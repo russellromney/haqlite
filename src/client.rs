@@ -1,19 +1,28 @@
-//! HaQLiteClient: stateless client that discovers the leader from S3 and forwards
-//! reads and writes over HTTP. No local SQLite, no cluster join.
+//! HaQLiteClient: SQLite-specific HA client wrapping hadb's generic HaClient.
+//!
+//! Adds read-replica support (local SQLite reads) and typed SQL operations
+//! on top of HaClient's leader discovery and HTTP forwarding.
 //!
 //! ```ignore
-//! let client = HaQLiteClient::new("my-bucket").await?;
-//!
+//! // Full client — discovers leader, forwards writes, queries leader
+//! let client = HaQLiteClient::new("my-bucket")
+//!     .db_name("mydb")
+//!     .connect()
+//!     .await?;
 //! client.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Alice".into())]).await?;
 //! let row = client.query_row("SELECT COUNT(*) FROM users", &[]).await?;
-//! let count = row[0].as_integer().unwrap();
+//!
+//! // Read-replica client — reads from local follower DB, no leader needed
+//! let reader = HaQLiteClient::read_replica_only("/data/mydb.db");
+//! let row = reader.query_row("SELECT COUNT(*) FROM users", &[]).await?;
 //! ```
 
-use std::sync::RwLock;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use hadb::{DbLease, LeaseStore};
+use hadb::{HaClient, LeaseStore};
 use hadb_s3::S3LeaseStore;
 
 use crate::forwarding::{self, SqlValue};
@@ -30,6 +39,7 @@ pub struct HaQLiteClientBuilder {
     db_name: String,
     timeout: Duration,
     secret: Option<String>,
+    read_replica_path: Option<PathBuf>,
 }
 
 impl HaQLiteClientBuilder {
@@ -41,6 +51,7 @@ impl HaQLiteClientBuilder {
             db_name: DEFAULT_DB_NAME.to_string(),
             timeout: DEFAULT_TIMEOUT,
             secret: None,
+            read_replica_path: None,
         }
     }
 
@@ -76,6 +87,17 @@ impl HaQLiteClientBuilder {
         self
     }
 
+    /// Enable read-replica mode: `query_row()` reads from this local DB path
+    /// instead of forwarding to the leader. `execute()` still forwards writes.
+    ///
+    /// The local DB must be a follower that's being replicated via walrust.
+    /// Each read opens a fresh connection (no pooling) so external WAL
+    /// applies are always visible.
+    pub fn read_replica(mut self, db_path: &str) -> Self {
+        self.read_replica_path = Some(PathBuf::from(db_path));
+        self
+    }
+
     /// Connect to the HaQLite cluster by discovering the leader from S3.
     pub async fn connect(self) -> Result<HaQLiteClient> {
         // Build S3 client for lease reading.
@@ -93,38 +115,39 @@ impl HaQLiteClientBuilder {
             }
         };
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
-        let lease_store: std::sync::Arc<dyn LeaseStore> =
-            std::sync::Arc::new(S3LeaseStore::new(s3_client, self.bucket.clone()));
+        let lease_store: Arc<dyn LeaseStore> =
+            Arc::new(S3LeaseStore::new(s3_client, self.bucket.clone()));
 
-        let http_client = reqwest::Client::builder()
-            .timeout(self.timeout)
-            .build()?;
+        let mut ha_builder = HaClient::builder()
+            .lease_store(lease_store)
+            .prefix(&self.prefix)
+            .db_name(&self.db_name)
+            .timeout(self.timeout);
 
-        // Discover the leader.
-        let leader_addr = discover_leader(&lease_store, &self.prefix, &self.db_name).await?;
+        if let Some(ref secret) = self.secret {
+            ha_builder = ha_builder.secret(secret);
+        }
+
+        let ha_client = ha_builder.connect().await?;
 
         Ok(HaQLiteClient {
-            lease_store,
-            prefix: self.prefix,
-            db_name: self.db_name,
-            http_client,
-            leader_address: RwLock::new(leader_addr),
-            secret: self.secret,
+            ha_client,
+            read_replica_path: self.read_replica_path,
         })
     }
 }
 
-/// Stateless client for an HaQLite cluster.
+/// SQLite-specific HA client.
 ///
-/// Discovers the leader from S3 and forwards reads/writes over HTTP.
-/// On connection failure, re-discovers the leader automatically.
+/// Wraps hadb's generic `HaClient` for leader discovery and HTTP forwarding,
+/// adding typed SQL operations and optional read-replica support.
+///
+/// In read-replica mode, `query_row()` reads from a local follower DB
+/// (fresh connection per call — no pooling), while `execute()` still
+/// forwards writes to the leader.
 pub struct HaQLiteClient {
-    lease_store: std::sync::Arc<dyn LeaseStore>,
-    prefix: String,
-    db_name: String,
-    http_client: reqwest::Client,
-    leader_address: RwLock<String>,
-    secret: Option<String>,
+    ha_client: HaClient,
+    read_replica_path: Option<PathBuf>,
 }
 
 impl HaQLiteClient {
@@ -133,145 +156,115 @@ impl HaQLiteClient {
         HaQLiteClientBuilder::new(bucket)
     }
 
+    /// Create a read-replica-only client that reads from a local DB file.
+    ///
+    /// No leader discovery or S3 access. `execute()` returns an error.
+    /// `query_row()` opens a fresh read-only connection per call.
+    pub fn read_replica_only(db_path: &str) -> Self {
+        Self {
+            ha_client: HaClient::disconnected(),
+            read_replica_path: Some(PathBuf::from(db_path)),
+        }
+    }
+
+    /// Returns true if this client reads from a local replica DB.
+    pub fn is_read_replica(&self) -> bool {
+        self.read_replica_path.is_some()
+    }
+
     /// Execute a write statement on the leader. Returns rows affected.
+    ///
+    /// Always forwards to the leader, even in read-replica mode.
+    /// Returns an error if no leader is available (e.g. `read_replica_only`).
     pub async fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         let body = forwarding::ForwardedExecute {
             sql: sql.to_string(),
             params: params.to_vec(),
         };
 
-        let result = self
-            .post_with_retry("/haqlite/execute", &body)
+        let result: forwarding::ExecuteResult = self
+            .ha_client
+            .forward("/haqlite/execute", &body)
             .await?;
 
-        let exec_result: forwarding::ExecuteResult = serde_json::from_value(result)?;
-        Ok(exec_result.rows_affected)
+        Ok(result.rows_affected)
     }
 
-    /// Query a single row from the leader. Returns column values as SqlValues.
+    /// Query a single row. Returns column values as SqlValues.
+    ///
+    /// If a read-replica path is configured, reads from the local DB
+    /// (fresh connection per call). Otherwise forwards to the leader.
     pub async fn query_row(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<SqlValue>> {
+        if let Some(ref db_path) = self.read_replica_path {
+            return self.query_row_local(db_path, sql, params);
+        }
+
         let body = forwarding::ForwardedQuery {
             sql: sql.to_string(),
             params: params.to_vec(),
         };
 
-        let result = self
-            .post_with_retry("/haqlite/query", &body)
+        let result: forwarding::QueryResult = self
+            .ha_client
+            .forward("/haqlite/query", &body)
             .await?;
 
-        let query_result: forwarding::QueryResult = serde_json::from_value(result)?;
-        Ok(query_result.values)
+        Ok(result.values)
     }
 
     /// Get the current leader address (cached — may be stale).
     pub fn leader_address(&self) -> String {
-        self.leader_address.read().unwrap().clone()
+        self.ha_client.leader_address()
     }
 
     /// Force re-discovery of the leader from S3.
     pub async fn refresh_leader(&self) -> Result<()> {
-        let addr = discover_leader(&self.lease_store, &self.prefix, &self.db_name).await?;
-        *self.leader_address.write().unwrap() = addr;
-        Ok(())
+        self.ha_client.refresh_leader().await
     }
 
     // ========================================================================
     // Internal
     // ========================================================================
 
-    /// POST to the leader with automatic retry on connection failure.
-    /// On failure, re-discovers the leader from S3 and retries once.
-    async fn post_with_retry<T: serde::Serialize>(
+    /// Read from the local follower DB with a fresh connection.
+    ///
+    /// Opens a new read-only rusqlite::Connection per call — no pooling.
+    /// This ensures external WAL applies (by walrust) are always visible.
+    fn query_row_local(
         &self,
-        path: &str,
-        body: &T,
-    ) -> Result<serde_json::Value> {
-        let addr = self.leader_address.read().unwrap().clone();
-        let url = format!("{}{}", addr, path);
+        db_path: &PathBuf,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> Result<Vec<SqlValue>> {
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| anyhow!("Failed to open read-replica DB: {}", e))?;
 
-        match self.do_post(&url, body).await {
-            Ok(val) => Ok(val),
-            Err(first_err) => {
-                // Re-discover leader and retry once.
-                tracing::warn!(
-                    "Request to {} failed ({}), re-discovering leader...",
-                    url,
-                    first_err
-                );
-                match discover_leader(&self.lease_store, &self.prefix, &self.db_name).await {
-                    Ok(new_addr) => {
-                        *self.leader_address.write().unwrap() = new_addr.clone();
-                        let retry_url = format!("{}{}", new_addr, path);
-                        self.do_post(&retry_url, body).await
-                    }
-                    Err(discover_err) => {
-                        Err(anyhow!(
-                            "Request failed ({}) and leader re-discovery also failed ({})",
-                            first_err,
-                            discover_err
-                        ))
-                    }
+        let rusqlite_params: Vec<rusqlite::types::Value> =
+            params.iter().map(|p| p.to_rusqlite()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            rusqlite_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| anyhow!("Failed to prepare query: {}", e))?;
+
+        let column_count = stmt.column_count();
+
+        let values = stmt
+            .query_row(param_refs.as_slice(), |row| {
+                let mut vals = Vec::with_capacity(column_count);
+                for i in 0..column_count {
+                    let val: rusqlite::types::Value = row.get(i)?;
+                    vals.push(SqlValue::from_rusqlite(val));
                 }
-            }
-        }
-    }
+                Ok(vals)
+            })
+            .map_err(|e| anyhow!("Query failed: {}", e))?;
 
-    async fn do_post<T: serde::Serialize>(
-        &self,
-        url: &str,
-        body: &T,
-    ) -> Result<serde_json::Value> {
-        let mut req = self.http_client.post(url).json(body);
-        if let Some(ref secret) = self.secret {
-            req = req.bearer_auth(secret);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| anyhow!("Request to {} failed: {}", url, e))?;
-
-        if !resp.status().is_success() {
-            return Err(anyhow!(
-                "Leader returned error: {} {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            ));
-        }
-
-        resp.json()
-            .await
-            .map_err(|e| anyhow!("Failed to parse response: {}", e))
-    }
-}
-
-/// Discover the leader's forwarding address by reading the lease from S3.
-async fn discover_leader(
-    lease_store: &std::sync::Arc<dyn LeaseStore>,
-    prefix: &str,
-    db_name: &str,
-) -> Result<String> {
-    let lease = DbLease::new(
-        lease_store.clone(),
-        prefix,
-        db_name,
-        "client", // dummy — we never claim
-        "client",
-        5,
-    );
-
-    match lease.read().await? {
-        Some((data, _etag)) => {
-            if data.sleeping {
-                Err(anyhow!("Cluster is sleeping — no active leader"))
-            } else if data.is_expired() {
-                Err(anyhow!("Leader lease is expired — no active leader"))
-            } else if data.address.is_empty() {
-                Err(anyhow!("Leader lease has no address"))
-            } else {
-                Ok(data.address)
-            }
-        }
-        None => Err(anyhow!("No lease found — cluster not initialized")),
+        Ok(values)
     }
 }
 

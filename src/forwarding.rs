@@ -36,6 +36,17 @@ impl SqlValue {
             SqlValue::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
         }
     }
+
+    /// Convert from rusqlite's Value type.
+    pub fn from_rusqlite(val: rusqlite::types::Value) -> Self {
+        match val {
+            rusqlite::types::Value::Null => SqlValue::Null,
+            rusqlite::types::Value::Integer(n) => SqlValue::Integer(n),
+            rusqlite::types::Value::Real(f) => SqlValue::Real(f),
+            rusqlite::types::Value::Text(s) => SqlValue::Text(s),
+            rusqlite::types::Value::Blob(b) => SqlValue::Blob(b),
+        }
+    }
 }
 
 /// Request body for forwarded execute calls.
@@ -157,13 +168,7 @@ pub(crate) async fn handle_forwarded_query(
             let mut vals = Vec::with_capacity(column_count);
             for i in 0..column_count {
                 let val: rusqlite::types::Value = row.get(i)?;
-                vals.push(match val {
-                    rusqlite::types::Value::Null => SqlValue::Null,
-                    rusqlite::types::Value::Integer(n) => SqlValue::Integer(n),
-                    rusqlite::types::Value::Real(f) => SqlValue::Real(f),
-                    rusqlite::types::Value::Text(s) => SqlValue::Text(s),
-                    rusqlite::types::Value::Blob(b) => SqlValue::Blob(b),
-                });
+                vals.push(SqlValue::from_rusqlite(val));
             }
             Ok(vals)
         })

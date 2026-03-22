@@ -63,6 +63,3 @@ haqlite should support SQLite extensions (sqlite-vec, FTS5, sqlean, etc.) across
 - Extract graphstream crate from graphd
 - Integrate into graphd with `--ha` CLI flags
 
-## Future: Extract Generic Lease Monitor
-
-The `FollowerBehavior::run_lease_monitor` is ~90% generic (poll lease, count consecutive expired reads, claim, emit events) and ~10% database-specific (warm catch-up on promotion). Consider splitting into a generic `run_lease_monitor` in hadb (like `run_leader_renewal` already is) with a small `OnPromotionCatchup` hook trait for the DB-specific part.

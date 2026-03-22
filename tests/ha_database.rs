@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use tokio::sync::Mutex;
 
 use haqlite::{
-    Coordinator, CoordinatorConfig, HaQLite, InMemoryLeaseStore, LeaseConfig, Role,
+    Coordinator, CoordinatorConfig, HaQLite, HaQLiteClient, InMemoryLeaseStore, LeaseConfig, Role,
     SqliteFollowerBehavior, SqliteReplicator, SqlValue,
 };
 
@@ -571,4 +571,134 @@ async fn auth_accepts_correct_secret() {
 
     leader.close().await.unwrap();
     follower.close().await.unwrap();
+}
+
+// ============================================================================
+// Read Replica Tests
+// ============================================================================
+
+#[tokio::test]
+async fn read_replica_local_query() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("replica.db");
+
+    // Create and populate a DB with raw rusqlite.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
+            rusqlite::params![1, "hello"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
+            rusqlite::params![2, "world"],
+        )
+        .unwrap();
+    }
+
+    // Read-replica-only client — no leader, no S3.
+    let client = HaQLiteClient::read_replica_only(db_path.to_str().unwrap());
+    assert!(client.is_read_replica());
+
+    // Query should read from local DB.
+    let row = client
+        .query_row("SELECT COUNT(*) FROM test_data", &[])
+        .await
+        .unwrap();
+    assert_eq!(row[0].as_integer().unwrap(), 2);
+
+    // Query with params.
+    let row = client
+        .query_row(
+            "SELECT value FROM test_data WHERE id = ?1",
+            &[SqlValue::Integer(1)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row[0].as_text().unwrap(), "hello");
+}
+
+#[tokio::test]
+async fn read_replica_execute_returns_error() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("replica.db");
+
+    // Create empty DB.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+    }
+
+    let client = HaQLiteClient::read_replica_only(db_path.to_str().unwrap());
+
+    // execute() should fail — no leader to forward to.
+    let result = client
+        .execute(
+            "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
+            &[SqlValue::Integer(1), SqlValue::Text("nope".into())],
+        )
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("No leader address"),
+        "Expected 'No leader address' error, got: {}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn read_replica_sees_external_writes() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("replica.db");
+
+    // Create DB with initial data.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
+            rusqlite::params![1, "original"],
+        )
+        .unwrap();
+    }
+
+    let client = HaQLiteClient::read_replica_only(db_path.to_str().unwrap());
+
+    // First read — sees 1 row.
+    let row = client
+        .query_row("SELECT COUNT(*) FROM test_data", &[])
+        .await
+        .unwrap();
+    assert_eq!(row[0].as_integer().unwrap(), 1);
+
+    // External write (simulates walrust applying a WAL delta).
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
+            rusqlite::params![2, "external"],
+        )
+        .unwrap();
+    }
+
+    // Second read — fresh connection should see the new row.
+    let row = client
+        .query_row("SELECT COUNT(*) FROM test_data", &[])
+        .await
+        .unwrap();
+    assert_eq!(row[0].as_integer().unwrap(), 2);
+
+    // Verify the new row content.
+    let row = client
+        .query_row(
+            "SELECT value FROM test_data WHERE id = ?1",
+            &[SqlValue::Integer(2)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row[0].as_text().unwrap(), "external");
 }
