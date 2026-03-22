@@ -1,22 +1,19 @@
 //! HTTP writer for haqlite HA experiment.
 //!
-//! Discovers the leader via S3 (reads the haqlite lease) and sends writes.
-//! On failure, polls S3 for a new leader session and reconnects.
+//! Uses HaQLiteClient to discover the leader and send writes.
+//! On failure, HaQLiteClient re-discovers the leader automatically.
 //!
 //! Usage:
-//!   haqlite-ha-writer --bucket my-bucket --prefix ha-test/
+//!   haqlite-ha-writer --bucket my-bucket --prefix ha-test/ --db-name ha
 
 use clap::Parser;
-use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use haqlite::{DbLease, LeaseStore, S3LeaseStore};
-
-const DB_NAME: &str = "ha-db";
+use haqlite::{HaQLiteClient, SqlValue};
 
 #[derive(Parser)]
 #[command(name = "haqlite-ha-writer")]
-#[command(about = "HTTP writer for haqlite HA experiment — discovers leader via S3 lease")]
+#[command(about = "HTTP writer for haqlite HA experiment — uses HaQLiteClient")]
 struct Args {
     /// S3 bucket containing the lease
     #[arg(long, env = "HA_BUCKET")]
@@ -30,6 +27,11 @@ struct Args {
     #[arg(long, env = "HA_S3_ENDPOINT")]
     endpoint: Option<String>,
 
+    /// Database name — must match the file stem of the server's --db path.
+    /// E.g. if the server uses --db /tmp/node1/ha.db, set --db-name ha
+    #[arg(long, default_value = "db")]
+    db_name: String,
+
     /// Write interval in milliseconds
     #[arg(long, default_value = "100")]
     interval_ms: u64,
@@ -39,44 +41,17 @@ struct Args {
     total_writes: u64,
 
     /// Verify data integrity on all nodes after completion.
-    /// Provide comma-separated node addresses (e.g., "http://localhost:9001,http://localhost:9002")
+    /// Provide comma-separated app server addresses (e.g., "http://localhost:9001,http://localhost:9002")
     #[arg(long)]
     verify_nodes: Option<String>,
 
-    /// Enable benchmark mode: print a tab-separated summary line suitable for
-    /// collecting across multiple runs with different --sync-interval values.
-    /// Output: sync_interval_ms, writes, errors, elapsed_s, writes_per_s, promotion_us, catchup_us
+    /// Enable benchmark mode: print a tab-separated summary line.
     #[arg(long)]
     bench: bool,
-}
 
-/// Discover the leader by reading the haqlite lease from S3.
-/// Returns (address, session_id) if an active, non-sleeping leader exists.
-async fn discover_leader(
-    lease_store: Arc<dyn LeaseStore>,
-    prefix: &str,
-) -> anyhow::Result<Option<(String, String)>> {
-    let lease = DbLease::new(
-        lease_store,
-        prefix,
-        DB_NAME,
-        "writer",     // dummy instance_id — we never claim
-        "writer",     // dummy address
-        5,
-    );
-
-    match lease.read().await? {
-        Some((data, _etag)) => {
-            if data.sleeping {
-                Ok(None) // sleeping = no active leader
-            } else if data.is_expired() {
-                Ok(None) // expired = no active leader
-            } else {
-                Ok(Some((data.address.clone(), data.session_id.clone())))
-            }
-        }
-        None => Ok(None),
-    }
+    /// Shared secret for authenticating with the forwarding server
+    #[arg(long, env = "HAQLITE_SECRET")]
+    secret: Option<String>,
 }
 
 #[tokio::main]
@@ -89,27 +64,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    info!("=== haqlite HA HTTP writer (S3 discovery) ===");
+    info!("=== haqlite HA HTTP writer (HaQLiteClient) ===");
     info!("Bucket: {}", args.bucket);
     info!("Prefix: {}", args.prefix);
-
-    // Build S3 client for lease reading
-    let s3_config = if let Some(ref endpoint) = args.endpoint {
-        aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .endpoint_url(endpoint)
-            .load()
-            .await
-    } else {
-        aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .load()
-            .await
-    };
-    let s3_client = aws_sdk_s3::Client::new(&s3_config);
-    let lease_store: Arc<dyn LeaseStore> = Arc::new(S3LeaseStore::new(s3_client, args.bucket.clone()));
-
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
+    info!("DB name: {}", args.db_name);
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -121,20 +79,28 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    // Discover initial leader
-    let (mut leader_address, mut session_id) = loop {
-        match discover_leader(lease_store.clone(), &args.prefix).await {
-            Ok(Some((addr, sid))) => {
-                info!("Discovered leader: {} (session {})", addr, sid);
-                break (addr, sid);
-            }
-            Ok(None) => {
-                info!("No active leader yet, waiting...");
+    // Connect with retry — rebuilds the builder each time since connect() consumes it.
+    let client = loop {
+        let mut b = HaQLiteClient::new(&args.bucket)
+            .prefix(&args.prefix)
+            .db_name(&args.db_name);
+        if let Some(ref endpoint) = args.endpoint {
+            b = b.endpoint(endpoint);
+        }
+        if let Some(ref secret) = args.secret {
+            b = b.secret(secret);
+        }
+
+        match b.connect().await {
+            Ok(c) => {
+                info!("Connected to leader: {}", c.leader_address());
+                break c;
             }
             Err(e) => {
-                warn!("S3 discovery failed: {}", e);
+                info!("Waiting for leader: {}", e);
             }
         }
+
         tokio::select! {
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
             _ = shutdown_rx.changed() => {
@@ -153,59 +119,27 @@ async fn main() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let write_url = format!("{}/write", leader_address);
-                match http_client.post(&write_url).send().await {
-                    Ok(resp) if resp.status().is_success() => {
+                match client.execute(
+                    "INSERT INTO test_data (id, value) VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM test_data), ?1)",
+                    &[SqlValue::Text(format!("row-{}", writes + 1))],
+                ).await {
+                    Ok(_) => {
                         writes += 1;
                         consecutive_errors = 0;
                         if writes % 100 == 0 {
                             let elapsed = start.elapsed().as_secs_f64();
                             let rate = writes as f64 / elapsed;
-                            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                            let count = client.query_row("SELECT COUNT(*) FROM test_data", &[]).await
+                                .ok().and_then(|r| r[0].as_integer()).unwrap_or(0);
                             info!("{} writes ({:.0}/s), {} errors, leader={}, count={}",
-                                writes, rate, errors, leader_address,
-                                body.get("count").and_then(|v| v.as_i64()).unwrap_or(0),
-                            );
-                        }
-                    }
-                    Ok(resp) => {
-                        errors += 1;
-                        consecutive_errors += 1;
-                        if consecutive_errors <= 3 || consecutive_errors % 10 == 0 {
-                            warn!("Write failed: HTTP {} (consecutive #{})",
-                                resp.status(), consecutive_errors);
+                                writes, rate, errors, client.leader_address(), count);
                         }
                     }
                     Err(e) => {
                         errors += 1;
                         consecutive_errors += 1;
                         if consecutive_errors <= 3 || consecutive_errors % 10 == 0 {
-                            warn!("Write failed: {} (consecutive #{})",
-                                e, consecutive_errors);
-                        }
-                    }
-                }
-
-                // After 3 consecutive failures, poll S3 for a new leader session
-                if consecutive_errors >= 3 {
-                    match discover_leader(lease_store.clone(), &args.prefix).await {
-                        Ok(Some((addr, sid))) if sid != session_id => {
-                            info!("New leader session: {} at {} (was {})",
-                                sid, addr, leader_address);
-                            leader_address = addr;
-                            session_id = sid;
-                            consecutive_errors = 0;
-                        }
-                        Ok(Some(_)) => {
-                            // Same session — leader hasn't changed yet
-                        }
-                        Ok(None) => {
-                            // No active leader — keep polling
-                        }
-                        Err(e) => {
-                            if consecutive_errors % 10 == 0 {
-                                warn!("S3 discovery error: {}", e);
-                            }
+                            warn!("Write failed: {} (consecutive #{})", e, consecutive_errors);
                         }
                     }
                 }
@@ -215,7 +149,6 @@ async fn main() -> anyhow::Result<()> {
                     break;
                 }
 
-                // Stop after total_writes if configured.
                 if args.total_writes > 0 && writes >= args.total_writes {
                     info!("Reached {} writes, stopping", args.total_writes);
                     break;
@@ -234,18 +167,21 @@ async fn main() -> anyhow::Result<()> {
         writes, errors, elapsed, rate
     );
 
-    // Verify data integrity on all nodes.
+    // Verify data integrity on all nodes (uses raw HTTP — these are app server endpoints).
     if let Some(ref nodes_str) = args.verify_nodes {
-        // Wait for replication to catch up.
         info!("Waiting 3s for replication to catch up before verification...");
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
 
         let nodes: Vec<&str> = nodes_str.split(',').map(|s| s.trim()).collect();
         let mut all_ok = true;
 
         for node in &nodes {
             let verify_url = format!("{}/verify", node);
-            match http_client.get(&verify_url).send().await {
+            match http.get(&verify_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -257,9 +193,8 @@ async fn main() -> anyhow::Result<()> {
                         info!("VERIFY {}: OK ({} rows, 0 gaps, 0 duplicates)", node, count);
                     } else {
                         error!(
-                            "VERIFY {}: FAILED ({} rows, {} gaps, {} dups, sample: {})",
-                            node, count, gaps, dups,
-                            body.get("gaps_sample").unwrap_or(&serde_json::json!([]))
+                            "VERIFY {}: FAILED ({} rows, {} gaps, {} dups)",
+                            node, count, gaps, dups
                         );
                         all_ok = false;
                     }
@@ -274,9 +209,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Also fetch metrics.
             let metrics_url = format!("{}/metrics", node);
-            match http_client.get(&metrics_url).send().await {
+            match http.get(&metrics_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     info!("METRICS {}: {}", node, body);
@@ -293,17 +227,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Benchmark summary: collect metrics from all verify_nodes and print TSV line.
+    // Benchmark summary.
     if args.bench {
         let mut promotion_us: u64 = 0;
         let mut catchup_us: u64 = 0;
         let mut promotions: u64 = 0;
 
         if let Some(ref nodes_str) = args.verify_nodes {
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?;
             let nodes: Vec<&str> = nodes_str.split(',').map(|s| s.trim()).collect();
             for node in &nodes {
                 let metrics_url = format!("{}/metrics", node);
-                if let Ok(resp) = http_client.get(&metrics_url).send().await {
+                if let Ok(resp) = http.get(&metrics_url).send().await {
                     if let Ok(body) = resp.json::<serde_json::Value>().await {
                         let p = body.get("last_promotion_duration_us")
                             .and_then(|v| v.as_u64()).unwrap_or(0);
@@ -319,8 +256,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Print header on first run hint, then data line.
-        // Format: TSV for easy paste into spreadsheets.
         println!("# sync_interval_ms\twrites\terrors\telapsed_s\twrites_per_s\tpromotion_us\tcatchup_us\tpromotions");
         println!(
             "{}\t{}\t{}\t{:.1}\t{:.0}\t{}\t{}\t{}",

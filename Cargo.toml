@@ -2,11 +2,18 @@
 name = "haqlite"
 version = "0.1.0"
 edition = "2021"
-description = "HA building blocks for SQLite: leases, roles, join/leave, auto-promotion, self-fencing"
+description = "HA SQLite with one line of code. Leader election, WAL replication, write forwarding — just your app + an S3 bucket."
 authors = ["Russell Romney <russellromney@gmail.com>"]
 license = "Apache-2.0"
+repository = "https://github.com/russellromney/haqlite"
+keywords = ["sqlite", "ha", "replication", "leader-election", "s3"]
+categories = ["database", "network-programming"]
 
 [dependencies]
+# HA coordination framework
+hadb = { path = "../hadb/hadb" }
+hadb-s3 = { path = "../hadb/hadb-s3" }
+
 # WAL sync primitives
 walrust = "0.1.0"
 
@@ -29,8 +36,9 @@ tracing = "0.1"
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
+hostname = "0.4"
 
-# HTTP (for HA experiment binaries)
+# HTTP (write forwarding + experiment binaries)
 axum = "0.8"
 reqwest = { version = "0.12", features = ["json"] }
 
@@ -38,7 +46,7 @@ reqwest = { version = "0.12", features = ["json"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# SQLite (for experiment binaries + on_promoted)
+# SQLite
 rusqlite = { version = "0.35", features = ["bundled"] }
 
 [[bin]]

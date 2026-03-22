@@ -1,43 +1,45 @@
-//! haqlite: HA building blocks for SQLite.
+//! haqlite: HA SQLite with one line of code.
 //!
-//! Provides lease-based role coordination for SQLite databases replicated via walrust.
-//! Three clean layers: walrust (WAL sync) → haqlite (HA coordination) → your app.
+//! Embeddable HA for SQLite — leader election, WAL replication, write forwarding,
+//! automatic failover. Just your app servers + an S3 bucket.
 //!
 //! ```ignore
-//! let coordinator = Coordinator::new(storage, Some(lease_store), "ha/", config);
-//! let role = coordinator.join("my-db", Path::new("/data/my.db")).await?;
-//! // role == Leader or Follower
+//! use haqlite::{HaQLite, SqlValue};
 //!
-//! // Listen for role changes (promotion, fencing)
-//! let mut events = coordinator.role_events();
-//! tokio::spawn(async move {
-//!     while let Ok(event) = events.recv().await {
-//!         match event {
-//!             RoleEvent::Promoted { db_name } => { /* now leader */ }
-//!             RoleEvent::Fenced { db_name } => { /* stop serving! */ }
-//!             _ => {}
-//!         }
-//!     }
-//! });
+//! let db = HaQLite::builder("my-bucket")
+//!     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);")
+//!     .await?;
+//!
+//! // Writes: forwarded to leader automatically
+//! db.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Alice".into())]).await?;
+//!
+//! // Reads: always local
+//! let count: i64 = db.query_row("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;
 //! ```
 
-pub mod coordinator;
-pub mod follower;
-pub mod lease;
-pub mod lease_store;
-pub mod metrics;
-pub mod node_registry;
-pub mod types;
+pub mod client;
+pub mod database;
+pub mod follower_behavior;
+pub mod forwarding;
+pub mod replicator;
 
-// Re-export key types for convenience.
-pub use coordinator::Coordinator;
-pub use lease::{DbLease, LeaseData};
-pub use lease_store::{CasResult, InMemoryLeaseStore, LeaseStore, S3LeaseStore};
-pub use metrics::{HaMetrics, MetricsSnapshot};
-pub use node_registry::{InMemoryNodeRegistry, NodeRegistration, NodeRegistry, S3NodeRegistry};
-pub use types::{CoordinatorConfig, LeaseConfig, Role, RoleEvent};
+// Re-export HaQLite as the primary API.
+pub use database::{HaQLite, HaQLiteBuilder};
+pub use client::{HaQLiteClient, HaQLiteClientBuilder};
+pub use forwarding::SqlValue;
 
-// Re-export walrust types that consumers need.
-pub use walrust::storage::{S3Backend, StorageBackend};
-pub use walrust::sync::ReplicationConfig;
-pub use walrust::Replicator;
+// Re-export rusqlite for query params.
+pub use rusqlite;
+
+// Re-export hadb types.
+pub use hadb::{
+    Coordinator, CoordinatorConfig, HaMetrics, InMemoryLeaseStore, LeaseConfig,
+    LeaseData, MetricsSnapshot, NodeRegistration, NodeRegistry, Role, RoleEvent,
+};
+
+// Re-export hadb-s3 implementations.
+pub use hadb_s3::{S3LeaseStore, S3NodeRegistry, S3StorageBackend};
+
+// Re-export SQLite-specific implementations.
+pub use follower_behavior::SqliteFollowerBehavior;
+pub use replicator::SqliteReplicator;

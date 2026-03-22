@@ -1,5 +1,43 @@
 # haqlite Changelog
 
+## hadb Core Framework Extraction (Foundation — 83 tests)
+
+- **hadb workspace created**: Database-agnostic HA framework at `~/Documents/Github/hadb/` with core (`hadb/`) and S3 implementation (`hadb-s3/`) crates. Zero cloud dependencies in core.
+- **Core traits extracted** (12 tests): `Replicator`, `Executor`, `LeaseStore`, `StorageBackend` — fully abstract, works with any database or storage backend.
+- **types.rs extracted** (12 tests): `Role`, `RoleEvent`, `CoordinatorConfig`, `LeaseConfig` — database-agnostic HA types. Added `Role::to_u8/from_u8` for AtomicU8 storage.
+- **metrics.rs extracted** (6 tests): `HaMetrics` with 19 atomic counters, Prometheus export, zero-allocation reads via `MetricsSnapshot`.
+- **lease.rs extracted** (22 tests): `DbLease` CAS-based leader election with post-claim verification, session ID tracking, TTL management. Bug fixed: session_id wasn't regenerated on new claim after release.
+- **node_registry.rs extracted** (13 tests): `NodeRegistry` trait for read replica discovery, `InMemoryNodeRegistry` for testing, validates nodes by session ID and TTL.
+- **follower.rs created**: `FollowerBehavior` trait for pluggable follower pull/monitor logic. `run_leader_renewal()` made generic over Replicator.
+- **coordinator.rs extracted** (15 tests): Generic `Coordinator<R, E, L, S, F>` with all lifecycle methods (join, leave, handoff), role/address queries, metrics, replica discovery. Bug fixed: follower leader_address tracking.
+- **S3 implementations** (3 tests): `S3LeaseStore` (conditional PUTs via ETag), `S3StorageBackend` (upload/download/list/delete with OOM protection via max_keys), `S3NodeRegistry` (S3-backed node discovery). Type alias `S3Coordinator<R, E, F>` for convenience.
+- **All 83 tests passing**: 65 hadb core unit tests + 15 coordinator integration tests + 3 hadb-s3 tests. Comprehensive coverage: single-node mode, HA leader/follower, promotion/demotion, handoff, role events, edge cases.
+- **Next step**: Refactor haqlite to use hadb + hadb-s3 (see ROADMAP).
+
+## Auth, Handoff, Prometheus, crates.io Prep
+
+- **Shared-secret auth**: `.secret("token")` on `HaQLiteBuilder` and `HaQLiteClientBuilder`. Forwarding server checks `Authorization: Bearer <token>` header, rejects 401 on mismatch. `--secret` / `HAQLITE_SECRET` env on CLI binaries.
+- **Graceful leader handoff**: `HaQLite::handoff()` — stop renewal → final WAL sync → release lease → emit Demoted. Node stays alive as follower for drain. `Coordinator::handoff()` underlying implementation.
+- **Prometheus metrics**: `MetricsSnapshot::to_prometheus()` — exposition format for all counters and timing gauges. `HaQLite::prometheus_metrics()` convenience method.
+- **crates.io metadata**: Added `repository`, `keywords`, `categories` to Cargo.toml.
+- **Read pool investigation**: Attempted follower read connection pool — reverted. Followers must open fresh connections per read because walrust applies LTX files externally (pooled connections hold stale snapshots).
+- 2 new integration tests: `auth_rejects_wrong_secret`, `auth_accepts_correct_secret`.
+
+## HaQLite One-Liner API
+
+- **HaQLite struct**: `HaQLite::builder("bucket").open(path, schema).await?` — dead-simple embedded HA SQLite. One line to join a cluster, transparent write forwarding, local reads, automatic failover.
+- **HaQLiteBuilder**: `.prefix()`, `.endpoint()`, `.instance_id()`, `.address()`, `.forwarding_port()`, `.coordinator_config()`. Auto-detects instance ID (FLY_MACHINE_ID or UUID) and address (Fly internal DNS or hostname).
+- **HaQLite::local()**: Single-node mode — same API, no S3, no HA. Useful for dev/testing.
+- **HaQLite::from_coordinator()**: Escape hatch for tests and advanced use cases.
+- **SqlValue enum**: `Null | Integer | Real | Text | Blob` — serializable across the wire for `execute()` params.
+- **Write forwarding**: Leader runs internal HTTP server (`/haqlite/execute`, `/haqlite/query`). Followers forward writes transparently. Clients never need to know who the leader is.
+- **HaQLiteClient**: Stateless client that discovers the leader from S3 and forwards reads/writes over HTTP. Auto-retries on connection failure with leader re-discovery.
+- **ha_experiment.rs refactored**: ~400 → ~200 lines. All manual state management replaced with HaQLite.
+- **ha_writer.rs refactored**: Uses HaQLiteClient instead of manual S3 lease discovery.
+- **Configurable CLI args**: `--sync-interval-ms`, `--lease-ttl`, `--renew-interval-ms`, `--follower-poll-ms`, `--follower-pull-ms`.
+- **E2e test suite**: 7 scenarios (basic replication, write forwarding, leader failover, fast/slow sync, fast lease failover, writer reconnect). All 15 checks pass.
+- 5 new integration tests (`ha_database.rs`): local mode, single-node HA, two-node forwarded write, forwarding error, clean close.
+
 ## P0 — Split-Brain & Data Loss Prevention
 
 - **Catch-up failure aborts promotion**: If warm catch-up fails (S3 down), release the lease and loop back instead of promoting with stale data. (`follower.rs`)

@@ -1,22 +1,41 @@
 # haqlite
 
-HA building blocks for SQLite. Leases, roles, auto-promotion, self-fencing, WAL replication — all via S3.
+HA SQLite with one line of code. Leader election, WAL replication, write forwarding — just your app + an S3 bucket.
 
-Your app servers embed haqlite and become stateful. No separate database cluster needed. Just your app + an S3 bucket.
+## Quick start
+
+```rust
+use haqlite::{HaQLite, SqlValue};
+
+let db = HaQLite::builder("my-bucket")
+    .open("/data/my.db", "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);")
+    .await?;
+
+// Writes — forwarded to leader automatically
+db.execute(
+    "INSERT INTO users (name) VALUES (?1)",
+    &[SqlValue::Text("Alice".into())],
+).await?;
+
+// Reads — always local
+let count: i64 = db.query_row("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;
+
+// Clean shutdown
+db.close().await?;
+```
+
+That's it. No S3 client setup, no lease configuration, no write proxy, no role event handlers. HaQLite handles everything internally.
 
 ## How it works
-
-Each node runs a `Coordinator` that manages a single SQLite database:
-
-- **Leader election** via S3 conditional PUTs (compare-and-swap on ETags). No Raft, no Paxos, no consensus protocol — just S3.
-- **WAL replication** via [walrust](https://crates.io/crates/walrust). Leader syncs WAL frames to S3 as LTX files. Followers pull and apply incrementals.
-- **Auto-promotion**: when the leader's lease expires, a follower claims it, catches up from S3, and promotes itself.
-- **Self-fencing**: if a leader loses its lease (network partition, slow renewal), it demotes itself immediately. No split-brain.
 
 ```
 Node 1 (leader)                    Node 2 (follower)
 ┌──────────────────────┐           ┌──────────────────────┐
 │  Your App            │           │  Your App            │
+│         │            │           │         │            │
+│    HaQLite           │           │    HaQLite           │
+│    ├─ execute() ─────┤──local    │    ├─ execute() ─────┤──► HTTP to leader
+│    ├─ query_row() ───┤──local    │    ├─ query_row() ───┤──local (read replica)
 │    ├─ Coordinator    │           │    ├─ Coordinator    │
 │    ├─ SQLite (rw)    │           │    ├─ SQLite (ro)    │
 │    └─ walrust sync   │           │    └─ walrust pull   │
@@ -24,61 +43,84 @@ Node 1 (leader)                    Node 2 (follower)
            └────────── S3 bucket ─────────────┘
 ```
 
-## Usage
+- **Leader election** via S3 conditional PUTs (compare-and-swap on ETags). No Raft, no Paxos — just S3.
+- **WAL replication** via [walrust](https://crates.io/crates/walrust). Leader syncs WAL frames to S3, followers pull and apply.
+- **Write forwarding**: `execute()` on a follower transparently forwards to the leader via an internal HTTP server. Your app doesn't need to know who the leader is.
+- **Auto-promotion**: when the leader dies, a follower claims the lease, catches up from S3, and promotes itself.
+- **Self-fencing**: if a leader loses its lease (partition, slow renewal), it demotes itself immediately. No split-brain.
+
+## Builder options
 
 ```rust
-use haqlite::{Coordinator, CoordinatorConfig, S3Backend, S3LeaseStore};
-use std::sync::Arc;
+let db = HaQLite::builder("my-bucket")
+    .prefix("myapp/")                        // S3 key prefix (default: "haqlite/")
+    .endpoint("https://t3.storage.dev")       // S3 endpoint (Tigris, MinIO, R2)
+    .instance_id("node-1")                    // default: FLY_MACHINE_ID or UUID
+    .address("http://node1.internal:18080")   // default: auto-detected
+    .forwarding_port(18080)                   // internal HTTP port (default: 18080)
+    .coordinator_config(config)               // override lease/sync timing
+    .open("/data/my.db", schema)
+    .await?;
+```
 
-// Storage + lease store (both backed by S3)
-let storage: Arc<dyn StorageBackend> = Arc::new(S3Backend::new(s3_client.clone(), "my-bucket", Some("ha/")));
-let lease_store: Arc<dyn LeaseStore> = Arc::new(S3LeaseStore::new(s3_client, "my-bucket".into()));
+## Local mode (no HA)
 
-let config = CoordinatorConfig::default();
-let coordinator = Coordinator::new(storage, Some(lease_store), "ha/", config);
+For development and testing — same API, no S3:
 
-// Join the cluster — returns Leader or Follower
-let role = coordinator.join("my-db", Path::new("/data/my.db")).await?;
+```rust
+let db = HaQLite::local("/tmp/dev.db", schema)?;
+db.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Bob".into())]).await?;
+```
 
-// Listen for role changes
-let mut events = coordinator.role_events();
-tokio::spawn(async move {
-    while let Ok(event) = events.recv().await {
-        match event {
-            RoleEvent::Promoted { db_name } => { /* now leader — open rw connection */ }
-            RoleEvent::Demoted { db_name } => { /* lost leadership — close rw, go read-only */ }
-            RoleEvent::Fenced { db_name } => { /* lease lost — stop serving immediately */ }
-            _ => {}
-        }
-    }
-});
+## Client mode
+
+Connect to an existing HaQLite cluster from outside (no local SQLite, no cluster join):
+
+```rust
+use haqlite::{HaQLiteClient, SqlValue};
+
+let client = HaQLiteClient::new("my-bucket")
+    .prefix("myapp/")
+    .db_name("my")       // must match server's db filename stem
+    .connect()
+    .await?;
+
+// Discovers leader from S3, forwards reads/writes over HTTP
+client.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Eve".into())]).await?;
+let row = client.query_row("SELECT COUNT(*) FROM users", &[]).await?;
+let count = row[0].as_integer().unwrap();
+```
+
+## Configuration
+
+```rust
+use haqlite::{CoordinatorConfig, LeaseConfig};
+
+let config = CoordinatorConfig {
+    sync_interval: Duration::from_millis(500),           // WAL sync frequency
+    follower_pull_interval: Duration::from_millis(500),  // how often followers pull
+    lease: Some(LeaseConfig {
+        ttl_secs: 5,                   // lease time-to-live
+        renew_interval: Duration::from_secs(2),
+        follower_poll_interval: Duration::from_secs(1),
+        required_expired_reads: 1,     // prevent premature takeover
+        max_consecutive_renewal_errors: 3,
+        ..LeaseConfig::new(instance_id, address)
+    }),
+    ..Default::default()
+};
 ```
 
 ## Features
 
 - **No external dependencies** beyond S3. No etcd, no ZooKeeper, no sidecar.
+- **One-liner API**: `HaQLite::builder("bucket").open(path, schema).await?`
+- **Transparent write forwarding**: `execute()` works on any node.
+- **Sync reads / async writes**: `query_row()` is sync (always local), `execute()` is async (may forward).
 - **Warm promotion**: followers catch up from S3 before promoting. No stale reads after failover.
-- **Structured metrics**: `coordinator.metrics()` exposes lease claims, renewals, promotions, catchup timing — all lock-free atomics.
-- **Fault injection**: `ControlledFailStorage` and `FaultyStorage` for chaos testing.
-- **88 tests** including split-brain regression tests, chaos tests, and soak tests.
-
-## Configuration
-
-```rust
-CoordinatorConfig {
-    lease: LeaseConfig {
-        ttl_secs: 10,           // Lease TTL
-        renewal_interval_secs: 3, // How often the leader renews
-        renewal_timeout_secs: 5,  // Max time for a renewal attempt
-    },
-    replication: ReplicationConfig {
-        sync_interval: Duration::from_secs(1), // WAL sync frequency
-        ..Default::default()
-    },
-    replicator_timeout: Duration::from_secs(30),
-    max_consecutive_renewal_errors: 3,
-}
-```
+- **Structured metrics**: `coordinator.metrics()` — lease claims, renewals, promotions, catchup timing.
+- **93 tests** including split-brain regression, chaos tests, soak tests, and HA integration tests.
+- **E2e test suite**: 7 scenarios covering replication, forwarding, failover, varying sync/lease params.
 
 ## Architecture
 
@@ -86,11 +128,9 @@ haqlite is one layer in a stack:
 
 ```
 walrust (WAL sync to S3)
-  └─ haqlite (HA coordination: leases, roles, promotion)
+  └─ haqlite (HA coordination + one-liner API)
        └─ your app (HTTP server, gRPC, whatever)
 ```
-
-walrust handles the data plane (WAL frames → LTX files → S3). haqlite handles the control plane (who is leader, when to promote, when to fence). Your app handles the application logic.
 
 ## License
 
