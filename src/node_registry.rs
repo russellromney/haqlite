@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use walrust_core::storage::StorageBackend;
+use walrust::storage::StorageBackend;
 
 /// Node registration data stored in S3.
 #[derive(Debug, Clone, Serialize, Deserialize)]

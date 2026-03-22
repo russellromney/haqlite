@@ -8,7 +8,7 @@ license = "Apache-2.0"
 
 [dependencies]
 # WAL sync primitives
-walrust-core = { path = "../personal-website/walrust/crates/walrust-core" }
+walrust = "0.1.0"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

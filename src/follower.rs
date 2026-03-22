@@ -6,8 +6,8 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::{broadcast, watch};
 
-use walrust_core::storage::StorageBackend;
-use walrust_core::Replicator;
+use walrust::storage::StorageBackend;
+use walrust::Replicator;
 
 use crate::lease::DbLease;
 use crate::metrics::HaMetrics;
@@ -36,7 +36,7 @@ pub(crate) async fn run_follower_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                match walrust_core::sync::pull_incremental(
+                match walrust::sync::pull_incremental(
                     storage.as_ref(),
                     &prefix,
                     &db_name,
@@ -197,7 +197,7 @@ pub(crate) async fn run_lease_monitor(
                                 let catchup_start = std::time::Instant::now();
                                 let catchup_result = tokio::time::timeout(
                                     replicator_timeout,
-                                    walrust_core::sync::pull_incremental(
+                                    walrust::sync::pull_incremental(
                                         storage.as_ref(),
                                         &prefix,
                                         &db_name,

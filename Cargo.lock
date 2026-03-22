@@ -1306,7 +1306,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "walrust-core",
+ "walrust",
 ]
 
 [[package]]
@@ -1777,8 +1777,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
-name = "litetx"
-version = "0.1.1"
+name = "litepages"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f47037021fef1e7cf4d506970647944a33f6c75f83eb5ca3989df5a2948f82d5"
 dependencies = [
  "bitflags",
  "crc",
@@ -3102,8 +3104,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "walrust-core"
+name = "walrust"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcf0deb862c75be2f4ba36da14c1ec5e98a6aa74f3ce39744cadcd4bfc183637"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3112,7 +3116,7 @@ dependencies = [
  "aws-smithy-runtime",
  "chrono",
  "futures",
- "litetx",
+ "litepages",
  "rand 0.8.5",
  "rayon",
  "rusqlite",

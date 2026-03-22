@@ -38,6 +38,6 @@ pub use node_registry::{InMemoryNodeRegistry, NodeRegistration, NodeRegistry, S3
 pub use types::{CoordinatorConfig, LeaseConfig, Role, RoleEvent};
 
 // Re-export walrust types that consumers need.
-pub use walrust_core::storage::{S3Backend, StorageBackend};
-pub use walrust_core::sync::ReplicationConfig;
-pub use walrust_core::Replicator;
+pub use walrust::storage::{S3Backend, StorageBackend};
+pub use walrust::sync::ReplicationConfig;
+pub use walrust::Replicator;

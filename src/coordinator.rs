@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use anyhow::Result;
 use tokio::sync::{broadcast, watch, RwLock};
 
-use walrust_core::storage::StorageBackend;
-use walrust_core::sync::ReplicationConfig;
-use walrust_core::Replicator;
+use walrust::storage::StorageBackend;
+use walrust::sync::ReplicationConfig;
+use walrust::Replicator;
 
 use crate::follower;
 use crate::lease::DbLease;
