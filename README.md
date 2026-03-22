@@ -132,7 +132,7 @@ walrust (WAL sync to S3)
        └─ your app (HTTP server, gRPC, whatever)
 ```
 
-haqlite is the first implementation of **hadb**, a generic framework for making any embedded database highly available. See [DIRECTION.md](DIRECTION.md) for the full vision.
+haqlite is the first implementation of **[hadb](https://github.com/russellromney/hadb)**, a generic framework for making any embedded database highly available.
 
 ## License
 
