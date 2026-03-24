@@ -3,7 +3,9 @@
 //! Embeddable HA for SQLite — leader election, WAL replication, write forwarding,
 //! automatic failover. Just your app servers + an S3 bucket.
 //!
-//! ```ignore
+//! ```no_run
+//! # #[tokio::main]
+//! # async fn main() -> anyhow::Result<()> {
 //! use haqlite::{HaQLite, SqlValue};
 //!
 //! let db = HaQLite::builder("my-bucket")
@@ -15,6 +17,8 @@
 //!
 //! // Reads: always local
 //! let count: i64 = db.query_row("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;
+//! # Ok(())
+//! # }
 //! ```
 
 pub mod cli_config;

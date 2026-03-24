@@ -3,8 +3,12 @@
 //! Adds read-replica support (local SQLite reads) and typed SQL operations
 //! on top of HaClient's leader discovery and HTTP forwarding.
 //!
-//! ```ignore
-//! // Full client — discovers leader, forwards writes, queries leader
+//! ```no_run
+//! # #[tokio::main]
+//! # async fn main() -> anyhow::Result<()> {
+//! use haqlite::{HaQLiteClient, SqlValue};
+//!
+//! // Full client: discovers leader, forwards writes, queries leader
 //! let client = HaQLiteClient::new("my-bucket")
 //!     .db_name("mydb")
 //!     .connect()
@@ -12,9 +16,11 @@
 //! client.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Alice".into())]).await?;
 //! let row = client.query_row("SELECT COUNT(*) FROM users", &[]).await?;
 //!
-//! // Read-replica client — reads from local follower DB, no leader needed
+//! // Read-replica client: reads from local follower DB, no leader needed
 //! let reader = HaQLiteClient::read_replica_only("/data/mydb.db");
 //! let row = reader.query_row("SELECT COUNT(*) FROM users", &[]).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::path::PathBuf;

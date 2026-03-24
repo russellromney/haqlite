@@ -1,12 +1,18 @@
 //! HaQLite: dead-simple embedded HA SQLite.
 //!
-//! ```ignore
+//! ```no_run
+//! # #[tokio::main]
+//! # async fn main() -> anyhow::Result<()> {
+//! use haqlite::{HaQLite, SqlValue};
+//!
 //! let db = HaQLite::builder("my-bucket")
 //!     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);")
 //!     .await?;
 //!
 //! db.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Alice".into())]).await?;
 //! let count: i64 = db.query_row("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -34,12 +40,18 @@ const ROLE_FOLLOWER: u8 = 1;
 ///
 /// Only the bucket is required — everything else has sensible defaults.
 ///
-/// ```ignore
+/// ```no_run
+/// # #[tokio::main]
+/// # async fn main() -> anyhow::Result<()> {
+/// use haqlite::HaQLite;
+///
 /// let db = HaQLite::builder("my-bucket")
 ///     .prefix("myapp/")
 ///     .forwarding_port(19000)
 ///     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS ...")
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct HaQLiteBuilder {
     bucket: String,
