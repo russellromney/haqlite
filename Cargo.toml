@@ -12,10 +12,10 @@ categories = ["database", "network-programming"]
 [dependencies]
 # HA coordination framework
 hadb = { path = "../hadb/hadb" }
-hadb-s3 = { path = "../hadb/hadb-s3" }
+hadb-lease-s3 = { path = "../hadb/hadb-lease-s3" }
 
 # WAL sync primitives
-walrust = "0.1.0"
+walrust = { path = "../personal-website/walrust/crates/walrust-core" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -42,12 +42,22 @@ hostname = "0.4"
 axum = "0.8"
 reqwest = { version = "0.12", features = ["json"] }
 
-# CLI + logging (for experiment binaries)
+# Shared CLI framework
+hadb-cli = { path = "../hadb/hadb-cli" }
+
+# Hrana protocol (libSQL HTTP API)
+hrana-server = { path = "../hrana-server" }
+
+# CLI + logging
 clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # SQLite
 rusqlite = { version = "0.35", features = ["bundled"] }
+
+[[bin]]
+name = "haqlite"
+path = "src/bin/main.rs"
 
 [[bin]]
 name = "haqlite-ha-experiment"
@@ -66,3 +76,7 @@ async-trait = "0.1"
 futures = "0.3"
 chrono = "0.4"
 serde_json = "1"
+tower = { version = "0.5", features = ["util"] }
+http = "1"
+http-body-util = "0.1"
+axum = "0.8"

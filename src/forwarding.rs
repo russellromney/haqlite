@@ -128,11 +128,11 @@ pub(crate) struct ForwardedQuery {
     pub params: Vec<SqlValue>,
 }
 
-/// Response body for forwarded query calls — returns a single row.
+/// Response body for forwarded query calls — returns all matching rows.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct QueryResult {
     pub columns: Vec<String>,
-    pub values: Vec<SqlValue>,
+    pub rows: Vec<Vec<SqlValue>>,
 }
 
 /// Handler for `POST /haqlite/query` — receives forwarded reads from clients.
@@ -163,19 +163,25 @@ pub(crate) async fn handle_forwarded_query(
         .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
         .collect();
 
-    let values = stmt
-        .query_row(param_refs.as_slice(), |row| {
-            let mut vals = Vec::with_capacity(column_count);
-            for i in 0..column_count {
-                let val: rusqlite::types::Value = row.get(i)?;
-                vals.push(SqlValue::from_rusqlite(val));
-            }
-            Ok(vals)
-        })
-        .map_err(|e| {
-            tracing::error!("Forwarded query failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let mut rows_iter = stmt.query(param_refs.as_slice()).map_err(|e| {
+        tracing::error!("Forwarded query failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let mut rows = Vec::new();
+    while let Some(row) = rows_iter.next().map_err(|e| {
+        tracing::error!("Forwarded query row iteration failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })? {
+        let mut vals = Vec::with_capacity(column_count);
+        for i in 0..column_count {
+            let val: rusqlite::types::Value = row.get(i).map_err(|e| {
+                tracing::error!("Forwarded query column read failed: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            vals.push(SqlValue::from_rusqlite(val));
+        }
+        rows.push(vals);
+    }
 
-    Ok(Json(QueryResult { columns, values }))
+    Ok(Json(QueryResult { columns, rows }))
 }

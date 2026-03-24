@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use hadb::{HaClient, LeaseStore};
-use hadb_s3::S3LeaseStore;
+use hadb_lease_s3::S3LeaseStore;
 
 use crate::forwarding::{self, SqlValue};
 
@@ -190,13 +190,13 @@ impl HaQLiteClient {
         Ok(result.rows_affected)
     }
 
-    /// Query a single row. Returns column values as SqlValues.
+    /// Query and return all matching rows.
     ///
     /// If a read-replica path is configured, reads from the local DB
     /// (fresh connection per call). Otherwise forwards to the leader.
-    pub async fn query_row(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<SqlValue>> {
+    pub async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>> {
         if let Some(ref db_path) = self.read_replica_path {
-            return self.query_row_local(db_path, sql, params);
+            return self.query_local(db_path, sql, params);
         }
 
         let body = forwarding::ForwardedQuery {
@@ -209,7 +209,17 @@ impl HaQLiteClient {
             .forward("/haqlite/query", &body)
             .await?;
 
-        Ok(result.values)
+        Ok(result.rows)
+    }
+
+    /// Query a single row. Returns column values as SqlValues.
+    ///
+    /// Returns an error if the query returns zero rows.
+    pub async fn query_row(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<SqlValue>> {
+        let rows = self.query(sql, params).await?;
+        rows.into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("query returned no rows"))
     }
 
     /// Get the current leader address (cached — may be stale).
@@ -230,12 +240,12 @@ impl HaQLiteClient {
     ///
     /// Opens a new read-only rusqlite::Connection per call — no pooling.
     /// This ensures external WAL applies (by walrust) are always visible.
-    fn query_row_local(
+    fn query_local(
         &self,
         db_path: &PathBuf,
         sql: &str,
         params: &[SqlValue],
-    ) -> Result<Vec<SqlValue>> {
+    ) -> Result<Vec<Vec<SqlValue>>> {
         let conn = rusqlite::Connection::open_with_flags(
             db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -245,26 +255,35 @@ impl HaQLiteClient {
         let rusqlite_params: Vec<rusqlite::types::Value> =
             params.iter().map(|p| p.to_rusqlite()).collect();
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            rusqlite_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            rusqlite_params
+                .iter()
+                .map(|p| p as &dyn rusqlite::types::ToSql)
+                .collect();
 
         let mut stmt = conn
             .prepare(sql)
             .map_err(|e| anyhow!("Failed to prepare query: {}", e))?;
 
         let column_count = stmt.column_count();
-
-        let values = stmt
-            .query_row(param_refs.as_slice(), |row| {
-                let mut vals = Vec::with_capacity(column_count);
-                for i in 0..column_count {
-                    let val: rusqlite::types::Value = row.get(i)?;
-                    vals.push(SqlValue::from_rusqlite(val));
-                }
-                Ok(vals)
-            })
+        let mut rows_iter = stmt
+            .query(param_refs.as_slice())
             .map_err(|e| anyhow!("Query failed: {}", e))?;
+        let mut rows = Vec::new();
+        while let Some(row) = rows_iter
+            .next()
+            .map_err(|e| anyhow!("Row iteration failed: {}", e))?
+        {
+            let mut vals = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                let val: rusqlite::types::Value = row
+                    .get(i)
+                    .map_err(|e| anyhow!("Column {i} read failed: {}", e))?;
+                vals.push(SqlValue::from_rusqlite(val));
+            }
+            rows.push(vals);
+        }
 
-        Ok(values)
+        Ok(rows)
     }
 }
 
