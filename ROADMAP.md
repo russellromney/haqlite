@@ -58,6 +58,114 @@
 | `haqlite/src/bin/main.rs` | resolve_prefix, wire prefix, fix outputs, explain override |
 | `haqlite/tests/test_ops.rs` | update 37 tests, add ~8 prefix tests |
 
+## Phase Rampart: Production Hardening (from hakuzu)
+
+> After: Phase Meridian · Before: SQLite Extensions Support
+
+hakuzu has been hardened through 10 phases of production work. haqlite is missing 5 features that hakuzu already has. All code should be extracted from hakuzu's existing implementation, not written new.
+
+**Ordering constraint:** Rampart-a must precede Rampart-c (semaphore returns `EngineClosed` variant). Rampart-c must precede Rampart-d (close() shuts down the semaphore). Rampart-e is atomic with hadb Phase Beacon (see below). Rampart-b is independent.
+
+### Rampart-a: Structured Error Types
+
+haqlite uses `anyhow::Result` everywhere (`src/database.rs:377,390,430,531,551,569`). Consumers (like cinch-engine) cannot match on failure modes. hakuzu solved this with a `HakuzuError` enum.
+
+- New file: `src/error.rs` (~55 lines, extracted from `hakuzu/src/error.rs`)
+- Variants: `LeaderUnavailable(String)`, `NotLeader`, `DatabaseError(String)`, `ReplicationError(String)`, `CoordinatorError(String)`, `EngineClosed`
+- `impl Display`, `impl Error`, `impl From<anyhow::Error>`, `type Result<T>`
+- Replace `anyhow::Result` returns in public API: `execute()`, `query_row()`, `query_values()`, `close()`, `handoff()`
+- Internal methods can stay `anyhow` where the error gets converted at the boundary
+- Add `mod error; pub use error::{HaQLiteError, Result};` to `src/lib.rs`
+
+Source: `hakuzu/src/error.rs:8-51` (copy, rename `HakuzuError` to `HaQLiteError`, rename `JournalError` to `ReplicationError`)
+
+Tests (~10, extracted from `hakuzu/src/error.rs` test module):
+- Display for each variant, Error trait, From<anyhow>, Result alias, exhaustive match
+
+### Rampart-b: Forwarding Retry with Backoff
+
+haqlite's `execute_forwarded()` (`src/database.rs:569-604`) makes a single HTTP request with no retry. hakuzu retries with exponential backoff (100ms, 400ms, 1600ms) and skips retry on 4xx client errors.
+
+This is a **pattern extraction**, not a copy-paste. hakuzu sends `{cypher, params}` to `/hakuzu/execute` and parses `{ok: bool}`; haqlite sends `{sql, params}` to `/haqlite/execute` and parses `{rows_affected: u64}`. The retry loop structure (backoff timing, 4xx skip, exhaustion error) is identical; the request/response handling differs.
+
+- Extract the retry loop structure from hakuzu's `execute_forwarded`
+- Backoffs: `[100ms, 400ms, 1600ms]` (same as hakuzu)
+- Don't retry 4xx (client errors won't succeed on retry)
+- Return `HaQLiteError::LeaderUnavailable` on exhaustion, `HaQLiteError::NotLeader` if no leader address
+
+Source: `hakuzu/src/database.rs:816-885` (retry loop pattern to adapt, not copy verbatim)
+
+Tests (~3):
+- Forwarding succeeds on first attempt
+- Forwarding retries on 5xx, succeeds on second attempt
+- Forwarding does NOT retry on 4xx
+
+### Rampart-c: Read Semaphore
+
+haqlite has no read concurrency control. On a follower, every `query_row()` and `query_values()` opens a fresh `rusqlite::Connection` (`src/database.rs:414-421`). Under load this is unbounded.
+
+- Add `read_semaphore: tokio::sync::Semaphore` to `HaQLiteInner`
+- Add `read_concurrency: usize` to `HaQLiteBuilder` (default 32)
+- Add `.read_concurrency(n)` builder method
+- Wrap follower reads in `query_row()` and `query_values()` with `self.inner.read_semaphore.acquire()` (return `HaQLiteError::EngineClosed` if semaphore is closed)
+- Leader reads through the persistent rw connection don't need the semaphore (already serialized by the Mutex)
+
+Source: `hakuzu/src/database.rs:74,92,166-167,324,346,609-615,762` (semaphore creation, builder method, acquire in query, close)
+
+Tests (~3):
+- Read semaphore limits concurrent follower reads
+- Read semaphore does not block leader reads
+- Closed semaphore returns EngineClosed
+
+### Rampart-d: Graceful Shutdown with Drain
+
+haqlite's `close()` (`src/database.rs:531-545`) does not drain in-flight writes or seal the journal before leaving. hakuzu's `close()` acquires the write mutex (drains in-flight writes), seals the journal via `replicator.sync()`, then leaves the cluster.
+
+- Acquire write mutex before leaving (drain in-flight writes). haqlite currently has no write mutex; add `write_mutex: Arc<tokio::sync::Mutex<()>>` to `HaQLiteInner` (same pattern as hakuzu `src/database.rs:343`).
+- Call `replicator.sync(&db_name)` to flush pending WAL + upload. **Verify first:** confirm walrust's `SqliteReplicator::sync()` actually flushes pending WAL data and uploads to S3. If it's a no-op or partial, the drain is incomplete and we need to fix walrust first.
+- Close the read semaphore (new reads get `EngineClosed` immediately)
+- Then leave cluster and abort background tasks
+- Wait for background task handles (so `Arc<HaQLiteInner>` refs are released before drop)
+
+Source: `hakuzu/src/database.rs:759-793` (complete close() with drain, seal, abort, await)
+
+Tests (~2):
+- Close drains in-flight writes (start a write, call close, write completes)
+- Close seals journal before leaving cluster
+
+### Rampart-e: Follower Readiness
+
+**Atomicity: Rampart-e MUST land simultaneously with hadb Phase Beacon and hakuzu Phase Parity.** Phase Beacon changes the `FollowerBehavior` trait signature. haqlite's `SqliteFollowerBehavior` implements this trait and must update in the same coordinated change.
+
+After hadb Phase Beacon adds readiness to the coordinator, haqlite gets `is_caught_up()` and `replay_position()` for free.
+
+- Cache `caught_up: Arc<AtomicBool>` and `position: Arc<AtomicU64>` from `Coordinator::join()` `JoinResult` in `HaQLiteInner` (same pattern as hakuzu Phase Parity)
+- Add `is_caught_up(&self) -> bool` to `HaQLite` (single atomic load on cached Arc)
+- Add `replay_position(&self) -> u64` to `HaQLite` (single atomic load on cached Arc)
+- Add readiness to `prometheus_metrics()` output (same format as hakuzu)
+- Update `SqliteFollowerBehavior::run_follower_loop()` to accept the new `caught_up: Arc<AtomicBool>` parameter and add state transitions. Currently `SqliteFollowerBehavior` has NO readiness tracking at all (`src/follower_behavior.rs:31-80`). Add `caught_up.store(true/false)` following hakuzu's state machine:
+  - Empty poll (no new LTX files) = `caught_up.store(true)`
+  - New data downloaded = `caught_up.store(false)`
+  - Successful replay = `caught_up.store(true)`
+
+Source: `hakuzu/src/database.rs:682-717` (is_caught_up, replay_position, prometheus readiness), `hakuzu/src/follower_behavior.rs:109-161` (caught_up state machine to replicate)
+
+Tests (~3):
+- Leader is always caught up
+- Follower caught_up transitions (false after download, true after replay)
+- Readiness appears in prometheus output
+
+### Files
+
+| File | Changes |
+|------|---------|
+| `haqlite/src/error.rs` | NEW: structured error types (from hakuzu/src/error.rs) |
+| `haqlite/src/database.rs` | forwarding retry, read semaphore, write mutex, graceful close, readiness, JoinResult destructuring |
+| `haqlite/src/lib.rs` | pub use error types |
+| `haqlite/src/follower_behavior.rs` | caught_up state transitions (from Phase Beacon trait) |
+
+---
+
 ## SQLite Extensions Support
 
 haqlite should support SQLite extensions (sqlite-vec, FTS5, sqlean, etc.) across the cluster. Extensions must be loaded on ALL connections — leader rw, follower reads, and walrust LTX apply — otherwise WAL replay fails or silently corrupts data.
