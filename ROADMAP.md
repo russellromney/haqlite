@@ -1,32 +1,62 @@
 # haqlite Roadmap
 
-## Read Replicas (Scale-Out Reads)
+## Phase Meridian: Wire Up CLI Commands
 
-Followers currently forward writes to the leader but reads are local. Add explicit read-replica connections that don't join the forwarding path — as long as the app uses read-after-write patterns (write to leader, then read locally), reads can scale to arbitrary nodes.
+> After: hadb-cli + haqlite serve + hrana + ops implementation
 
-- `HaQLiteClient` option for read-only mode (no write forwarding, only queries)
-- Read-replica connection that queries the local follower DB directly
-- Document read-after-write consistency guarantees
+`haqlite serve` is production-ready. The 6 non-serve commands (restore, list, verify, compact, replicate, snapshot) plus explain all have issues that make them broken or misleading in practice.
 
-### How to build this
+### Problems
 
-The current `HaQLiteClient` (in `src/client.rs`) connects to a remote HaQLite node over HTTP. Both `execute()` and `query_row()` go through the forwarding server (`/haqlite/execute` and `/haqlite/query` endpoints in `src/forwarding.rs`). For read replicas, the client needs a mode where reads go to the local follower's SQLite DB file instead of over HTTP.
+1. **No `--prefix` on non-serve commands** -- serve uses prefix `"haqlite/"` but every other command hardcodes `""`. They can't find any data created by serve.
+2. **Compact GFS flags are fake** -- `--hourly/--daily/--weekly/--monthly` just get summed into keep-N. No temporal bucketing.
+3. **Replicate has no graceful shutdown** -- loops forever, no SIGTERM handling.
+4. **Restore uses tracing, not println** -- inconsistent with every other command's output.
+5. **Snapshot doesn't report S3 location** -- user can't tell what name was used or where it went.
+6. **Explain dumps raw Rust Debug** for product config section.
+7. **Arg help text unclear** about "name in S3" vs "local file path".
 
-**What to change in `src/client.rs`:**
-- Add a `.read_replica(db_path)` option to `HaQLiteClientBuilder` that stores a local DB path
-- When in read-replica mode, `query_row()` opens a fresh read-only SQLite connection to that local path and queries directly — no HTTP round-trip
-- `execute()` still forwards to the leader over HTTP (unchanged)
+### Meridian-a: hadb-cli changes
 
-**Critical constraint — no connection pooling for reads:**
-Walrust applies LTX files (WAL deltas) by modifying the DB file directly from outside SQLite. Persistent read-only connections hold stale snapshots and won't see these external changes. The test `regression_fresh_connection_sees_file_changes` in `tests/ha_database.rs` exists specifically for this. A read pool was attempted and reverted (see CHANGELOG). Followers MUST open a fresh `rusqlite::Connection` per read.
+- Add `--prefix` to `S3Args` (`args.rs`): `#[arg(long, env = "HADB_PREFIX", default_value = "")]`. Products apply their own default.
+- Replace 4 GFS flags with `--keep N` on `CompactArgs` (default 47, preserves old sum). Honest about what it does.
+- Improve help text on positional args (name = "Database name in S3", database = "Path to local database file").
+- Update explain default in `runner.rs`, fix test compilation.
+- `RetentionSection` in config stays (serve may use it for scheduled snapshots later).
 
-**Consistency tradeoff to document:**
-If a client writes via `execute()` (forwarded to leader) and immediately calls `query_row()` (local read), the local follower may not have pulled that write yet. The walrust pull interval (configured in `CoordinatorConfig`) determines the replication lag. Users who need strict read-after-write should either query the leader directly (standard `HaQLiteClient` without read-replica mode) or accept a short delay. This is the fundamental tradeoff of read replicas — you get horizontal read scale at the cost of eventual consistency.
+### Meridian-b: haqlite ops prefix threading
 
-**Testing:**
-- Unit test: read-replica client reads from local DB file
-- Integration test: two nodes, write through client to leader, wait for pull interval, read-replica client on follower sees the write
-- Negative test: read-replica `execute()` still goes to leader (doesn't try to write locally)
+- Add `prefix: &str` param to all 7 ops functions (`discover_ltx_files`, `discover_databases`, `list_databases`, `verify_database`, `plan_compact`, `snapshot_database`, `replicate_database`).
+- Add `normalize_prefix()` helper (handles missing trailing slash).
+- `snapshot_database` returns `SnapshotResult { txid, db_name }` instead of bare `u64`.
+- Wrap replicate loop in `tokio::select!` with `hadb_cli::shutdown_signal()`.
+
+### Meridian-c: haqlite CLI dispatch
+
+- Add `DEFAULT_PREFIX = "haqlite/"` and `resolve_prefix()` helper to `main.rs`. If `--prefix` is empty (default from hadb-cli), use `"haqlite/"`.
+- Wire `resolve_prefix(&args.s3)` through all 6 commands.
+- Fix restore: `println!` instead of `tracing::info!`.
+- Fix snapshot: print db_name and TXID from `SnapshotResult`.
+- Update compact: `args.keep` instead of `args.hourly + ... + args.monthly`.
+- Override `explain()` with clean formatted ServeConfig output.
+
+### Meridian-d: Tests
+
+- Update all 37 existing ops tests: add `""` as prefix param (no test data changes needed).
+- Update snapshot tests to destructure `SnapshotResult`.
+- Add ~8 new tests: prefix discovery, prefix isolation, prefix normalization, snapshot result fields.
+- Fix hadb-cli test compilation for new S3Args/CompactArgs fields.
+
+### Files
+
+| File | Changes |
+|------|---------|
+| `hadb/hadb-cli/src/args.rs` | prefix on S3Args, --keep on CompactArgs, help text |
+| `hadb/hadb-cli/src/runner.rs` | explain default, test fix |
+| `hadb/hadb-cli/src/config.rs` | keep field on RetentionSection |
+| `haqlite/src/ops.rs` | prefix params, SnapshotResult, shutdown, normalize_prefix |
+| `haqlite/src/bin/main.rs` | resolve_prefix, wire prefix, fix outputs, explain override |
+| `haqlite/tests/test_ops.rs` | update 37 tests, add ~8 prefix tests |
 
 ## SQLite Extensions Support
 

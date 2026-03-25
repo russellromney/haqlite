@@ -27,6 +27,7 @@ pub mod database;
 pub mod follower_behavior;
 pub mod forwarding;
 pub mod hrana;
+pub mod ops;
 pub mod replicator;
 pub mod serve;
 
