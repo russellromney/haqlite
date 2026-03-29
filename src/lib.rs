@@ -34,12 +34,17 @@ pub use rusqlite;
 // Re-export hadb types.
 pub use hadb::{
     Coordinator, CoordinatorConfig, HaMetrics, InMemoryLeaseStore, LeaseConfig,
-    LeaseData, MetricsSnapshot, NodeRegistration, NodeRegistry, Role, RoleEvent,
+    LeaseData, LeaseStore, MetricsSnapshot, NodeRegistration, NodeRegistry, Role, RoleEvent,
 };
 
-// Re-export hadb-s3 implementations.
-pub use hadb_s3::{S3LeaseStore, S3NodeRegistry, S3StorageBackend};
+// Re-export hadb-lease-s3 implementations.
+pub use hadb_lease_s3::{S3LeaseStore, S3NodeRegistry, S3StorageBackend};
 
 // Re-export SQLite-specific implementations.
 pub use follower_behavior::SqliteFollowerBehavior;
 pub use replicator::SqliteReplicator;
+
+// Re-export walrust types so downstream crates don't need a direct walrust dependency.
+pub use walrust::storage::S3Backend as WalrustS3Backend;
+pub use walrust::storage::StorageBackend as WalrustStorageBackend;
+pub use walrust::sync::ReplicationConfig;

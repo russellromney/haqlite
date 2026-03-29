@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use axum::routing::post;
 use hadb::{CoordinatorConfig, Coordinator, LeaseConfig, Role, RoleEvent};
-use hadb_s3::S3LeaseStore;
+use hadb_lease_s3::S3LeaseStore;
 
 use crate::follower_behavior::SqliteFollowerBehavior;
 use crate::forwarding::{self, ForwardingState, SqlValue};

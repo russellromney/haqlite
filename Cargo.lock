@@ -1301,7 +1301,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hadb-s3"
+name = "hadb-lease-s3"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1331,7 +1331,7 @@ dependencies = [
  "clap",
  "futures",
  "hadb",
- "hadb-s3",
+ "hadb-lease-s3",
  "hostname",
  "rand 0.8.5",
  "reqwest",

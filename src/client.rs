@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use hadb::{HaClient, LeaseStore};
-use hadb_s3::S3LeaseStore;
+use hadb_lease_s3::S3LeaseStore;
 
 use crate::forwarding::{self, SqlValue};
 

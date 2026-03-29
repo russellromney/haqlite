@@ -12,7 +12,7 @@ categories = ["database", "network-programming"]
 [dependencies]
 # HA coordination framework
 hadb = { path = "../hadb/hadb" }
-hadb-s3 = { path = "../hadb/hadb-s3" }
+hadb-lease-s3 = { path = "../hadb/hadb-lease-s3" }
 
 # WAL sync primitives
 walrust = "0.1.0"
