@@ -68,7 +68,7 @@ hakuzu has been hardened through 10 phases of production work. haqlite is missin
 
 ### Rampart-a: Structured Error Types
 
-haqlite uses `anyhow::Result` everywhere (`src/database.rs:377,390,430,531,551,569`). Consumers (like cinch-engine) cannot match on failure modes. hakuzu solved this with a `HakuzuError` enum.
+haqlite uses `anyhow::Result` everywhere (`src/database.rs:377,390,430,531,551,569`). Consumers cannot match on failure modes. hakuzu solved this with a `HakuzuError` enum.
 
 - New file: `src/error.rs` (~55 lines, extracted from `hakuzu/src/error.rs`)
 - Variants: `LeaderUnavailable(String)`, `NotLeader`, `DatabaseError(String)`, `ReplicationError(String)`, `CoordinatorError(String)`, `EngineClosed`
