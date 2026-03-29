@@ -6,8 +6,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use walrust::sync::ReplicationConfig;
-use walrust::storage::StorageBackend;
+use walrust::ReplicationConfig;
+use walrust::StorageBackend;
 
 use hadb::Replicator;
 

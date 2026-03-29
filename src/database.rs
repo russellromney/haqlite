@@ -1,12 +1,18 @@
 //! HaQLite: dead-simple embedded HA SQLite.
 //!
-//! ```ignore
+//! ```no_run
+//! # #[tokio::main]
+//! # async fn main() -> anyhow::Result<()> {
+//! use haqlite::{HaQLite, SqlValue};
+//!
 //! let db = HaQLite::builder("my-bucket")
 //!     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);")
 //!     .await?;
 //!
 //! db.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Alice".into())]).await?;
 //! let count: i64 = db.query_row("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -34,12 +40,18 @@ const ROLE_FOLLOWER: u8 = 1;
 ///
 /// Only the bucket is required — everything else has sensible defaults.
 ///
-/// ```ignore
+/// ```no_run
+/// # #[tokio::main]
+/// # async fn main() -> anyhow::Result<()> {
+/// use haqlite::HaQLite;
+///
 /// let db = HaQLite::builder("my-bucket")
 ///     .prefix("myapp/")
 ///     .forwarding_port(19000)
 ///     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS ...")
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct HaQLiteBuilder {
     bucket: String,
@@ -157,8 +169,8 @@ impl HaQLiteBuilder {
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
 
         // Build walrust S3 storage backend (for SQLite WAL operations).
-        let walrust_storage: Arc<dyn walrust::storage::StorageBackend> = Arc::new(
-            walrust::storage::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
+        let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(
+            walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
         );
 
         // Build S3 lease store (for CAS leases).
@@ -169,7 +181,7 @@ impl HaQLiteBuilder {
         config.lease = Some(LeaseConfig::new(instance_id.clone(), address.clone()));
 
         // Build SQLite-specific components.
-        let replication_config = walrust::sync::ReplicationConfig {
+        let replication_config = walrust::ReplicationConfig {
             sync_interval: config.sync_interval,
             snapshot_interval: config.snapshot_interval,
             ..Default::default()
@@ -407,6 +419,66 @@ impl HaQLite {
                 .map_err(|e| anyhow!("Failed to open read-only connection: {}", e))?;
                 conn.query_row(sql, params, f)
                     .map_err(|e| anyhow!("query_row failed: {}", e))
+            }
+        }
+    }
+
+    /// Query and return rows as Vec<Vec<SqlValue>>. Always executes locally.
+    ///
+    /// Returns all matching rows. Each row is a Vec of column values.
+    /// Returns an empty Vec if no rows match (not an error).
+    pub fn query_values(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>> {
+        let rusqlite_params: Vec<rusqlite::types::Value> =
+            params.iter().map(|p| p.to_rusqlite()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            rusqlite_params
+                .iter()
+                .map(|p| p as &dyn rusqlite::types::ToSql)
+                .collect();
+
+        let query_with = |conn: &rusqlite::Connection| -> Result<Vec<Vec<SqlValue>>> {
+            let mut stmt = conn
+                .prepare(sql)
+                .map_err(|e| anyhow!("query prepare failed: {e}"))?;
+            let column_count = stmt.column_count();
+            let mut rows_iter = stmt
+                .query(param_refs.as_slice())
+                .map_err(|e| anyhow!("query failed: {e}"))?;
+            let mut rows = Vec::new();
+            while let Some(row) = rows_iter
+                .next()
+                .map_err(|e| anyhow!("row iteration failed: {e}"))?
+            {
+                let mut vals = Vec::with_capacity(column_count);
+                for i in 0..column_count {
+                    let val: rusqlite::types::Value = row
+                        .get(i)
+                        .map_err(|e| anyhow!("column {i} read failed: {e}"))?;
+                    vals.push(SqlValue::from_rusqlite(val));
+                }
+                rows.push(vals);
+            }
+            Ok(rows)
+        };
+
+        let role = self.inner.current_role();
+        match role {
+            Some(Role::Leader) | None => {
+                let conn_arc = self
+                    .inner
+                    .get_conn()
+                    .ok_or_else(|| anyhow!("No connection available"))?;
+                let conn = conn_arc.lock().unwrap();
+                query_with(&conn)
+            }
+            Some(Role::Follower) => {
+                let conn = rusqlite::Connection::open_with_flags(
+                    &self.inner.db_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+                .map_err(|e| anyhow!("Failed to open read-only connection: {e}"))?;
+                query_with(&conn)
             }
         }
     }

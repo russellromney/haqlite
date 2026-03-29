@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use tokio::sync::watch;
 
 use hadb::{FollowerBehavior, HaMetrics, Replicator};
-use walrust::storage::StorageBackend as WalrustStorageBackend;
+use walrust::StorageBackend as WalrustStorageBackend;
 
 /// SQLite-specific follower behavior.
 ///
