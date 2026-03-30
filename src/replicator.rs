@@ -67,11 +67,10 @@ impl Replicator for SqliteReplicator {
     }
 
     async fn sync(&self, name: &str) -> Result<()> {
-        // walrust doesn't have an explicit sync() method.
-        // The replicator syncs continuously in the background.
-        // For graceful shutdown, we just ensure remove() is called.
-        // This is a no-op since sync happens automatically.
-        tracing::debug!("SqliteReplicator::sync('{}') - background sync is automatic", name);
+        let frames = self.inner.flush(name).await?;
+        if frames > 0 {
+            tracing::info!("SqliteReplicator::sync('{}') flushed {} frames", name, frames);
+        }
         Ok(())
     }
 }
