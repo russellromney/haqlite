@@ -16,13 +16,13 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
 use axum::routing::post;
-use hadb::{CoordinatorConfig, Coordinator, LeaseConfig, Role, RoleEvent};
+use hadb::{CoordinatorConfig, Coordinator, JoinResult, LeaseConfig, Role, RoleEvent};
 use hadb_lease_s3::S3LeaseStore;
 
 use crate::error::HaQLiteError;
@@ -256,6 +256,10 @@ pub(crate) struct HaQLiteInner {
     pub(crate) secret: Option<String>,
     /// Limits concurrent follower reads. Closed on shutdown.
     read_semaphore: tokio::sync::Semaphore,
+    /// Whether the follower has caught up with the leader's WAL.
+    follower_caught_up: Arc<AtomicBool>,
+    /// Current follower replay position (TXID).
+    follower_replay_position: Arc<AtomicU64>,
 }
 
 impl HaQLiteInner {
@@ -324,6 +328,8 @@ impl HaQLite {
             http_client: reqwest::Client::new(),
             secret: None,
             read_semaphore: tokio::sync::Semaphore::new(DEFAULT_READ_CONCURRENCY),
+            follower_caught_up: Arc::new(AtomicBool::new(true)),
+            follower_replay_position: Arc::new(AtomicU64::new(0)),
         });
 
         // No forwarding server or role listener in local mode.
@@ -518,13 +524,41 @@ impl HaQLite {
         self.inner.coordinator.as_ref()
     }
 
+    /// Whether the follower has caught up with the leader's WAL.
+    /// Always true for leaders and local mode.
+    pub fn is_caught_up(&self) -> bool {
+        match self.inner.current_role() {
+            Some(Role::Leader) | None => true,
+            Some(Role::Follower) => self.inner.follower_caught_up.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Current follower replay position (TXID). Returns 0 for leaders/local mode.
+    pub fn replay_position(&self) -> u64 {
+        self.inner.follower_replay_position.load(Ordering::SeqCst)
+    }
+
     /// Get metrics in Prometheus exposition format.
     /// Returns None in local mode (no coordinator).
     pub fn prometheus_metrics(&self) -> Option<String> {
         self.inner
             .coordinator
             .as_ref()
-            .map(|c| c.metrics().snapshot().to_prometheus())
+            .map(|c| {
+                let mut output = c.metrics().snapshot().to_prometheus();
+                let caught_up = if self.is_caught_up() { 1 } else { 0 };
+                let position = self.replay_position();
+                output.push_str(&format!(
+                    "\n# HELP haqlite_follower_caught_up Whether follower is caught up (1=yes, 0=no)\n\
+                     # TYPE haqlite_follower_caught_up gauge\n\
+                     haqlite_follower_caught_up {}\n\
+                     # HELP haqlite_follower_replay_position Current follower replay TXID\n\
+                     # TYPE haqlite_follower_replay_position gauge\n\
+                     haqlite_follower_replay_position {}\n",
+                    caught_up, position,
+                ));
+                output
+            })
     }
 
     /// Graceful leader handoff — release leadership without shutting down.
@@ -679,8 +713,8 @@ async fn open_with_coordinator(
     let role_rx = coordinator.role_events();
 
     // Join the HA cluster.
-    let join_result = coordinator.join(db_name, &db_path).await?;
-    let initial_role = join_result.role;
+    let JoinResult { role: initial_role, caught_up, position } =
+        coordinator.join(db_name, &db_path).await?;
 
     let leader_addr = if initial_role == Role::Leader {
         address.to_string()
@@ -708,6 +742,8 @@ async fn open_with_coordinator(
         http_client,
         secret: secret.clone(),
         read_semaphore: tokio::sync::Semaphore::new(read_concurrency),
+        follower_caught_up: caught_up,
+        follower_replay_position: position,
     });
 
     // If leader, open rw connection.

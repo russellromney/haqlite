@@ -44,10 +44,9 @@ pub use rusqlite;
 // Re-export hadb types.
 pub use hadb::{
     Coordinator, CoordinatorConfig, HaMetrics, HaNode, HaNodeConfig,
-    InMemoryLeaseStore, LeaseConfig, LeaseData, LeaseStore, MetricsSnapshot,
+    InMemoryLeaseStore, JoinResult, LeaseConfig, LeaseData, LeaseStore, MetricsSnapshot,
     NodeRegistration, NodeRegistry, Role, RoleEvent,
 };
-pub use hadb::coordinator::JoinResult;
 
 // Re-export hadb-lease-s3 implementations.
 pub use hadb_lease_s3::{S3LeaseStore, S3NodeRegistry, S3StorageBackend};

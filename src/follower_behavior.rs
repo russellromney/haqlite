@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -36,7 +36,7 @@ impl FollowerBehavior for SqliteFollowerBehavior {
         db_path: &PathBuf,
         poll_interval: Duration,
         position: Arc<AtomicU64>,
-        caught_up: Arc<std::sync::atomic::AtomicBool>,
+        caught_up: Arc<AtomicBool>,
         mut cancel_rx: watch::Receiver<bool>,
         metrics: Arc<HaMetrics>,
     ) -> Result<()> {
@@ -55,6 +55,8 @@ impl FollowerBehavior for SqliteFollowerBehavior {
                     ).await {
                         Ok(new_txid) => {
                             if new_txid > current_txid {
+                                // New data downloaded -- not caught up until replay completes.
+                                caught_up.store(false, Ordering::SeqCst);
                                 tracing::debug!(
                                     "Follower '{}': pulled TXID {} -> {}",
                                     db_name, current_txid, new_txid
@@ -62,7 +64,10 @@ impl FollowerBehavior for SqliteFollowerBehavior {
                                 position.store(new_txid, Ordering::SeqCst);
                                 caught_up.store(true, Ordering::SeqCst);
                                 metrics.inc(&metrics.follower_pulls_succeeded);
+                                // Replay succeeded (pull_incremental applies the WAL).
+                                caught_up.store(true, Ordering::SeqCst);
                             } else {
+                                // Empty poll -- no new data means we are caught up.
                                 caught_up.store(true, Ordering::SeqCst);
                                 metrics.inc(&metrics.follower_pulls_no_new_data);
                             }
