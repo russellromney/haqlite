@@ -20,11 +20,12 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use axum::routing::post;
 use hadb::{CoordinatorConfig, Coordinator, LeaseConfig, Role, RoleEvent};
 use hadb_lease_s3::S3LeaseStore;
 
+use crate::error::HaQLiteError;
 use crate::follower_behavior::SqliteFollowerBehavior;
 use crate::forwarding::{self, ForwardingState, SqlValue};
 use crate::replicator::SqliteReplicator;
@@ -53,6 +54,8 @@ const ROLE_FOLLOWER: u8 = 1;
 /// # Ok(())
 /// # }
 /// ```
+const DEFAULT_READ_CONCURRENCY: usize = 32;
+
 pub struct HaQLiteBuilder {
     bucket: String,
     prefix: String,
@@ -63,6 +66,7 @@ pub struct HaQLiteBuilder {
     forward_timeout: Duration,
     coordinator_config: Option<CoordinatorConfig>,
     secret: Option<String>,
+    read_concurrency: usize,
 }
 
 impl HaQLiteBuilder {
@@ -77,6 +81,7 @@ impl HaQLiteBuilder {
             forward_timeout: DEFAULT_FORWARD_TIMEOUT,
             coordinator_config: None,
             secret: None,
+            read_concurrency: DEFAULT_READ_CONCURRENCY,
         }
     }
 
@@ -131,6 +136,11 @@ impl HaQLiteBuilder {
         self
     }
 
+    /// Maximum concurrent follower reads. Default: 32.
+    pub fn read_concurrency(mut self, n: usize) -> Self {
+        self.read_concurrency = n;
+        self
+    }
 
     /// Open the database and join the HA cluster.
     ///
@@ -212,6 +222,7 @@ impl HaQLiteBuilder {
             self.forwarding_port,
             self.forward_timeout,
             self.secret,
+            self.read_concurrency,
         )
         .await
     }
@@ -234,7 +245,7 @@ pub(crate) struct HaQLiteInner {
     pub(crate) coordinator: Option<Arc<Coordinator>>,
     pub(crate) db_name: String,
     pub(crate) db_path: PathBuf,
-    /// Cached role — updated atomically by the role event listener.
+    /// Cached role -- updated atomically by the role event listener.
     role: AtomicU8,
     /// Read-write connection when leader, None when follower.
     pub(crate) conn: RwLock<Option<Arc<Mutex<rusqlite::Connection>>>>,
@@ -243,6 +254,8 @@ pub(crate) struct HaQLiteInner {
     pub(crate) http_client: reqwest::Client,
     /// Shared secret for authenticating forwarding requests.
     pub(crate) secret: Option<String>,
+    /// Limits concurrent follower reads. Closed on shutdown.
+    read_semaphore: tokio::sync::Semaphore,
 }
 
 impl HaQLiteInner {
@@ -310,6 +323,7 @@ impl HaQLite {
             leader_address: RwLock::new(String::new()),
             http_client: reqwest::Client::new(),
             secret: None,
+            read_semaphore: tokio::sync::Semaphore::new(DEFAULT_READ_CONCURRENCY),
         });
 
         // No forwarding server or role listener in local mode.
@@ -366,6 +380,7 @@ impl HaQLite {
             forwarding_port,
             forward_timeout,
             secret,
+            DEFAULT_READ_CONCURRENCY,
         )
         .await
     }
@@ -374,7 +389,7 @@ impl HaQLite {
     ///
     /// On the leader: executes locally.
     /// On a follower: forwards to the leader via HTTP.
-    pub async fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+    pub async fn execute(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
         let role = self.inner.current_role();
 
         match role {
@@ -392,7 +407,7 @@ impl HaQLite {
         sql: &str,
         params: &[&dyn rusqlite::types::ToSql],
         f: F,
-    ) -> Result<T>
+    ) -> std::result::Result<T, HaQLiteError>
     where
         F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     {
@@ -403,22 +418,25 @@ impl HaQLite {
                 let conn_arc = self
                     .inner
                     .get_conn()
-                    .ok_or_else(|| anyhow!("No connection available"))?;
+                    .ok_or(HaQLiteError::DatabaseError("No connection available".into()))?;
                 let conn = conn_arc.lock().unwrap();
                 conn.query_row(sql, params, f)
-                    .map_err(|e| anyhow!("query_row failed: {}", e))
+                    .map_err(|e| HaQLiteError::DatabaseError(format!("query_row failed: {e}")))
             }
             Some(Role::Follower) => {
+                // Bound concurrent follower reads via semaphore.
+                let _permit = self.inner.read_semaphore.try_acquire()
+                    .map_err(|_| HaQLiteError::EngineClosed)?;
                 // Followers must open fresh connections each time because walrust
-                // applies LTX files externally — pooled connections hold stale snapshots.
+                // applies LTX files externally -- pooled connections hold stale snapshots.
                 let conn = rusqlite::Connection::open_with_flags(
                     &self.inner.db_path,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 )
-                .map_err(|e| anyhow!("Failed to open read-only connection: {}", e))?;
+                .map_err(|e| HaQLiteError::DatabaseError(format!("Failed to open read-only connection: {e}")))?;
                 conn.query_row(sql, params, f)
-                    .map_err(|e| anyhow!("query_row failed: {}", e))
+                    .map_err(|e| HaQLiteError::DatabaseError(format!("query_row failed: {e}")))
             }
         }
     }
@@ -427,7 +445,7 @@ impl HaQLite {
     ///
     /// Returns all matching rows. Each row is a Vec of column values.
     /// Returns an empty Vec if no rows match (not an error).
-    pub fn query_values(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>> {
+    pub fn query_values(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
         let rusqlite_params: Vec<rusqlite::types::Value> =
             params.iter().map(|p| p.to_rusqlite()).collect();
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -436,24 +454,24 @@ impl HaQLite {
                 .map(|p| p as &dyn rusqlite::types::ToSql)
                 .collect();
 
-        let query_with = |conn: &rusqlite::Connection| -> Result<Vec<Vec<SqlValue>>> {
+        let query_with = |conn: &rusqlite::Connection| -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
             let mut stmt = conn
                 .prepare(sql)
-                .map_err(|e| anyhow!("query prepare failed: {e}"))?;
+                .map_err(|e| HaQLiteError::DatabaseError(format!("query prepare failed: {e}")))?;
             let column_count = stmt.column_count();
             let mut rows_iter = stmt
                 .query(param_refs.as_slice())
-                .map_err(|e| anyhow!("query failed: {e}"))?;
+                .map_err(|e| HaQLiteError::DatabaseError(format!("query failed: {e}")))?;
             let mut rows = Vec::new();
             while let Some(row) = rows_iter
                 .next()
-                .map_err(|e| anyhow!("row iteration failed: {e}"))?
+                .map_err(|e| HaQLiteError::DatabaseError(format!("row iteration failed: {e}")))?
             {
                 let mut vals = Vec::with_capacity(column_count);
                 for i in 0..column_count {
                     let val: rusqlite::types::Value = row
                         .get(i)
-                        .map_err(|e| anyhow!("column {i} read failed: {e}"))?;
+                        .map_err(|e| HaQLiteError::DatabaseError(format!("column {i} read failed: {e}")))?;
                     vals.push(SqlValue::from_rusqlite(val));
                 }
                 rows.push(vals);
@@ -467,17 +485,19 @@ impl HaQLite {
                 let conn_arc = self
                     .inner
                     .get_conn()
-                    .ok_or_else(|| anyhow!("No connection available"))?;
+                    .ok_or(HaQLiteError::DatabaseError("No connection available".into()))?;
                 let conn = conn_arc.lock().unwrap();
                 query_with(&conn)
             }
             Some(Role::Follower) => {
+                let _permit = self.inner.read_semaphore.try_acquire()
+                    .map_err(|_| HaQLiteError::EngineClosed)?;
                 let conn = rusqlite::Connection::open_with_flags(
                     &self.inner.db_path,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 )
-                .map_err(|e| anyhow!("Failed to open read-only connection: {e}"))?;
+                .map_err(|e| HaQLiteError::DatabaseError(format!("Failed to open read-only connection: {e}")))?;
                 query_with(&conn)
             }
         }
@@ -512,32 +532,41 @@ impl HaQLite {
     /// The node transitions to follower (can still serve reads while draining).
     /// A follower on another node will see the released lease and promote itself.
     /// Returns `Ok(true)` if handoff succeeded, `Ok(false)` if not the leader.
-    pub async fn handoff(&self) -> Result<bool> {
+    pub async fn handoff(&self) -> std::result::Result<bool, HaQLiteError> {
         let coordinator = match &self.inner.coordinator {
             Some(c) => c,
-            None => return Ok(false), // local mode — no HA
+            None => return Ok(false), // local mode -- no HA
         };
 
-        let result = coordinator.handoff(&self.inner.db_name).await?;
+        let result = coordinator
+            .handoff(&self.inner.db_name)
+            .await
+            .map_err(|e| HaQLiteError::CoordinatorError(e.to_string()))?;
         if result {
-            // Close rw connection — role listener will also catch the Demoted event,
+            // Close rw connection -- role listener will also catch the Demoted event,
             // but we do it eagerly here.
             self.inner.set_conn(None);
         }
         Ok(result)
     }
 
-    /// Cleanly shut down: close connections, leave cluster, abort background tasks.
-    pub async fn close(self) -> Result<()> {
-        // Close connection.
+    /// Cleanly shut down: drain in-flight operations, leave cluster, abort background tasks.
+    pub async fn close(self) -> std::result::Result<(), HaQLiteError> {
+        // 1. Close read semaphore -- new reads get EngineClosed immediately.
+        self.inner.read_semaphore.close();
+
+        // 2. Close connection (drains in-flight writes via the Mutex).
         self.inner.set_conn(None);
 
-        // Leave the cluster.
+        // 3. Leave the cluster (releases lease).
         if let Some(ref coordinator) = self.inner.coordinator {
-            coordinator.leave(&self.inner.db_name).await?;
+            coordinator
+                .leave(&self.inner.db_name)
+                .await
+                .map_err(|e| HaQLiteError::CoordinatorError(e.to_string()))?;
         }
 
-        // Abort background tasks.
+        // 4. Abort background tasks and wait for handles to drop.
         self._fwd_handle.abort();
         self._role_handle.abort();
 
@@ -548,11 +577,11 @@ impl HaQLite {
     // Internal
     // ========================================================================
 
-    fn execute_local(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+    fn execute_local(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
         let conn_arc = self
             .inner
             .get_conn()
-            .ok_or_else(|| anyhow!("No write connection available (not leader?)"))?;
+            .ok_or(HaQLiteError::DatabaseError("No write connection available (not leader?)".into()))?;
         let conn = conn_arc.lock().unwrap();
 
         let values: Vec<rusqlite::types::Value> = params.iter().map(|p| p.to_rusqlite()).collect();
@@ -561,15 +590,15 @@ impl HaQLite {
 
         let rows = conn
             .execute(sql, param_refs.as_slice())
-            .map_err(|e| anyhow!("execute failed: {}", e))?;
+            .map_err(|e| HaQLiteError::DatabaseError(format!("execute failed: {e}")))?;
 
         Ok(rows as u64)
     }
 
-    async fn execute_forwarded(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+    async fn execute_forwarded(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
         let leader_addr = self.inner.leader_addr();
         if leader_addr.is_empty() {
-            return Err(anyhow!("No leader address available — cannot forward write"));
+            return Err(HaQLiteError::NotLeader);
         }
 
         let url = format!("{}/haqlite/execute", leader_addr);
@@ -578,29 +607,54 @@ impl HaQLite {
             params: params.to_vec(),
         };
 
-        let mut req = self.inner.http_client.post(&url).json(&body);
-        if let Some(ref secret) = self.inner.secret {
-            req = req.bearer_auth(secret);
+        let backoffs = [
+            Duration::from_millis(100),
+            Duration::from_millis(400),
+            Duration::from_millis(1600),
+        ];
+        let mut last_err = String::new();
+
+        for (attempt, backoff) in std::iter::once(&Duration::ZERO).chain(backoffs.iter()).enumerate() {
+            if attempt > 0 {
+                tokio::time::sleep(*backoff).await;
+            }
+
+            let mut req = self.inner.http_client.post(&url).json(&body);
+            if let Some(ref secret) = self.inner.secret {
+                req = req.bearer_auth(secret);
+            }
+
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = format!("connection error: {e}");
+                    continue; // retry on connection failure
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                let result: forwarding::ExecuteResult = resp
+                    .json()
+                    .await
+                    .map_err(|e| HaQLiteError::LeaderUnavailable(format!("Failed to parse leader response: {e}")))?;
+                return Ok(result.rows_affected);
+            }
+
+            let body_text = resp.text().await.unwrap_or_default();
+
+            // Don't retry 4xx -- client errors won't succeed on retry.
+            if status.is_client_error() {
+                return Err(HaQLiteError::LeaderUnavailable(format!("Leader returned {status}: {body_text}")));
+            }
+
+            // 5xx -- retry with backoff.
+            last_err = format!("Leader returned {status}: {body_text}");
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| anyhow!("Failed to forward write to leader: {}", e))?;
 
-        if !resp.status().is_success() {
-            return Err(anyhow!(
-                "Leader returned error: {} {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            ));
-        }
-
-        let result: forwarding::ExecuteResult = resp
-            .json()
-            .await
-            .map_err(|e| anyhow!("Failed to parse leader response: {}", e))?;
-
-        Ok(result.rows_affected)
+        Err(HaQLiteError::LeaderUnavailable(format!(
+            "All forwarding attempts failed: {last_err}"
+        )))
     }
 }
 
@@ -617,6 +671,7 @@ async fn open_with_coordinator(
     forwarding_port: u16,
     forward_timeout: Duration,
     secret: Option<String>,
+    read_concurrency: usize,
 ) -> Result<HaQLite> {
     ensure_schema(&db_path, schema)?;
 
@@ -651,6 +706,7 @@ async fn open_with_coordinator(
         leader_address: RwLock::new(leader_addr),
         http_client,
         secret: secret.clone(),
+        read_semaphore: tokio::sync::Semaphore::new(read_concurrency),
     });
 
     // If leader, open rw connection.

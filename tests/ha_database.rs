@@ -13,8 +13,8 @@ use tempfile::TempDir;
 use tokio::sync::Mutex;
 
 use haqlite::{
-    Coordinator, CoordinatorConfig, HaQLite, HaQLiteClient, InMemoryLeaseStore, LeaseConfig, Role,
-    SqliteFollowerBehavior, SqliteReplicator, SqlValue,
+    Coordinator, CoordinatorConfig, HaQLite, HaQLiteClient, HaQLiteError, InMemoryLeaseStore,
+    LeaseConfig, Role, SqliteFollowerBehavior, SqliteReplicator, SqlValue,
 };
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS test_data (
@@ -701,4 +701,452 @@ async fn read_replica_sees_external_writes() {
         .await
         .unwrap();
     assert_eq!(row[0].as_text().unwrap(), "external");
+}
+
+// ============================================================================
+// Phase Rampart: Structured Error Tests
+// ============================================================================
+
+#[tokio::test]
+async fn error_execute_on_follower_with_dead_leader_returns_leader_unavailable() {
+    let tmp = TempDir::new().unwrap();
+    let follower_path = tmp.path().join("ha.db");
+
+    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    // Fake lease pointing to a dead port.
+    let fake_lease = serde_json::json!({
+        "instance_id": "ghost",
+        "address": "http://127.0.0.1:1",
+        "claimed_at": chrono::Utc::now().timestamp() as u64,
+        "ttl_secs": 300,
+        "session_id": "fake",
+        "sleeping": false,
+    });
+    lease_store
+        .write_if_not_exists("test/ha/_lease.json", serde_json::to_vec(&fake_lease).unwrap())
+        .await
+        .unwrap();
+
+    let coordinator = build_coordinator(
+        walrust_storage, lease_store, "orphan", "http://localhost:19050",
+    );
+    let db = HaQLite::from_coordinator(
+        coordinator, follower_path.to_str().unwrap(), SCHEMA, 19050, Duration::from_millis(500),
+    )
+    .await
+    .unwrap();
+    assert_eq!(db.role(), Some(Role::Follower));
+
+    let result = db
+        .execute("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
+        .await;
+
+    // Must be LeaderUnavailable, not a generic error.
+    match result {
+        Err(HaQLiteError::LeaderUnavailable(_)) => {}
+        other => panic!("Expected LeaderUnavailable, got {:?}", other),
+    }
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn error_query_row_bad_sql_returns_database_error() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("err.db");
+    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    let result: std::result::Result<i64, HaQLiteError> =
+        db.query_row("SELECT * FROM nonexistent_table", &[], |r| r.get(0));
+
+    match result {
+        Err(HaQLiteError::DatabaseError(msg)) => {
+            assert!(msg.contains("no such table"), "got: {msg}");
+        }
+        other => panic!("Expected DatabaseError, got {:?}", other),
+    }
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn error_execute_bad_sql_returns_database_error() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("err.db");
+    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    let result = db
+        .execute("INSERT INTO nonexistent (x) VALUES (1)", &[])
+        .await;
+
+    match result {
+        Err(HaQLiteError::DatabaseError(msg)) => {
+            assert!(msg.contains("no such table"), "got: {msg}");
+        }
+        other => panic!("Expected DatabaseError, got {:?}", other),
+    }
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn error_query_values_bad_sql_returns_database_error() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("err.db");
+    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    let result = db.query_values("INVALID SQL GARBAGE", &[]);
+
+    match result {
+        Err(HaQLiteError::DatabaseError(_)) => {}
+        other => panic!("Expected DatabaseError, got {:?}", other),
+    }
+
+    db.close().await.unwrap();
+}
+
+// ============================================================================
+// Phase Rampart: Forwarding Retry Tests
+// ============================================================================
+
+#[tokio::test]
+async fn retry_forwarding_does_not_retry_4xx() {
+    // Auth rejection (401) is a 4xx -- should NOT retry.
+    let tmp = TempDir::new().unwrap();
+    let leader_dir = tmp.path().join("node1");
+    let follower_dir = tmp.path().join("node2");
+    std::fs::create_dir_all(&leader_dir).unwrap();
+    std::fs::create_dir_all(&follower_dir).unwrap();
+
+    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    let leader = HaQLite::from_coordinator_with_secret(
+        build_coordinator(walrust_storage.clone(), lease_store.clone(), "l", "http://localhost:19060"),
+        leader_dir.join("ha.db").to_str().unwrap(),
+        SCHEMA, 19060, Duration::from_secs(5), Some("secret".into()),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let follower = HaQLite::from_coordinator_with_secret(
+        build_coordinator(walrust_storage.clone(), lease_store.clone(), "f", "http://localhost:19061"),
+        follower_dir.join("ha.db").to_str().unwrap(),
+        SCHEMA, 19061, Duration::from_secs(1), Some("wrong-secret".into()),
+    )
+    .await
+    .unwrap();
+
+    let start = std::time::Instant::now();
+    let result = follower
+        .execute("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
+        .await;
+    let elapsed = start.elapsed();
+
+    // Should fail with LeaderUnavailable (4xx from auth rejection).
+    assert!(result.is_err());
+    match result {
+        Err(HaQLiteError::LeaderUnavailable(msg)) => {
+            assert!(msg.contains("401"), "got: {msg}");
+        }
+        other => panic!("Expected LeaderUnavailable with 401, got {:?}", other),
+    }
+
+    // Should NOT have retried (4xx) -- well under 100ms backoff.
+    assert!(elapsed < Duration::from_millis(200), "Took {:?}, suggests retry happened", elapsed);
+
+    leader.close().await.unwrap();
+    follower.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn retry_forwarding_succeeds_on_first_attempt() {
+    // Happy path: forwarding works on first try.
+    let tmp = TempDir::new().unwrap();
+    let leader_dir = tmp.path().join("node1");
+    let follower_dir = tmp.path().join("node2");
+    std::fs::create_dir_all(&leader_dir).unwrap();
+    std::fs::create_dir_all(&follower_dir).unwrap();
+
+    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    let leader = HaQLite::from_coordinator(
+        build_coordinator(walrust_storage.clone(), lease_store.clone(), "l", "http://localhost:19070"),
+        leader_dir.join("ha.db").to_str().unwrap(),
+        SCHEMA, 19070, Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let follower = HaQLite::from_coordinator(
+        build_coordinator(walrust_storage.clone(), lease_store.clone(), "f", "http://localhost:19071"),
+        follower_dir.join("ha.db").to_str().unwrap(),
+        SCHEMA, 19071, Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    let start = std::time::Instant::now();
+    follower
+        .execute(
+            "INSERT INTO test_data (id, value) VALUES (1, 'fast')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    // Should succeed quickly (no retries needed).
+    assert!(elapsed < Duration::from_millis(500), "Took {:?}, too slow for single attempt", elapsed);
+
+    let count: i64 = leader.query_row("SELECT COUNT(*) FROM test_data", &[], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+
+    leader.close().await.unwrap();
+    follower.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn retry_forwarding_retries_on_connection_error() {
+    // Follower points to dead leader -- connection error should be retried,
+    // then eventually fail with LeaderUnavailable after all retries exhausted.
+    let tmp = TempDir::new().unwrap();
+    let follower_path = tmp.path().join("ha.db");
+
+    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    let fake_lease = serde_json::json!({
+        "instance_id": "ghost",
+        "address": "http://127.0.0.1:1",
+        "claimed_at": chrono::Utc::now().timestamp() as u64,
+        "ttl_secs": 300,
+        "session_id": "fake",
+        "sleeping": false,
+    });
+    lease_store
+        .write_if_not_exists("test/ha/_lease.json", serde_json::to_vec(&fake_lease).unwrap())
+        .await
+        .unwrap();
+
+    let coordinator = build_coordinator(
+        walrust_storage, lease_store, "retry-node", "http://localhost:19080",
+    );
+    let db = HaQLite::from_coordinator(
+        coordinator, follower_path.to_str().unwrap(), SCHEMA, 19080, Duration::from_millis(200),
+    )
+    .await
+    .unwrap();
+
+    let start = std::time::Instant::now();
+    let result = db
+        .execute("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
+        .await;
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err());
+    match result {
+        Err(HaQLiteError::LeaderUnavailable(msg)) => {
+            assert!(msg.contains("All forwarding attempts failed"), "got: {msg}");
+        }
+        other => panic!("Expected LeaderUnavailable, got {:?}", other),
+    }
+
+    // Should have retried: 0ms + 100ms + 400ms + 1600ms = ~2100ms minimum.
+    assert!(elapsed >= Duration::from_millis(1500), "Took {:?}, suggests no retries", elapsed);
+
+    db.close().await.unwrap();
+}
+
+// ============================================================================
+// Phase Rampart: Read Semaphore Tests
+// ============================================================================
+
+#[tokio::test]
+async fn semaphore_does_not_block_leader_reads() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("sem.db");
+    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    // Leader reads should work regardless of semaphore state.
+    db.execute("INSERT INTO test_data (id, value) VALUES (1, 'a')", &[])
+        .await
+        .unwrap();
+
+    // Read many times (leader doesn't use semaphore).
+    for _ in 0..100 {
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM test_data", &[], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn semaphore_query_values_also_bounded() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("sem.db");
+    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    db.execute("INSERT INTO test_data (id, value) VALUES (1, 'a')", &[])
+        .await
+        .unwrap();
+
+    let result = db.query_values("SELECT * FROM test_data", &[]);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap().len(), 1);
+
+    db.close().await.unwrap();
+}
+
+// ============================================================================
+// Phase Rampart: Graceful Shutdown Tests
+// ============================================================================
+
+#[tokio::test]
+async fn close_then_reopen_preserves_data() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("persist.db");
+
+    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    for i in 1..=10 {
+        db.execute(
+            "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
+            &[SqlValue::Integer(i), SqlValue::Text(format!("row-{i}"))],
+        )
+        .await
+        .unwrap();
+    }
+    db.close().await.unwrap();
+
+    // Reopen and verify all data persisted.
+    let db2 = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let count: i64 = db2.query_row("SELECT COUNT(*) FROM test_data", &[], |r| r.get(0)).unwrap();
+    assert_eq!(count, 10);
+    db2.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn close_ha_node_is_clean() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ha.db");
+
+    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    let coordinator = build_coordinator(
+        walrust_storage, lease_store, "close-node", "http://localhost:19090",
+    );
+    let db = HaQLite::from_coordinator(
+        coordinator, db_path.to_str().unwrap(), SCHEMA, 19090, Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    db.execute("INSERT INTO test_data (id, value) VALUES (1, 'a')", &[])
+        .await
+        .unwrap();
+
+    // Close should succeed, not hang.
+    db.close().await.unwrap();
+
+    // DB file should still exist.
+    assert!(db_path.exists());
+}
+
+// ============================================================================
+// Phase Rampart: Edge Cases
+// ============================================================================
+
+#[tokio::test]
+async fn execute_empty_params() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("edge.db");
+    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    // Execute with no params.
+    db.execute("INSERT INTO test_data (id, value) VALUES (1, 'bare')", &[])
+        .await
+        .unwrap();
+
+    let val: String = db.query_row("SELECT value FROM test_data WHERE id = 1", &[], |r| r.get(0)).unwrap();
+    assert_eq!(val, "bare");
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn query_values_empty_result() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("edge.db");
+    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    let rows = db.query_values("SELECT * FROM test_data WHERE id = 999", &[]).unwrap();
+    assert!(rows.is_empty());
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn error_not_leader_when_no_address() {
+    let tmp = TempDir::new().unwrap();
+    let follower_path = tmp.path().join("ha.db");
+
+    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    // Fake lease with empty address.
+    let fake_lease = serde_json::json!({
+        "instance_id": "no-addr",
+        "address": "",
+        "claimed_at": chrono::Utc::now().timestamp() as u64,
+        "ttl_secs": 300,
+        "session_id": "fake",
+        "sleeping": false,
+    });
+    lease_store
+        .write_if_not_exists("test/ha/_lease.json", serde_json::to_vec(&fake_lease).unwrap())
+        .await
+        .unwrap();
+
+    let coordinator = build_coordinator(
+        walrust_storage, lease_store, "no-addr-node", "http://localhost:19100",
+    );
+    let db = HaQLite::from_coordinator(
+        coordinator, follower_path.to_str().unwrap(), SCHEMA, 19100, Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(db.role(), Some(Role::Follower));
+
+    let result = db
+        .execute("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
+        .await;
+
+    // Should be NotLeader (empty address), not LeaderUnavailable (connection failed).
+    match result {
+        Err(HaQLiteError::NotLeader) => {}
+        other => panic!("Expected NotLeader, got {:?}", other),
+    }
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn handoff_on_local_mode_returns_false() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("local.db");
+    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    let result = db.handoff().await.unwrap();
+    assert!(!result); // local mode has no coordinator
+
+    db.close().await.unwrap();
 }

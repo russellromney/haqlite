@@ -24,6 +24,7 @@
 pub mod cli_config;
 pub mod client;
 pub mod database;
+pub mod error;
 pub mod follower_behavior;
 pub mod forwarding;
 pub mod hrana;
@@ -33,6 +34,7 @@ pub mod serve;
 
 // Re-export HaQLite as the primary API.
 pub use database::{HaQLite, HaQLiteBuilder};
+pub use error::HaQLiteError;
 pub use client::{HaQLiteClient, HaQLiteClientBuilder};
 pub use forwarding::SqlValue;
 
