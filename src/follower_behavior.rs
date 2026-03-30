@@ -36,6 +36,7 @@ impl FollowerBehavior for SqliteFollowerBehavior {
         db_path: &PathBuf,
         poll_interval: Duration,
         position: Arc<AtomicU64>,
+        caught_up: Arc<std::sync::atomic::AtomicBool>,
         mut cancel_rx: watch::Receiver<bool>,
         metrics: Arc<HaMetrics>,
     ) -> Result<()> {
@@ -55,12 +56,14 @@ impl FollowerBehavior for SqliteFollowerBehavior {
                         Ok(new_txid) => {
                             if new_txid > current_txid {
                                 tracing::debug!(
-                                    "Follower '{}': pulled TXID {} → {}",
+                                    "Follower '{}': pulled TXID {} -> {}",
                                     db_name, current_txid, new_txid
                                 );
                                 position.store(new_txid, Ordering::SeqCst);
+                                caught_up.store(true, Ordering::SeqCst);
                                 metrics.inc(&metrics.follower_pulls_succeeded);
                             } else {
+                                caught_up.store(true, Ordering::SeqCst);
                                 metrics.inc(&metrics.follower_pulls_no_new_data);
                             }
                         }

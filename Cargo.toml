@@ -11,8 +11,8 @@ categories = ["database", "network-programming"]
 
 [dependencies]
 # HA coordination framework
-hadb = { path = "../hadb/hadb" }
-hadb-lease-s3 = { path = "../hadb/hadb-lease-s3" }
+hadb = { path = "../../hadb/hadb" }
+hadb-lease-s3 = { path = "../../hadb/hadb-lease-s3" }
 
 # WAL sync primitives
 walrust = { path = "../walrust/crates/walrust-core" }
@@ -43,7 +43,7 @@ axum = "0.8"
 reqwest = { version = "0.12", features = ["json"] }
 
 # Shared CLI framework
-hadb-cli = { path = "../hadb/hadb-cli" }
+hadb-cli = { path = "../../hadb/hadb-cli" }
 
 # Hrana protocol (libSQL HTTP API)
 hrana-server = { path = "../hrana-server" }

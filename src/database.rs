@@ -624,7 +624,8 @@ async fn open_with_coordinator(
     let role_rx = coordinator.role_events();
 
     // Join the HA cluster.
-    let initial_role = coordinator.join(db_name, &db_path).await?;
+    let join_result = coordinator.join(db_name, &db_path).await?;
+    let initial_role = join_result.role;
 
     let leader_addr = if initial_role == Role::Leader {
         address.to_string()
