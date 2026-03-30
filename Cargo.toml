@@ -15,7 +15,7 @@ hadb = { path = "../hadb/hadb" }
 hadb-lease-s3 = { path = "../hadb/hadb-lease-s3" }
 
 # WAL sync primitives
-walrust = { path = "../walrust/crates/walrust-core" }
+walrust = { path = "../personal-website/walrust/crates/walrust-core" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
