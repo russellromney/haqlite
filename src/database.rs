@@ -432,7 +432,12 @@ impl HaQLite {
             Some(Role::Follower) => {
                 // Bound concurrent follower reads via semaphore.
                 let _permit = self.inner.read_semaphore.try_acquire()
-                    .map_err(|_| HaQLiteError::EngineClosed)?;
+                    .map_err(|e| match e {
+                        tokio::sync::TryAcquireError::Closed => HaQLiteError::EngineClosed,
+                        tokio::sync::TryAcquireError::NoPermits => HaQLiteError::DatabaseError(
+                            "Too many concurrent reads".into(),
+                        ),
+                    })?;
                 // Followers must open fresh connections each time because walrust
                 // applies LTX files externally -- pooled connections hold stale snapshots.
                 let conn = rusqlite::Connection::open_with_flags(
@@ -497,7 +502,12 @@ impl HaQLite {
             }
             Some(Role::Follower) => {
                 let _permit = self.inner.read_semaphore.try_acquire()
-                    .map_err(|_| HaQLiteError::EngineClosed)?;
+                    .map_err(|e| match e {
+                        tokio::sync::TryAcquireError::Closed => HaQLiteError::EngineClosed,
+                        tokio::sync::TryAcquireError::NoPermits => HaQLiteError::DatabaseError(
+                            "Too many concurrent reads".into(),
+                        ),
+                    })?;
                 let conn = rusqlite::Connection::open_with_flags(
                     &self.inner.db_path,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -577,6 +587,9 @@ impl HaQLite {
             .await
             .map_err(|e| HaQLiteError::CoordinatorError(e.to_string()))?;
         if result {
+            // Update cached role immediately -- don't wait for role listener
+            // to process the Demoted event.
+            self.inner.set_role(Role::Follower);
             // Close rw connection -- role listener will also catch the Demoted event,
             // but we do it eagerly here.
             self.inner.set_conn(None);
@@ -600,9 +613,11 @@ impl HaQLite {
                 .map_err(|e| HaQLiteError::CoordinatorError(e.to_string()))?;
         }
 
-        // 4. Abort background tasks and wait for handles to drop.
+        // 4. Abort background tasks and wait for them to finish.
         self._fwd_handle.abort();
         self._role_handle.abort();
+        let _ = self._fwd_handle.await;
+        let _ = self._role_handle.await;
 
         Ok(())
     }

@@ -57,17 +57,21 @@ impl FollowerBehavior for SqliteFollowerBehavior {
                             if new_txid > current_txid {
                                 // New data downloaded -- not caught up until replay completes.
                                 caught_up.store(false, Ordering::SeqCst);
+                                metrics.follower_caught_up.store(0, Ordering::Relaxed);
                                 tracing::debug!(
                                     "Follower '{}': pulled TXID {} -> {}",
                                     db_name, current_txid, new_txid
                                 );
                                 position.store(new_txid, Ordering::SeqCst);
+                                metrics.follower_replay_position.store(new_txid, Ordering::Relaxed);
                                 metrics.inc(&metrics.follower_pulls_succeeded);
                                 // Replay succeeded (pull_incremental applies the WAL).
                                 caught_up.store(true, Ordering::SeqCst);
+                                metrics.follower_caught_up.store(1, Ordering::Relaxed);
                             } else {
                                 // Empty poll -- no new data means we are caught up.
                                 caught_up.store(true, Ordering::SeqCst);
+                                metrics.follower_caught_up.store(1, Ordering::Relaxed);
                                 metrics.inc(&metrics.follower_pulls_no_new_data);
                             }
                         }

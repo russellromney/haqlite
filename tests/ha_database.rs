@@ -1226,3 +1226,154 @@ async fn local_mode_no_prometheus_metrics() {
 
     db.close().await.unwrap();
 }
+
+// ============================================================================
+// Regression Tests
+// ============================================================================
+
+#[tokio::test]
+async fn regression_hadb_prometheus_has_nonzero_caught_up_for_leader() {
+    // Regression: hadb HaMetrics follower_caught_up gauge was always 0
+    // because nobody wrote to it. Now the coordinator sets it on promotion.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ha.db");
+
+    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    let coordinator = build_coordinator(
+        walrust_storage, lease_store, "prom-regression", "http://localhost:19130",
+    );
+    let db = HaQLite::from_coordinator(
+        coordinator, db_path.to_str().unwrap(), SCHEMA, 19130, Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(db.role(), Some(Role::Leader));
+
+    let prom = db.prometheus_metrics().unwrap();
+    // The hadb-level gauge should be 1 for a leader (not 0).
+    assert!(
+        prom.contains("hadb_follower_caught_up 1"),
+        "hadb gauge should be 1 for leader, got:\n{}",
+        prom
+    );
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn regression_close_completes_fully() {
+    // Regression: close() aborted tasks but didn't await handles,
+    // leaving dangling Arc refs. Now it awaits both handles.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ha.db");
+
+    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    let coordinator = build_coordinator(
+        walrust_storage, lease_store, "close-regression", "http://localhost:19140",
+    );
+    let db = HaQLite::from_coordinator(
+        coordinator, db_path.to_str().unwrap(), SCHEMA, 19140, Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    db.execute("INSERT INTO test_data (id, value) VALUES (1, 'test')", &[])
+        .await
+        .unwrap();
+
+    // close() should complete without hanging (tasks are awaited, not just aborted).
+    let close_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        db.close(),
+    )
+    .await;
+    assert!(close_result.is_ok(), "close() timed out -- tasks not properly awaited");
+    assert!(close_result.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn error_query_values_on_nonexistent_table() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("err.db");
+    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    let result = db.query_values("SELECT * FROM nonexistent_table", &[]);
+    match result {
+        Err(HaQLiteError::DatabaseError(msg)) => {
+            assert!(msg.contains("no such table"), "got: {msg}");
+        }
+        other => panic!("Expected DatabaseError, got {:?}", other),
+    }
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn handoff_ha_leader_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ha.db");
+
+    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    let coordinator = build_coordinator(
+        walrust_storage, lease_store, "handoff-leader", "http://localhost:19150",
+    );
+    let db = HaQLite::from_coordinator(
+        coordinator, db_path.to_str().unwrap(), SCHEMA, 19150, Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(db.role(), Some(Role::Leader));
+
+    // Write some data first.
+    db.execute("INSERT INTO test_data (id, value) VALUES (1, 'before-handoff')", &[])
+        .await
+        .unwrap();
+
+    // Handoff should succeed (this node is the leader).
+    let result = db.handoff().await.unwrap();
+    assert!(result, "handoff should return true for leader");
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn handoff_preserves_data() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ha.db");
+
+    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    let coordinator = build_coordinator(
+        walrust_storage, lease_store, "handoff-data", "http://localhost:19160",
+    );
+    let db = HaQLite::from_coordinator(
+        coordinator, db_path.to_str().unwrap(), SCHEMA, 19160, Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    // Write data, handoff, verify data still readable locally.
+    for i in 1..=5 {
+        db.execute(
+            "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
+            &[SqlValue::Integer(i), SqlValue::Text(format!("row-{i}"))],
+        )
+        .await
+        .unwrap();
+    }
+
+    db.handoff().await.unwrap();
+
+    // Data should still be readable (local reads work regardless of role).
+    let count: i64 = db.query_row("SELECT COUNT(*) FROM test_data", &[], |r| r.get(0)).unwrap();
+    assert_eq!(count, 5);
+
+    db.close().await.unwrap();
+}
