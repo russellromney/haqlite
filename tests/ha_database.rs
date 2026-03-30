@@ -1150,3 +1150,79 @@ async fn handoff_on_local_mode_returns_false() {
 
     db.close().await.unwrap();
 }
+
+// ============================================================================
+// Phase Rampart-e: Follower Readiness Tests
+// ============================================================================
+
+#[tokio::test]
+async fn leader_is_always_caught_up() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("leader.db");
+    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    assert!(db.is_caught_up());
+    assert_eq!(db.replay_position(), 0);
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn ha_leader_is_caught_up() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ha.db");
+
+    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    let coordinator = build_coordinator(
+        walrust_storage, lease_store, "leader", "http://localhost:19110",
+    );
+    let db = HaQLite::from_coordinator(
+        coordinator, db_path.to_str().unwrap(), SCHEMA, 19110, Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(db.role(), Some(Role::Leader));
+
+    assert!(db.is_caught_up());
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn prometheus_contains_readiness_gauges() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ha.db");
+
+    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    let coordinator = build_coordinator(
+        walrust_storage, lease_store, "prom-node", "http://localhost:19120",
+    );
+    let db = HaQLite::from_coordinator(
+        coordinator, db_path.to_str().unwrap(), SCHEMA, 19120, Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    let prom = db.prometheus_metrics().expect("should have metrics in HA mode");
+    assert!(prom.contains("haqlite_follower_caught_up"), "missing caught_up gauge");
+    assert!(prom.contains("haqlite_follower_replay_position"), "missing replay_position gauge");
+    // hadb-level gauges should also be present
+    assert!(prom.contains("hadb_follower_caught_up"), "missing hadb caught_up gauge");
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_mode_no_prometheus_metrics() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("local.db");
+    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    assert!(db.prometheus_metrics().is_none());
+
+    db.close().await.unwrap();
+}

@@ -62,7 +62,6 @@ impl FollowerBehavior for SqliteFollowerBehavior {
                                     db_name, current_txid, new_txid
                                 );
                                 position.store(new_txid, Ordering::SeqCst);
-                                caught_up.store(true, Ordering::SeqCst);
                                 metrics.inc(&metrics.follower_pulls_succeeded);
                                 // Replay succeeded (pull_incremental applies the WAL).
                                 caught_up.store(true, Ordering::SeqCst);
