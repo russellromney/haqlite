@@ -1,6 +1,6 @@
 # haqlite
 
-> **Pre-1.0.** APIs may change between minor versions. Published to [crates.io](https://crates.io/crates/haqlite).
+> **Experimental.** haqlite is under active development and not yet stable. APIs will change without notice.
 
 HA SQLite with one line of code. Leader election, WAL replication, write forwarding — just your app + an S3 bucket.
 
