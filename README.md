@@ -1,6 +1,6 @@
 # haqlite
 
-> **Experimental.** haqlite is under active development and not yet stable. APIs will change without notice.
+> **Pre-1.0.** APIs may change between minor versions. Published to [crates.io](https://crates.io/crates/haqlite).
 
 HA SQLite with one line of code. Leader election, WAL replication, write forwarding — just your app + an S3 bucket.
 
@@ -147,7 +147,7 @@ If NATS is unreachable at startup, haqlite logs an error and falls back to S3 le
 - **Sync reads / async writes**: `query_row()` is sync (always local), `execute()` is async (may forward).
 - **Warm promotion**: followers catch up from S3 before promoting. No stale reads after failover.
 - **Structured metrics**: `coordinator.metrics()` — lease claims, renewals, promotions, catchup timing.
-- **164 tests** including split-brain regression, chaos tests, soak tests, and HA integration tests.
+- **162 tests** including HA integration, forwarding retry, structured errors, semaphore, readiness, and handoff tests.
 - **E2e test suite**: 7 scenarios covering replication, forwarding, failover, varying sync/lease params.
 
 ## Architecture
