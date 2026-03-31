@@ -147,7 +147,7 @@ If NATS is unreachable at startup, haqlite logs an error and falls back to S3 le
 - **Sync reads / async writes**: `query_row()` is sync (always local), `execute()` is async (may forward).
 - **Warm promotion**: followers catch up from S3 before promoting. No stale reads after failover.
 - **Structured metrics**: `coordinator.metrics()` — lease claims, renewals, promotions, catchup timing.
-- **162 tests** including HA integration, forwarding retry, structured errors, semaphore, readiness, and handoff tests.
+- **Tested**: HA integration, forwarding retry, structured errors, concurrency control, readiness, and handoff.
 - **E2e test suite**: 7 scenarios covering replication, forwarding, failover, varying sync/lease params.
 
 ## Architecture
