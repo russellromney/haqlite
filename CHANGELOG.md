@@ -1,5 +1,14 @@
 # haqlite Changelog
 
+## Phase Meridian: Wire Up CLI Commands
+
+- **Prefix threading**: All 7 ops functions (`discover_ltx_files`, `discover_databases`, `list_databases`, `verify_database`, `plan_compact`, `snapshot_database`, `replicate_database`) take `prefix: &str`. `normalize_prefix()` helper ensures trailing slash. CLI defaults to `"haqlite/"` via `resolve_prefix()`.
+- **Compact honesty**: Replaced fake GFS flags (`--hourly/--daily/--weekly/--monthly`) with `--keep N` (default 47). No temporal bucketing was ever implemented.
+- **Replicate shutdown**: Wrapped poll loop in `tokio::select!` with `hadb_cli::shutdown_signal()` for graceful SIGTERM/SIGINT handling.
+- **Output fixes**: `restore` uses `println!` (not `tracing::info!`). `snapshot` prints `SnapshotResult { db_name, txid }`. `explain` has clean formatted output instead of `{:#?}`.
+- **walrust Phase Somme fix**: In WAL mode, SQLite does not increment the file change counter per transaction, causing panics in `sync_wal` and `take_snapshot`. Fixed with deterministic WAL commit counting: `sync_wal` falls back to commit count from WAL batch, `take_snapshot` uses `file_change_counter + wal_commit_count`. `read_frames_as_page_map` now returns `commit_count`, new `count_wal_commits()` scans WAL frame headers only.
+- 8 new prefix tests, 46 ops tests + 34 HA tests passing.
+
 ## Phase Volt-c: NATS Lease Store Engine Integration
 
 - **Pluggable LeaseStore**: `.lease_store(Arc<dyn LeaseStore>)` on `HaQLiteBuilder`. When set, skips S3LeaseStore and S3 client construction entirely. Works with any `LeaseStore` impl (NATS, Redis, etcd, in-memory).
