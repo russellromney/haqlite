@@ -2,7 +2,9 @@
 
 > **Experimental.** haqlite is under active development and not yet stable. APIs will change without notice.
 
-HA SQLite with one line of code. Leader election, WAL replication, write forwarding — just your app + an S3 bucket.
+Embed HA SQLite in your app with one line of code + an S3 bucket. Leader election, WAL replication, write forwarding.
+
+Part of the [hadb](https://github.com/russellromney/hadb) ecosystem for making any embedded database highly available.
 
 ## Quick start
 
@@ -45,11 +47,12 @@ Node 1 (leader)                    Node 2 (follower)
            └────────── S3 bucket ─────────────┘
 ```
 
-- **Leader election** via S3 conditional PUTs (compare-and-swap on ETags). No Raft, no Paxos — just S3.
-- **WAL replication** via [walrust](https://crates.io/crates/walrust). Leader syncs WAL frames to S3, followers pull and apply.
+- **Leader election** via S3 conditional PUTs (compare-and-swap on ETags), or [NATS](https://github.com/russellromney/hadb/tree/main/hadb-lease-nats) for faster failover. No Raft, no Paxos.
+- **WAL replication** via [walrust](https://github.com/russellromney/walrust). Leader syncs WAL frames to S3, followers pull and apply.
 - **Write forwarding**: `execute()` on a follower transparently forwards to the leader via an internal HTTP server. Your app doesn't need to know who the leader is.
 - **Auto-promotion**: when the leader dies, a follower claims the lease, catches up from S3, and promotes itself.
 - **Self-fencing**: if a leader loses its lease (partition, slow renewal), it demotes itself immediately. No split-brain.
+- **Coordination** via [hadb](https://github.com/russellromney/hadb). Generic HA framework with pluggable lease stores, follower readiness, and Prometheus metrics.
 
 ## Builder options
 
@@ -152,15 +155,15 @@ If NATS is unreachable at startup, haqlite logs an error and falls back to S3 le
 
 ## Architecture
 
-haqlite is one layer in a stack:
-
 ```
-walrust (WAL sync to S3)
-  └─ haqlite (HA coordination + one-liner API)
-       └─ your app (HTTP server, gRPC, whatever)
+hadb        — coordination (leader election, role management, metrics)
+hadb-io     — shared infrastructure (S3, retry, circuit breaker)
+walrust     — SQLite WAL replication to S3
+haqlite     — HA API + write forwarding + CLI
+your app    — uses haqlite as an embedded library or CLI server
 ```
 
-haqlite is the first implementation of **[hadb](https://github.com/russellromney/hadb)**, a generic framework for making any embedded database highly available.
+See [hadb](https://github.com/russellromney/hadb) for the full ecosystem. [hakuzu](https://github.com/russellromney/hakuzu) is the equivalent for Kuzu/graph databases, using [graphstream](https://github.com/russellromney/graphstream) for journal replication.
 
 ## License
 
