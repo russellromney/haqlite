@@ -138,17 +138,17 @@ WAL_LEASE_NATS_URL=nats://localhost:4222 haqlite serve
 
 If NATS is unreachable at startup, haqlite logs an error and falls back to S3 leases.
 
-## Features
+## What it does
 
-- **S3 is the only required dependency**. No etcd, no ZooKeeper, no sidecar.
-- **Pluggable lease store**: S3 leases by default, or bring your own (NATS, Redis, etcd) via `.lease_store()`. NATS support built in behind `nats-lease` feature.
-- **One-liner API**: `HaQLite::builder("bucket").open(path, schema).await?`
-- **Transparent write forwarding**: `execute()` works on any node.
-- **Sync reads / async writes**: `query_row()` is sync (always local), `execute()` is async (may forward).
-- **Warm promotion**: followers catch up from S3 before promoting. No stale reads after failover.
-- **Structured metrics**: `coordinator.metrics()` — lease claims, renewals, promotions, catchup timing.
-- **Tested**: HA integration, forwarding retry, structured errors, concurrency control, readiness, and handoff.
-- **E2e test suite**: 7 scenarios covering replication, forwarding, failover, varying sync/lease params.
+- S3 is the only required dependency (no etcd, no ZooKeeper, no sidecar)
+- Pluggable lease store: S3 by default, NATS via `nats-lease` feature, or any `LeaseStore` impl
+- `query_row()` is sync (always local), `execute()` is async (forwards to leader if follower)
+- Followers catch up from S3 before promoting (warm promotion)
+- Forwarding retries with exponential backoff, skips 4xx
+- Read concurrency bounded by semaphore (default 32)
+- Structured error types (`HaQLiteError`) for matching on failure modes
+- Follower readiness tracking (`is_caught_up()`, `replay_position()`)
+- Prometheus metrics for lease operations, promotions, catchup timing, readiness
 
 ## Architecture
 
