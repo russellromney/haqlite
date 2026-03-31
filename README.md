@@ -60,6 +60,8 @@ let db = HaQLite::builder("my-bucket")
     .instance_id("node-1")                    // default: FLY_MACHINE_ID or UUID
     .address("http://node1.internal:18080")   // default: auto-detected
     .forwarding_port(18080)                   // internal HTTP port (default: 18080)
+    .secret("my-auth-token")                  // inter-node forwarding auth
+    .lease_store(my_nats_store)               // custom lease backend (default: S3)
     .coordinator_config(config)               // override lease/sync timing
     .open("/data/my.db", schema)
     .await?;
@@ -113,15 +115,39 @@ let config = CoordinatorConfig {
 };
 ```
 
+## Custom lease store
+
+By default, haqlite uses S3 conditional PUTs for leader election. For faster failover (2-5ms vs 50-200ms), plug in a NATS lease store:
+
+```rust
+use hadb_lease_nats::NatsLeaseStore;
+
+let nats_store = NatsLeaseStore::connect("nats://localhost:4222", "hadb-leases").await?;
+
+let db = HaQLite::builder("my-bucket")
+    .lease_store(Arc::new(nats_store))
+    .open("/data/my.db", schema)
+    .await?;
+```
+
+Or in CLI mode, just set the env var (requires `--features nats-lease`):
+
+```bash
+WAL_LEASE_NATS_URL=nats://localhost:4222 haqlite serve
+```
+
+If NATS is unreachable at startup, haqlite logs an error and falls back to S3 leases.
+
 ## Features
 
-- **No external dependencies** beyond S3. No etcd, no ZooKeeper, no sidecar.
+- **S3 is the only required dependency**. No etcd, no ZooKeeper, no sidecar.
+- **Pluggable lease store**: S3 leases by default, or bring your own (NATS, Redis, etcd) via `.lease_store()`. NATS support built in behind `nats-lease` feature.
 - **One-liner API**: `HaQLite::builder("bucket").open(path, schema).await?`
 - **Transparent write forwarding**: `execute()` works on any node.
 - **Sync reads / async writes**: `query_row()` is sync (always local), `execute()` is async (may forward).
 - **Warm promotion**: followers catch up from S3 before promoting. No stale reads after failover.
 - **Structured metrics**: `coordinator.metrics()` — lease claims, renewals, promotions, catchup timing.
-- **93 tests** including split-brain regression, chaos tests, soak tests, and HA integration tests.
+- **164 tests** including split-brain regression, chaos tests, soak tests, and HA integration tests.
 - **E2e test suite**: 7 scenarios covering replication, forwarding, failover, varying sync/lease params.
 
 ## Architecture
