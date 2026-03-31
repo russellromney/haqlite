@@ -49,7 +49,7 @@ hadb-lease-nats = { path = "../hadb/hadb-lease-nats", version = "0.2.0", optiona
 hadb-cli = { path = "../hadb/hadb-cli", version = "0.2.0" }
 
 # Hrana protocol (libSQL HTTP API)
-hrana-server = { path = "../hrana-server" }
+hrana-server = { path = "../hrana-server", version = "0.1.0" }
 
 # CLI + logging
 clap = { version = "4", features = ["derive", "env"] }
