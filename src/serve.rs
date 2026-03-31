@@ -90,6 +90,21 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
         builder = builder.secret(secret);
     }
 
+    // If NATS URL is set, try to use NATS for leases (faster than S3).
+    // Falls back to S3 leases if NATS connection fails.
+    #[cfg(feature = "nats-lease")]
+    if let Ok(nats_url) = std::env::var("WAL_LEASE_NATS_URL") {
+        match hadb_lease_nats::NatsLeaseStore::connect(&nats_url, "hadb-leases").await {
+            Ok(store) => {
+                info!(url = %nats_url, "using NATS lease store");
+                builder = builder.lease_store(std::sync::Arc::new(store));
+            }
+            Err(e) => {
+                error!(url = %nats_url, error = %e, "NATS lease store connection failed, falling back to S3 leases");
+            }
+        }
+    }
+
     let db_path_str = db_path
         .to_str()
         .ok_or_else(|| anyhow!("db_path is not valid UTF-8"))?;

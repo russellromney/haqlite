@@ -67,6 +67,7 @@ pub struct HaQLiteBuilder {
     coordinator_config: Option<CoordinatorConfig>,
     secret: Option<String>,
     read_concurrency: usize,
+    lease_store: Option<Arc<dyn hadb::LeaseStore>>,
 }
 
 impl HaQLiteBuilder {
@@ -82,6 +83,7 @@ impl HaQLiteBuilder {
             coordinator_config: None,
             secret: None,
             read_concurrency: DEFAULT_READ_CONCURRENCY,
+            lease_store: None,
         }
     }
 
@@ -142,6 +144,15 @@ impl HaQLiteBuilder {
         self
     }
 
+    /// Use a custom LeaseStore instead of the default S3LeaseStore.
+    ///
+    /// Works with any `LeaseStore` implementation: NATS, Redis, etcd, etc.
+    /// When set, the builder skips S3LeaseStore construction in `open()`.
+    pub fn lease_store(mut self, store: Arc<dyn hadb::LeaseStore>) -> Self {
+        self.lease_store = Some(store);
+        self
+    }
+
     /// Open the database and join the HA cluster.
     ///
     /// `schema` is run once on first open (e.g. CREATE TABLE IF NOT EXISTS ...).
@@ -162,29 +173,33 @@ impl HaQLiteBuilder {
             detect_address(&instance_id, self.forwarding_port)
         });
 
-        // Build AWS S3 config and client.
-        let s3_config = match &self.endpoint {
-            Some(endpoint) => {
-                aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .endpoint_url(endpoint)
-                    .load()
-                    .await
-            }
-            None => {
-                aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .load()
-                    .await
-            }
-        };
-        let s3_client = aws_sdk_s3::Client::new(&s3_config);
-
         // Build walrust S3 storage backend (for SQLite WAL operations).
         let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(
             walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
         );
 
-        // Build S3 lease store (for CAS leases).
-        let lease_store = Arc::new(S3LeaseStore::new(s3_client, self.bucket.clone()));
+        // Use custom lease store if provided, otherwise build S3 lease store.
+        // Only construct the S3 client when we actually need it for S3LeaseStore.
+        let lease_store: Arc<dyn hadb::LeaseStore> = match self.lease_store {
+            Some(store) => store,
+            None => {
+                let s3_config = match &self.endpoint {
+                    Some(endpoint) => {
+                        aws_config::defaults(aws_config::BehaviorVersion::latest())
+                            .endpoint_url(endpoint)
+                            .load()
+                            .await
+                    }
+                    None => {
+                        aws_config::defaults(aws_config::BehaviorVersion::latest())
+                            .load()
+                            .await
+                    }
+                };
+                let s3_client = aws_sdk_s3::Client::new(&s3_config);
+                Arc::new(S3LeaseStore::new(s3_client, self.bucket.clone()))
+            }
+        };
 
         // Build coordinator config.
         let mut config = self.coordinator_config.unwrap_or_default();
@@ -206,7 +221,7 @@ impl HaQLiteBuilder {
         // Build hadb Coordinator.
         let coordinator = Coordinator::new(
             replicator,
-            Some(lease_store as Arc<dyn hadb::LeaseStore>),
+            Some(lease_store),
             None, // node_registry
             follower_behavior,
             &self.prefix,

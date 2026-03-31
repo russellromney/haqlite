@@ -1,5 +1,13 @@
 # haqlite Changelog
 
+## Phase Volt-c: NATS Lease Store Engine Integration
+
+- **Pluggable LeaseStore**: `.lease_store(Arc<dyn LeaseStore>)` on `HaQLiteBuilder`. When set, skips S3LeaseStore and S3 client construction entirely. Works with any `LeaseStore` impl (NATS, Redis, etcd, in-memory).
+- **NATS feature**: `hadb-lease-nats` as optional dep behind `nats-lease` Cargo feature. `haqlite serve` auto-connects NATS when `WAL_LEASE_NATS_URL` env var is set, falls back to S3 leases on connection failure.
+- **Shared test helpers**: Extracted `InMemoryStorage` (walrust `StorageBackend`) into `tests/common/mod.rs`, replacing 4 identical copies across test files.
+- **Snapshot test fixes**: SQLite file change counter is 2 after `CREATE TABLE + INSERT` (two transactions), not 1. Fixed 5 assertion values and added writes between sequential snapshots.
+- 7 new tests: custom lease store used, builder method compiles, lease renewal, two-node custom store, default fallback, NATS integration (env-gated), NATS connection failure. 164 tests total.
+
 ## hadb Core Framework Extraction (Foundation — 83 tests)
 
 - **hadb workspace created**: Database-agnostic HA framework at `~/Documents/Github/hadb/` with core (`hadb/`) and S3 implementation (`hadb-s3/`) crates. Zero cloud dependencies in core.

@@ -2,131 +2,15 @@
 //!
 //! Uses an in-memory storage backend to avoid S3 dependencies.
 
-use std::collections::HashMap;
+mod common;
+
 use std::path::Path;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 
+use common::InMemoryStorage;
 use haqlite::ops::{self, VerifyFileResult};
-
-// ============================================================================
-// In-memory StorageBackend (same as test_hrana_ha.rs)
-// ============================================================================
-
-struct InMemoryStorage {
-    objects: Mutex<HashMap<String, Vec<u8>>>,
-}
-
-impl InMemoryStorage {
-    fn new() -> Self {
-        Self {
-            objects: Mutex::new(HashMap::new()),
-        }
-    }
-
-    async fn insert(&self, key: &str, data: Vec<u8>) {
-        self.objects.lock().await.insert(key.to_string(), data);
-    }
-
-    async fn keys(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self.objects.lock().await.keys().cloned().collect();
-        keys.sort();
-        keys
-    }
-}
-
-#[async_trait]
-impl walrust::StorageBackend for InMemoryStorage {
-    fn bucket_name(&self) -> &str {
-        "test-bucket"
-    }
-    async fn upload_bytes(&self, key: &str, data: Vec<u8>) -> Result<()> {
-        self.objects.lock().await.insert(key.to_string(), data);
-        Ok(())
-    }
-    async fn upload_bytes_with_checksum(
-        &self,
-        key: &str,
-        data: Vec<u8>,
-        _checksum: &str,
-    ) -> Result<()> {
-        self.upload_bytes(key, data).await
-    }
-    async fn upload_file(&self, key: &str, path: &Path) -> Result<()> {
-        let data = tokio::fs::read(path).await?;
-        self.upload_bytes(key, data).await
-    }
-    async fn upload_file_with_checksum(
-        &self,
-        key: &str,
-        path: &Path,
-        _checksum: &str,
-    ) -> Result<()> {
-        self.upload_file(key, path).await
-    }
-    async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
-        self.objects
-            .lock()
-            .await
-            .get(key)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Key not found: {}", key))
-    }
-    async fn download_file(&self, key: &str, path: &Path) -> Result<()> {
-        let data = self.download_bytes(key).await?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(path, data).await?;
-        Ok(())
-    }
-    async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut keys: Vec<String> = self
-            .objects
-            .lock()
-            .await
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        keys.sort();
-        Ok(keys)
-    }
-    async fn list_objects_after(&self, prefix: &str, start_after: &str) -> Result<Vec<String>> {
-        let mut keys: Vec<String> = self
-            .objects
-            .lock()
-            .await
-            .keys()
-            .filter(|k| k.starts_with(prefix) && k.as_str() > start_after)
-            .cloned()
-            .collect();
-        keys.sort();
-        Ok(keys)
-    }
-    async fn exists(&self, key: &str) -> Result<bool> {
-        Ok(self.objects.lock().await.contains_key(key))
-    }
-    async fn get_checksum(&self, _key: &str) -> Result<Option<String>> {
-        Ok(None)
-    }
-    async fn delete_object(&self, key: &str) -> Result<()> {
-        self.objects.lock().await.remove(key);
-        Ok(())
-    }
-    async fn delete_objects(&self, keys: &[String]) -> Result<usize> {
-        let mut objects = self.objects.lock().await;
-        let mut deleted = 0;
-        for key in keys {
-            if objects.remove(key).is_some() {
-                deleted += 1;
-            }
-        }
-        Ok(deleted)
-    }
-}
 
 // ============================================================================
 // Helpers
@@ -546,12 +430,13 @@ async fn test_snapshot_creates_ltx_file() {
 
     let storage = InMemoryStorage::new();
     let result = ops::snapshot_database(&storage, "",&db_path).await.unwrap();
-    assert_eq!(result.txid, 1); // First snapshot, TXID starts at 1
+    // SQLite file change counter is 2 after CREATE TABLE + INSERT (two transactions).
+    assert_eq!(result.txid, 2);
 
     // Verify the LTX file was uploaded
     let keys = storage.keys().await;
     assert_eq!(keys.len(), 1);
-    // Key should be: snap/0001/0000000000000001-0000000000000001.ltx
+    // Key should be: snap/0001/0000000000000001-0000000000000002.ltx
     assert!(keys[0].starts_with("snap/"));
     assert!(keys[0].contains("0001/"));
     assert!(keys[0].ends_with(".ltx"));
@@ -565,13 +450,19 @@ async fn test_snapshot_increments_txid() {
 
     let storage = InMemoryStorage::new();
 
-    // First snapshot
+    // First snapshot (change counter = 2 after CREATE + INSERT)
     let result1 = ops::snapshot_database(&storage, "",&db_path).await.unwrap();
-    assert_eq!(result1.txid, 1);
+    assert_eq!(result1.txid, 2);
 
-    // Second snapshot (discovers first snapshot's TXID)
+    // Second snapshot: take_snapshot reads the same file change counter (2),
+    // but current_txid is now 2, so cc > current_txid fails. The snapshot
+    // can only advance if the DB has been modified. Modify it to get txid=3.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("INSERT INTO t (val) VALUES ('world')", []).unwrap();
+    }
     let result2 = ops::snapshot_database(&storage, "",&db_path).await.unwrap();
-    assert_eq!(result2.txid, 2);
+    assert_eq!(result2.txid, 3);
 
     let keys = storage.keys().await;
     assert_eq!(keys.len(), 2);
@@ -954,9 +845,15 @@ async fn test_snapshot_list_verify_compact_roundtrip() {
 
     let storage = InMemoryStorage::new();
 
-    // Take 3 snapshots
-    for _ in 0..3 {
+    // Take 3 snapshots (each needs a new write to advance the change counter)
+    for i in 0..3 {
         ops::snapshot_database(&storage, "",&db_path).await.unwrap();
+        // Write between snapshots so the file change counter advances
+        if i < 2 {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("INSERT INTO t (val) VALUES (?1)", [&format!("row-{i}")])
+                .unwrap();
+        }
     }
 
     // List: should show 1 database with 3 snapshots
@@ -1129,7 +1026,7 @@ async fn test_snapshot_with_prefix() {
     let result = ops::snapshot_database(&storage, "haqlite/", &db_path)
         .await
         .unwrap();
-    assert_eq!(result.txid, 1);
+    assert_eq!(result.txid, 2); // CREATE TABLE + INSERT = change counter 2
     assert_eq!(result.db_name, "prefixed");
 
     // Verify the key is under the prefix
@@ -1154,7 +1051,7 @@ async fn test_snapshot_returns_db_name() {
         .await
         .unwrap();
     assert_eq!(result.db_name, "my_database");
-    assert_eq!(result.txid, 1);
+    assert_eq!(result.txid, 2); // CREATE TABLE + INSERT = change counter 2
 }
 
 #[tokio::test]

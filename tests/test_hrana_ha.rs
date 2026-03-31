@@ -4,14 +4,14 @@
 //! the hrana protocol works correctly for reads, writes, and write rejection
 //! on followers.
 
-use std::collections::HashMap;
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
-use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use common::InMemoryStorage;
 use haqlite::hrana::build_hrana_router;
 use haqlite::serve::{build_router, AppState};
 use haqlite::{
@@ -21,120 +21,12 @@ use haqlite::{
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL
 );";
-
-// ============================================================================
-// In-memory walrust storage (same as ha_database.rs)
-// ============================================================================
-
-struct WalrustInMemoryStorage {
-    objects: Mutex<HashMap<String, Vec<u8>>>,
-}
-
-impl WalrustInMemoryStorage {
-    fn new() -> Self {
-        Self {
-            objects: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-#[async_trait]
-impl walrust::StorageBackend for WalrustInMemoryStorage {
-    async fn upload_bytes(&self, key: &str, data: Vec<u8>) -> Result<()> {
-        self.objects.lock().await.insert(key.to_string(), data);
-        Ok(())
-    }
-    async fn upload_bytes_with_checksum(
-        &self,
-        key: &str,
-        data: Vec<u8>,
-        _checksum: &str,
-    ) -> Result<()> {
-        self.upload_bytes(key, data).await
-    }
-    async fn upload_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
-        let data = tokio::fs::read(path).await?;
-        self.upload_bytes(key, data).await
-    }
-    async fn upload_file_with_checksum(
-        &self,
-        key: &str,
-        path: &std::path::Path,
-        _checksum: &str,
-    ) -> Result<()> {
-        self.upload_file(key, path).await
-    }
-    async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
-        self.objects
-            .lock()
-            .await
-            .get(key)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Key not found: {}", key))
-    }
-    async fn download_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
-        let data = self.download_bytes(key).await?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(path, data).await?;
-        Ok(())
-    }
-    async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut keys: Vec<String> = self
-            .objects
-            .lock()
-            .await
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        keys.sort();
-        Ok(keys)
-    }
-    async fn list_objects_after(&self, prefix: &str, start_after: &str) -> Result<Vec<String>> {
-        let mut keys: Vec<String> = self
-            .objects
-            .lock()
-            .await
-            .keys()
-            .filter(|k| k.starts_with(prefix) && k.as_str() > start_after)
-            .cloned()
-            .collect();
-        keys.sort();
-        Ok(keys)
-    }
-    async fn exists(&self, key: &str) -> Result<bool> {
-        Ok(self.objects.lock().await.contains_key(key))
-    }
-    async fn get_checksum(&self, _key: &str) -> Result<Option<String>> {
-        Ok(None)
-    }
-    async fn delete_object(&self, key: &str) -> Result<()> {
-        self.objects.lock().await.remove(key);
-        Ok(())
-    }
-    async fn delete_objects(&self, keys: &[String]) -> Result<usize> {
-        let mut objects = self.objects.lock().await;
-        let mut deleted = 0;
-        for key in keys {
-            if objects.remove(key).is_some() {
-                deleted += 1;
-            }
-        }
-        Ok(deleted)
-    }
-    fn bucket_name(&self) -> &str {
-        "test-bucket"
-    }
-}
 
 // ============================================================================
 // Helpers
@@ -238,7 +130,7 @@ async fn test_leader_hrana_read() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("leader.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
     let coord = build_coordinator(storage, lease, "leader-1", "http://localhost:19100");
 
@@ -270,7 +162,7 @@ async fn test_leader_hrana_write() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("leader.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
     let coord = build_coordinator(storage, lease, "leader-2", "http://localhost:19101");
 
@@ -311,7 +203,7 @@ async fn test_leader_hrana_transaction() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("leader.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
     let coord = build_coordinator(storage, lease, "leader-3", "http://localhost:19102");
 
@@ -368,7 +260,7 @@ async fn test_follower_hrana_read() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     // Start leader
@@ -462,7 +354,7 @@ async fn test_follower_hrana_rejects_writes() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     // Start leader
@@ -575,7 +467,7 @@ async fn test_follower_hrana_rejects_batch_with_writes() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let leader_coord = build_coordinator(
@@ -652,7 +544,7 @@ async fn test_follower_hrana_cursor_rejects_writes() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let leader_coord = build_coordinator(
@@ -746,7 +638,7 @@ async fn test_follower_hrana_rejects_sequence_writes() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let leader_coord = build_coordinator(
@@ -818,7 +710,7 @@ async fn test_leader_follower_hrana_with_auth() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let leader_coord = build_coordinator(
@@ -908,7 +800,7 @@ async fn test_leader_write_follower_read_through_hrana() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let leader_coord = build_coordinator(
@@ -1020,7 +912,7 @@ async fn test_follower_hrana_close_and_autocommit() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let leader_coord = build_coordinator(
@@ -1102,7 +994,7 @@ async fn test_follower_hrana_describe() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let leader_coord = build_coordinator(
@@ -1184,7 +1076,7 @@ async fn test_follower_connection_is_sqlite_readonly() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let leader_coord = build_coordinator(
@@ -1273,7 +1165,7 @@ async fn test_hrana_session_isolation_on_leader() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("leader.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
     let coord = build_coordinator(storage, lease, "leader-iso1", "http://localhost:19210");
 
@@ -1343,7 +1235,7 @@ async fn test_hrana_and_haqlite_share_database_state() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("leader.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
     let coord = build_coordinator(storage, lease, "leader-share1", "http://localhost:19220");
 
@@ -1419,7 +1311,7 @@ async fn test_wrong_auth_rejected_on_both_roles() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let leader_coord = build_coordinator(
@@ -1549,7 +1441,7 @@ async fn test_role_promotion_changes_hrana_writability() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(WalrustInMemoryStorage::new());
+    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     // Leader with short lease TTL for fast failover
