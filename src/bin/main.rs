@@ -91,12 +91,12 @@ impl CliBackend for HaqliteBackend {
         println!("Databases:");
         for db in &dbs {
             let snapshot_info = match &db.latest_snapshot {
-                Some(s) => format!("snapshot gen {} (TXID {})", s.generation, s.max_txid),
+                Some(s) => format!("snapshot gen {} (seq {})", s.generation, s.seq),
                 None => "no snapshot".to_string(),
             };
             println!(
-                "  {} (TXID: {}, {} incrementals, {})",
-                db.name, db.max_txid, db.incremental_count, snapshot_info
+                "  {} (seq: {}, {} incrementals, {})",
+                db.name, db.max_seq, db.incremental_count, snapshot_info
             );
         }
         Ok(())
@@ -117,15 +117,15 @@ impl CliBackend for HaqliteBackend {
 
         for (filename, file_result) in &result.file_results {
             match file_result {
-                VerifyFileResult::Ok { txid_count, size_bytes } => {
+                VerifyFileResult::Ok { seq, size_bytes } => {
                     println!(
-                        "  OK   {} ({} TXIDs, {:.1} KB)",
-                        filename, txid_count, *size_bytes as f64 / 1024.0
+                        "  OK   {} (seq {}, {:.1} KB)",
+                        filename, seq, *size_bytes as f64 / 1024.0
                     );
                 }
-                VerifyFileResult::TxidMismatch { expected_min, expected_max, header_min, header_max } => {
-                    println!("  WARN {} TXID mismatch: filename {}-{}, header {}-{}",
-                        filename, expected_min, expected_max, header_min, header_max);
+                VerifyFileResult::SeqMismatch { expected_seq, header_seq } => {
+                    println!("  WARN {} seq mismatch: filename {}, header {}",
+                        filename, expected_seq, header_seq);
                 }
                 VerifyFileResult::ChecksumFailed(e) => {
                     println!("  FAIL {} checksum: {}", filename, e);
@@ -185,13 +185,13 @@ impl CliBackend for HaqliteBackend {
         println!("  Keeping {} snapshots:", plan.keep_snapshots.len());
         for s in &plan.keep_snapshots {
             let filename = s.key.split('/').next_back().unwrap_or(&s.key);
-            println!("    {} (gen {}, TXID {})", filename, s.generation, s.max_txid);
+            println!("    {} (gen {}, seq {})", filename, s.generation, s.seq);
         }
         if !plan.delete_snapshots.is_empty() {
             println!("  Deleting {} snapshots:", plan.delete_snapshots.len());
             for s in &plan.delete_snapshots {
                 let filename = s.key.split('/').next_back().unwrap_or(&s.key);
-                println!("    {} (gen {}, TXID {})", filename, s.generation, s.max_txid);
+                println!("    {} (gen {}, seq {})", filename, s.generation, s.seq);
             }
         }
         if !plan.delete_stale_incrementals.is_empty() {
@@ -201,7 +201,7 @@ impl CliBackend for HaqliteBackend {
             );
             for s in &plan.delete_stale_incrementals {
                 let filename = s.key.split('/').next_back().unwrap_or(&s.key);
-                println!("    {} (TXID {}-{})", filename, s.min_txid, s.max_txid);
+                println!("    {} (seq {})", filename, s.seq);
             }
         }
 
@@ -247,9 +247,9 @@ impl CliBackend for HaqliteBackend {
                 .await?;
         let result = ops::snapshot_database(&storage, prefix, &args.database).await?;
         println!(
-            "Snapshot uploaded for '{}' (TXID {})",
+            "Snapshot uploaded for '{}' (seq {})",
             result.db_name,
-            result.txid
+            result.seq
         );
         Ok(())
     }

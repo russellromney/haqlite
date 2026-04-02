@@ -2,7 +2,7 @@
 //!
 //! These are the implementations behind `haqlite list`, `haqlite verify`, etc.
 //! They operate on a `walrust::StorageBackend` (S3-compatible object store)
-//! and parse the litestream LTX file format from S3 key names.
+//! and parse the HADBP changeset format from S3 key names.
 
 use std::path::Path;
 use std::time::Duration;
@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use walrust::StorageBackend;
+use walrust::hadb_changeset::storage::{self as cs_storage, ChangesetKind, DiscoveredChangeset};
 
 // ============================================================================
 // Helpers
@@ -27,27 +28,25 @@ fn normalize_prefix(prefix: &str) -> String {
 }
 
 // ============================================================================
-// LTX file discovery
+// Changeset discovery
 // ============================================================================
 
-/// An LTX file discovered from S3 by parsing litestream-format filenames.
+/// A changeset file discovered from S3 by parsing HADBP filenames.
 #[derive(Debug, Clone)]
 pub struct DiscoveredLtx {
     /// Full S3 key
     pub key: String,
-    /// Starting transaction ID
-    pub min_txid: u64,
-    /// Ending transaction ID
-    pub max_txid: u64,
+    /// Sequence number
+    pub seq: u64,
     /// Whether this is a snapshot (generation > 0) vs incremental (generation 0)
     pub is_snapshot: bool,
     /// Generation number (0 = live incremental, 1+ = snapshot)
     pub generation: u64,
 }
 
-/// Discover all LTX files for a database by listing S3 and parsing filenames.
+/// Discover all changeset files for a database by listing S3 and parsing filenames.
 ///
-/// Litestream format: `{prefix}{db_name}/{GGGG}/{min_txid:016x}-{max_txid:016x}.ltx`
+/// HADBP format: `{prefix}{db_name}/{GGGG}/{seq:016x}.hadbp`
 /// Generation 0000 = live incrementals, 0001+ = snapshots.
 pub async fn discover_ltx_files(
     storage: &dyn StorageBackend,
@@ -72,31 +71,22 @@ pub async fn discover_ltx_files(
             Err(_) => continue,
         };
         let filename = parts[1];
-        if !filename.ends_with(".ltx") {
+        if !filename.ends_with(".hadbp") {
             continue;
         }
-        let stem = &filename[..filename.len() - 4];
-        let txid_parts: Vec<&str> = stem.splitn(2, '-').collect();
-        if txid_parts.len() != 2 {
-            continue;
-        }
-        let min_txid = match u64::from_str_radix(txid_parts[0], 16) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let max_txid = match u64::from_str_radix(txid_parts[1], 16) {
+        let stem = &filename[..filename.len() - 6]; // strip ".hadbp"
+        let seq = match u64::from_str_radix(stem, 16) {
             Ok(v) => v,
             Err(_) => continue,
         };
         files.push(DiscoveredLtx {
             key: key.clone(),
-            min_txid,
-            max_txid,
+            seq,
             is_snapshot: gen > 0,
             generation: gen,
         });
     }
-    files.sort_by_key(|f| f.min_txid);
+    files.sort_by_key(|f| f.seq);
     Ok(files)
 }
 
@@ -129,7 +119,7 @@ pub async fn discover_databases(
 #[derive(Debug)]
 pub struct DatabaseInfo {
     pub name: String,
-    pub max_txid: u64,
+    pub max_seq: u64,
     pub incremental_count: usize,
     pub latest_snapshot: Option<SnapshotInfo>,
 }
@@ -138,7 +128,7 @@ pub struct DatabaseInfo {
 #[derive(Debug)]
 pub struct SnapshotInfo {
     pub generation: u64,
-    pub max_txid: u64,
+    pub seq: u64,
 }
 
 /// List all databases in the S3 bucket under the given prefix, returning structured info.
@@ -150,19 +140,19 @@ pub async fn list_databases(
     let mut result = Vec::new();
     for db in dbs {
         let files = discover_ltx_files(storage, prefix, &db).await?;
-        let max_txid = files.iter().map(|f| f.max_txid).max().unwrap_or(0);
+        let max_seq = files.iter().map(|f| f.seq).max().unwrap_or(0);
         let incremental_count = files.iter().filter(|f| !f.is_snapshot).count();
         let latest_snapshot = files
             .iter()
             .filter(|f| f.is_snapshot)
-            .max_by_key(|f| f.max_txid)
+            .max_by_key(|f| f.seq)
             .map(|s| SnapshotInfo {
                 generation: s.generation,
-                max_txid: s.max_txid,
+                seq: s.seq,
             });
         result.push(DatabaseInfo {
             name: db,
-            max_txid,
+            max_seq,
             incremental_count,
             latest_snapshot,
         });
@@ -174,11 +164,11 @@ pub async fn list_databases(
 // verify
 // ============================================================================
 
-/// Result of verifying a single LTX file.
+/// Result of verifying a single changeset file.
 #[derive(Debug)]
 pub enum VerifyFileResult {
-    Ok { txid_count: u64, size_bytes: u64 },
-    TxidMismatch { expected_min: u64, expected_max: u64, header_min: u64, header_max: u64 },
+    Ok { seq: u64, size_bytes: u64 },
+    SeqMismatch { expected_seq: u64, header_seq: u64 },
     ChecksumFailed(String),
     DownloadFailed(String),
 }
@@ -196,15 +186,17 @@ pub struct VerifyResult {
 impl VerifyResult {
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        self.file_results.iter().all(|(_, r)| matches!(r, VerifyFileResult::Ok { .. }))
+        self.file_results
+            .iter()
+            .all(|(_, r)| matches!(r, VerifyFileResult::Ok { .. }))
             && self.continuity_issues.is_empty()
     }
 }
 
-/// Verify integrity of all LTX files for a database.
+/// Verify integrity of all changeset files for a database.
 ///
-/// Downloads each file, verifies LTX checksums, and checks TXID continuity
-/// (both gaps and overlaps) in the incremental chain.
+/// Downloads each file, verifies HADBP checksums, and checks seq continuity
+/// in the incremental chain.
 pub async fn verify_database(
     storage: &dyn StorageBackend,
     prefix: &str,
@@ -212,7 +204,10 @@ pub async fn verify_database(
 ) -> Result<VerifyResult> {
     let files = discover_ltx_files(storage, prefix, name).await?;
     if files.is_empty() {
-        return Err(anyhow!("No LTX files found for database '{}'", name));
+        return Err(anyhow!(
+            "No changeset files found for database '{}'",
+            name
+        ));
     }
 
     let snapshots = files.iter().filter(|f| f.is_snapshot).count();
@@ -227,68 +222,74 @@ pub async fn verify_database(
     let mut file_results = Vec::new();
 
     for file in &files {
-        let filename = file.key.split('/').next_back().unwrap_or(&file.key).to_string();
+        let filename = file
+            .key
+            .split('/')
+            .next_back()
+            .unwrap_or(&file.key)
+            .to_string();
         match storage.download_bytes(&file.key).await {
             Ok(data) => {
-                let cursor = std::io::Cursor::new(&data);
-                match walrust::ltx::verify_ltx(cursor) {
-                    Ok(header) => {
-                        let h_min = header.min_txid.into_inner();
-                        let h_max = header.max_txid.into_inner();
-                        if h_min != file.min_txid || h_max != file.max_txid {
-                            file_results.push((filename, VerifyFileResult::TxidMismatch {
-                                expected_min: file.min_txid,
-                                expected_max: file.max_txid,
-                                header_min: h_min,
-                                header_max: h_max,
-                            }));
+                match walrust::hadb_changeset::physical::decode(&data) {
+                    Ok(changeset) => {
+                        if changeset.header.seq != file.seq {
+                            file_results.push((
+                                filename,
+                                VerifyFileResult::SeqMismatch {
+                                    expected_seq: file.seq,
+                                    header_seq: changeset.header.seq,
+                                },
+                            ));
                         } else {
-                            let txid_count = file.max_txid - file.min_txid + 1;
                             verified_count += 1;
                             total_size += data.len() as u64;
-                            file_results.push((filename, VerifyFileResult::Ok {
-                                txid_count,
-                                size_bytes: data.len() as u64,
-                            }));
+                            file_results.push((
+                                filename,
+                                VerifyFileResult::Ok {
+                                    seq: file.seq,
+                                    size_bytes: data.len() as u64,
+                                },
+                            ));
                         }
                     }
                     Err(e) => {
-                        file_results.push((filename, VerifyFileResult::ChecksumFailed(e.to_string())));
+                        file_results.push((
+                            filename,
+                            VerifyFileResult::ChecksumFailed(e.to_string()),
+                        ));
                     }
                 }
             }
             Err(e) => {
-                file_results.push((filename, VerifyFileResult::DownloadFailed(e.to_string())));
+                file_results
+                    .push((filename, VerifyFileResult::DownloadFailed(e.to_string())));
             }
         }
     }
 
-    // TXID continuity check on incrementals: detect both gaps and overlaps
+    // Seq continuity check on incrementals: detect gaps
     let mut sorted_incr: Vec<_> = files.iter().filter(|f| !f.is_snapshot).collect();
-    sorted_incr.sort_by_key(|f| f.min_txid);
+    sorted_incr.sort_by_key(|f| f.seq);
     let mut continuity_issues = Vec::new();
     let mut expected_next: Option<u64> = None;
     for file in &sorted_incr {
         if let Some(expected) = expected_next {
-            if file.min_txid > expected {
+            if file.seq > expected {
                 continuity_issues.push(format!(
-                    "TXID gap: expected {}, got {} (missing {}-{})",
+                    "Seq gap: expected {}, got {} (missing {}-{})",
                     expected,
-                    file.min_txid,
+                    file.seq,
                     expected,
-                    file.min_txid - 1
+                    file.seq - 1
                 ));
-            } else if file.min_txid < expected {
+            } else if file.seq < expected {
                 continuity_issues.push(format!(
-                    "TXID overlap: expected {}, got {} (duplicate range {}-{})",
-                    expected,
-                    file.min_txid,
-                    file.min_txid,
-                    expected - 1
+                    "Seq overlap: expected {}, got {} (duplicate)",
+                    expected, file.seq
                 ));
             }
         }
-        expected_next = Some(file.max_txid + 1);
+        expected_next = Some(file.seq + 1);
     }
 
     Ok(VerifyResult {
@@ -334,8 +335,8 @@ pub async fn plan_compact(
         });
     }
 
-    // Sort by TXID descending (newest first)
-    snapshots.sort_by(|a, b| b.max_txid.cmp(&a.max_txid));
+    // Sort by seq descending (newest first)
+    snapshots.sort_by(|a, b| b.seq.cmp(&a.seq));
 
     let (keep_snapshots, delete_snapshots) = if snapshots.len() <= keep_count {
         (snapshots, Vec::new())
@@ -344,15 +345,14 @@ pub async fn plan_compact(
         (snapshots, delete)
     };
 
-    // Find stale incrementals: those with max_txid < oldest kept snapshot's min_txid.
-    // These are unrestorable since there's no base snapshot covering them.
-    let oldest_kept_min_txid = keep_snapshots
+    // Find stale incrementals: those with seq < oldest kept snapshot's seq.
+    let oldest_kept_seq = keep_snapshots
         .last()
-        .map(|s| s.min_txid)
+        .map(|s| s.seq)
         .unwrap_or(u64::MAX);
     let delete_stale_incrementals: Vec<_> = incrementals
         .into_iter()
-        .filter(|i| i.max_txid < oldest_kept_min_txid)
+        .filter(|i| i.seq < oldest_kept_seq)
         .collect();
 
     Ok(CompactPlan {
@@ -368,7 +368,11 @@ pub async fn execute_compact(
     plan: &CompactPlan,
 ) -> Result<usize> {
     let mut keys: Vec<String> = plan.delete_snapshots.iter().map(|s| s.key.clone()).collect();
-    keys.extend(plan.delete_stale_incrementals.iter().map(|s| s.key.clone()));
+    keys.extend(
+        plan.delete_stale_incrementals
+            .iter()
+            .map(|s| s.key.clone()),
+    );
     if keys.is_empty() {
         return Ok(0);
     }
@@ -382,8 +386,8 @@ pub async fn execute_compact(
 /// Result of taking a snapshot.
 #[derive(Debug)]
 pub struct SnapshotResult {
-    /// TXID of the newly created snapshot.
-    pub txid: u64,
+    /// Seq of the newly created snapshot.
+    pub seq: u64,
     /// Database name (derived from the file stem).
     pub db_name: String,
 }
@@ -402,9 +406,9 @@ pub async fn snapshot_database(
     let mut state = walrust::SyncState::new(db_path.to_path_buf())?;
     let db_name = state.name.clone();
 
-    // Discover current TXID from S3 so the snapshot gets the right sequence number
+    // Discover current seq from S3 so the snapshot gets the right sequence number
     let files = discover_ltx_files(storage, &prefix, &db_name).await?;
-    state.current_txid = files.iter().map(|f| f.max_txid).max().unwrap_or(0);
+    state.current_seq = files.iter().map(|f| f.seq).max().unwrap_or(0);
 
     // Initialize checksum from the database file
     state.init_checksum()?;
@@ -412,7 +416,7 @@ pub async fn snapshot_database(
     walrust::sync::take_snapshot(storage, &prefix, &mut state).await?;
 
     Ok(SnapshotResult {
-        txid: state.current_txid,
+        seq: state.current_seq,
         db_name,
     })
 }
@@ -421,7 +425,7 @@ pub async fn snapshot_database(
 // replicate
 // ============================================================================
 
-/// Load replica TXID from state file, or 0 if none exists.
+/// Load replica seq from state file, or 0 if none exists.
 ///
 /// Logs at error level if the state file exists but cannot be parsed,
 /// since this indicates corruption (not a normal "first run" scenario).
@@ -442,13 +446,19 @@ pub fn load_replica_state(local: &Path) -> u64 {
         }
     };
     match serde_json::from_str::<serde_json::Value>(&data) {
-        Ok(state) => state["current_txid"].as_u64().unwrap_or_else(|| {
-            tracing::error!(
-                "Replica state file {} missing current_txid field",
-                state_path.display()
-            );
-            0
-        }),
+        Ok(state) => {
+            // Try new field name first, fall back to old for migration
+            state["current_seq"]
+                .as_u64()
+                .or_else(|| state["current_txid"].as_u64())
+                .unwrap_or_else(|| {
+                    tracing::error!(
+                        "Replica state file {} missing current_seq field",
+                        state_path.display()
+                    );
+                    0
+                })
+        }
         Err(e) => {
             tracing::error!(
                 "Failed to parse replica state file {}: {}",
@@ -460,11 +470,11 @@ pub fn load_replica_state(local: &Path) -> u64 {
     }
 }
 
-/// Save current replica TXID to state file.
-pub fn save_replica_state(local: &Path, current_txid: u64) -> Result<()> {
+/// Save current replica seq to state file.
+pub fn save_replica_state(local: &Path, current_seq: u64) -> Result<()> {
     let state_path = local.with_extension("db-replica-state");
     let state = serde_json::json!({
-        "current_txid": current_txid,
+        "current_seq": current_seq,
         "last_updated": Utc::now().to_rfc3339(),
     });
     std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
@@ -473,7 +483,7 @@ pub fn save_replica_state(local: &Path, current_txid: u64) -> Result<()> {
 
 /// Run as a read replica: bootstrap from S3 if needed, then poll for incremental updates.
 ///
-/// Polls S3 every `interval` for new LTX files and applies them to the local database.
+/// Polls S3 every `interval` for new changeset files and applies them to the local database.
 /// Uses exponential backoff on consecutive failures with escalating log severity.
 /// Shuts down gracefully on SIGTERM/SIGINT.
 pub async fn replicate_database(
@@ -484,19 +494,19 @@ pub async fn replicate_database(
     interval: Duration,
 ) -> Result<()> {
     let prefix = normalize_prefix(prefix);
-    let mut current_txid = load_replica_state(local);
+    let mut current_seq = load_replica_state(local);
 
-    if current_txid == 0 || !local.exists() {
+    if current_seq == 0 || !local.exists() {
         tracing::info!("Bootstrapping replica from S3...");
-        current_txid = walrust::sync::restore(storage, &prefix, db_name, local, None).await?;
-        save_replica_state(local, current_txid)?;
+        current_seq = walrust::sync::restore(storage, &prefix, db_name, local, None).await?;
+        save_replica_state(local, current_seq)?;
     }
 
     tracing::info!(
-        "Replicating '{}' -> {} (starting at TXID {})",
+        "Replicating '{}' -> {} (starting at seq {})",
         db_name,
         local.display(),
-        current_txid
+        current_seq
     );
 
     let mut consecutive_failures: u32 = 0;
@@ -511,22 +521,22 @@ pub async fn replicate_database(
                 tracing::info!("Received shutdown signal, stopping replication.");
                 return Ok(());
             }
-            result = walrust::sync::pull_incremental(storage, &prefix, db_name, local, current_txid) => {
+            result = walrust::sync::pull_incremental(storage, &prefix, db_name, local, current_seq) => {
                 match result {
-                    Ok(new_txid) => {
+                    Ok(new_seq) => {
                         if consecutive_failures > 0 {
                             tracing::info!("Replication recovered after {} failures", consecutive_failures);
                         }
                         consecutive_failures = 0;
 
-                        if new_txid > current_txid {
+                        if new_seq > current_seq {
                             tracing::info!(
-                                "Pulled TXID {} -> {}",
-                                current_txid,
-                                new_txid
+                                "Pulled seq {} -> {}",
+                                current_seq,
+                                new_seq
                             );
-                            current_txid = new_txid;
-                            save_replica_state(local, current_txid)?;
+                            current_seq = new_seq;
+                            save_replica_state(local, current_seq)?;
                         }
                         tokio::time::sleep(interval).await;
                     }

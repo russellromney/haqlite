@@ -1,4 +1,4 @@
-//! Tests for haqlite::ops — CLI operations (list, verify, compact, snapshot, replicate).
+//! Tests for haqlite::ops -- CLI operations (list, verify, compact, snapshot, replicate).
 //!
 //! Uses an in-memory storage backend to avoid S3 dependencies.
 
@@ -26,8 +26,8 @@ fn create_test_db(path: &Path) {
     .unwrap();
 }
 
-/// Encode a snapshot LTX file from a database, returning the raw bytes.
-fn encode_snapshot(db_path: &Path, txid: u64) -> Vec<u8> {
+/// Encode a snapshot HADBP changeset from a database, returning the raw bytes.
+fn encode_snapshot(db_path: &Path, seq: u64) -> Vec<u8> {
     let page_size = {
         let conn = rusqlite::Connection::open(db_path).unwrap();
         let ps: u32 = conn
@@ -35,19 +35,17 @@ fn encode_snapshot(db_path: &Path, txid: u64) -> Vec<u8> {
             .unwrap();
         ps
     };
-    let mut buf = Vec::new();
-    walrust::ltx::encode_snapshot(&mut buf, db_path, page_size, txid).unwrap();
-    buf
+    walrust::ltx::encode_snapshot(db_path, page_size, seq, 0).unwrap()
 }
 
 // ============================================================================
-// discover_ltx_files
+// discover_ltx_files (now parses .hadbp format)
 // ============================================================================
 
 #[tokio::test]
 async fn test_discover_empty_bucket() {
     let storage = InMemoryStorage::new();
-    let files = ops::discover_ltx_files(&storage, "","mydb").await.unwrap();
+    let files = ops::discover_ltx_files(&storage, "", "mydb").await.unwrap();
     assert!(files.is_empty());
 }
 
@@ -56,21 +54,19 @@ async fn test_discover_finds_incrementals() {
     let storage = InMemoryStorage::new();
     // Generation 0 = incrementals
     storage
-        .insert("mydb/0000/0000000000000001-0000000000000001.ltx", vec![1])
+        .insert("mydb/0000/0000000000000001.hadbp", vec![1])
         .await;
     storage
-        .insert("mydb/0000/0000000000000002-0000000000000003.ltx", vec![2])
+        .insert("mydb/0000/0000000000000002.hadbp", vec![2])
         .await;
 
-    let files = ops::discover_ltx_files(&storage, "","mydb").await.unwrap();
+    let files = ops::discover_ltx_files(&storage, "", "mydb").await.unwrap();
     assert_eq!(files.len(), 2);
     assert!(!files[0].is_snapshot);
-    assert_eq!(files[0].min_txid, 1);
-    assert_eq!(files[0].max_txid, 1);
+    assert_eq!(files[0].seq, 1);
     assert_eq!(files[0].generation, 0);
     assert!(!files[1].is_snapshot);
-    assert_eq!(files[1].min_txid, 2);
-    assert_eq!(files[1].max_txid, 3);
+    assert_eq!(files[1].seq, 2);
 }
 
 #[tokio::test]
@@ -78,27 +74,26 @@ async fn test_discover_finds_snapshots() {
     let storage = InMemoryStorage::new();
     // Generation 1 = snapshot
     storage
-        .insert("mydb/0001/0000000000000001-0000000000000005.ltx", vec![1])
+        .insert("mydb/0001/0000000000000005.hadbp", vec![1])
         .await;
 
-    let files = ops::discover_ltx_files(&storage, "","mydb").await.unwrap();
+    let files = ops::discover_ltx_files(&storage, "", "mydb").await.unwrap();
     assert_eq!(files.len(), 1);
     assert!(files[0].is_snapshot);
-    assert_eq!(files[0].min_txid, 1);
-    assert_eq!(files[0].max_txid, 5);
+    assert_eq!(files[0].seq, 5);
     assert_eq!(files[0].generation, 1);
 }
 
 #[tokio::test]
-async fn test_discover_ignores_non_ltx_files() {
+async fn test_discover_ignores_non_hadbp_files() {
     let storage = InMemoryStorage::new();
     storage.insert("mydb/0000/manifest.json", vec![]).await;
     storage.insert("mydb/0000/state.json", vec![]).await;
     storage
-        .insert("mydb/0000/0000000000000001-0000000000000001.ltx", vec![1])
+        .insert("mydb/0000/0000000000000001.hadbp", vec![1])
         .await;
 
-    let files = ops::discover_ltx_files(&storage, "","mydb").await.unwrap();
+    let files = ops::discover_ltx_files(&storage, "", "mydb").await.unwrap();
     assert_eq!(files.len(), 1);
 }
 
@@ -106,34 +101,34 @@ async fn test_discover_ignores_non_ltx_files() {
 async fn test_discover_ignores_other_databases() {
     let storage = InMemoryStorage::new();
     storage
-        .insert("mydb/0000/0000000000000001-0000000000000001.ltx", vec![1])
+        .insert("mydb/0000/0000000000000001.hadbp", vec![1])
         .await;
     storage
-        .insert("other/0000/0000000000000001-0000000000000001.ltx", vec![1])
+        .insert("other/0000/0000000000000001.hadbp", vec![1])
         .await;
 
-    let files = ops::discover_ltx_files(&storage, "","mydb").await.unwrap();
+    let files = ops::discover_ltx_files(&storage, "", "mydb").await.unwrap();
     assert_eq!(files.len(), 1);
 }
 
 #[tokio::test]
-async fn test_discover_sorted_by_min_txid() {
+async fn test_discover_sorted_by_seq() {
     let storage = InMemoryStorage::new();
     storage
-        .insert("db/0000/0000000000000005-0000000000000005.ltx", vec![1])
+        .insert("db/0000/0000000000000005.hadbp", vec![1])
         .await;
     storage
-        .insert("db/0000/0000000000000001-0000000000000001.ltx", vec![1])
+        .insert("db/0000/0000000000000001.hadbp", vec![1])
         .await;
     storage
-        .insert("db/0000/0000000000000003-0000000000000003.ltx", vec![1])
+        .insert("db/0000/0000000000000003.hadbp", vec![1])
         .await;
 
-    let files = ops::discover_ltx_files(&storage, "","db").await.unwrap();
+    let files = ops::discover_ltx_files(&storage, "", "db").await.unwrap();
     assert_eq!(files.len(), 3);
-    assert_eq!(files[0].min_txid, 1);
-    assert_eq!(files[1].min_txid, 3);
-    assert_eq!(files[2].min_txid, 5);
+    assert_eq!(files[0].seq, 1);
+    assert_eq!(files[1].seq, 3);
+    assert_eq!(files[2].seq, 5);
 }
 
 // ============================================================================
@@ -151,13 +146,13 @@ async fn test_discover_databases_empty() {
 async fn test_discover_databases_multiple() {
     let storage = InMemoryStorage::new();
     storage
-        .insert("alpha/0000/0000000000000001-0000000000000001.ltx", vec![1])
+        .insert("alpha/0000/0000000000000001.hadbp", vec![1])
         .await;
     storage
-        .insert("beta/0001/0000000000000001-0000000000000001.ltx", vec![1])
+        .insert("beta/0001/0000000000000001.hadbp", vec![1])
         .await;
     storage
-        .insert("gamma/0000/0000000000000001-0000000000000001.ltx", vec![1])
+        .insert("gamma/0000/0000000000000001.hadbp", vec![1])
         .await;
 
     let dbs = ops::discover_databases(&storage, "").await.unwrap();
@@ -178,34 +173,34 @@ async fn test_list_empty_bucket() {
 #[tokio::test]
 async fn test_list_with_snapshot_and_incrementals() {
     let storage = InMemoryStorage::new();
-    // Snapshot at gen 1
+    // Snapshot at gen 1, seq 5
     storage
-        .insert("mydb/0001/0000000000000001-0000000000000005.ltx", vec![1])
+        .insert("mydb/0001/0000000000000005.hadbp", vec![1])
         .await;
     // Two incrementals at gen 0
     storage
-        .insert("mydb/0000/0000000000000006-0000000000000006.ltx", vec![1])
+        .insert("mydb/0000/0000000000000006.hadbp", vec![1])
         .await;
     storage
-        .insert("mydb/0000/0000000000000007-0000000000000007.ltx", vec![1])
+        .insert("mydb/0000/0000000000000007.hadbp", vec![1])
         .await;
 
     let dbs = ops::list_databases(&storage, "").await.unwrap();
     assert_eq!(dbs.len(), 1);
     assert_eq!(dbs[0].name, "mydb");
-    assert_eq!(dbs[0].max_txid, 7);
+    assert_eq!(dbs[0].max_seq, 7);
     assert_eq!(dbs[0].incremental_count, 2);
     assert!(dbs[0].latest_snapshot.is_some());
     let snap = dbs[0].latest_snapshot.as_ref().unwrap();
     assert_eq!(snap.generation, 1);
-    assert_eq!(snap.max_txid, 5);
+    assert_eq!(snap.seq, 5);
 }
 
 #[tokio::test]
 async fn test_list_no_snapshot() {
     let storage = InMemoryStorage::new();
     storage
-        .insert("mydb/0000/0000000000000001-0000000000000001.ltx", vec![1])
+        .insert("mydb/0000/0000000000000001.hadbp", vec![1])
         .await;
 
     let dbs = ops::list_databases(&storage, "").await.unwrap();
@@ -221,7 +216,7 @@ async fn test_list_no_snapshot() {
 async fn test_verify_empty_db_errors() {
     let storage = InMemoryStorage::new();
     let err = ops::verify_database(&storage, "", "mydb").await.unwrap_err();
-    assert!(err.to_string().contains("No LTX files found"));
+    assert!(err.to_string().contains("No changeset files found"));
 }
 
 #[tokio::test]
@@ -229,7 +224,7 @@ async fn test_verify_no_snapshot_errors() {
     let storage = InMemoryStorage::new();
     // Only incrementals, no snapshot
     storage
-        .insert("mydb/0000/0000000000000001-0000000000000001.ltx", vec![1])
+        .insert("mydb/0000/0000000000000001.hadbp", vec![1])
         .await;
 
     let err = ops::verify_database(&storage, "", "mydb").await.unwrap_err();
@@ -242,11 +237,11 @@ async fn test_verify_valid_snapshot() {
     let db_path = tmp.path().join("test.db");
     create_test_db(&db_path);
 
-    let ltx_data = encode_snapshot(&db_path, 1);
+    let hadbp_data = encode_snapshot(&db_path, 1);
 
     let storage = InMemoryStorage::new();
     storage
-        .insert("test/0001/0000000000000001-0000000000000001.ltx", ltx_data)
+        .insert("test/0001/0000000000000001.hadbp", hadbp_data)
         .await;
 
     let result = ops::verify_database(&storage, "", "test").await.unwrap();
@@ -258,10 +253,10 @@ async fn test_verify_valid_snapshot() {
 #[tokio::test]
 async fn test_verify_corrupt_file_detected() {
     let storage = InMemoryStorage::new();
-    // Corrupt data that doesn't parse as LTX
+    // Corrupt data that doesn't parse as HADBP
     storage
         .insert(
-            "mydb/0001/0000000000000001-0000000000000001.ltx",
+            "mydb/0001/0000000000000001.hadbp",
             vec![0xFF, 0xFF, 0xFF, 0xFF],
         )
         .await;
@@ -276,7 +271,7 @@ async fn test_verify_corrupt_file_detected() {
 }
 
 #[tokio::test]
-async fn test_verify_detects_txid_gap() {
+async fn test_verify_detects_seq_gap() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("test.db");
     create_test_db(&db_path);
@@ -284,26 +279,19 @@ async fn test_verify_detects_txid_gap() {
     let snapshot_data = encode_snapshot(&db_path, 1);
 
     let storage = InMemoryStorage::new();
-    // Snapshot
+    // Snapshot at seq 1
     storage
-        .insert(
-            "test/0001/0000000000000001-0000000000000001.ltx",
-            snapshot_data.clone(),
-        )
+        .insert("test/0001/0000000000000001.hadbp", snapshot_data.clone())
         .await;
-    // Incremental at TXID 2-2
+    // Incremental at seq 2
+    let incr2 = encode_snapshot(&db_path, 2);
     storage
-        .insert(
-            "test/0000/0000000000000002-0000000000000002.ltx",
-            snapshot_data.clone(),
-        )
+        .insert("test/0000/0000000000000002.hadbp", incr2)
         .await;
-    // Incremental at TXID 5-5 (gap: missing 3-4)
+    // Incremental at seq 5 (gap: missing 3-4)
+    let incr5 = encode_snapshot(&db_path, 5);
     storage
-        .insert(
-            "test/0000/0000000000000005-0000000000000005.ltx",
-            snapshot_data,
-        )
+        .insert("test/0000/0000000000000005.hadbp", incr5)
         .await;
 
     let result = ops::verify_database(&storage, "", "test").await.unwrap();
@@ -328,10 +316,10 @@ async fn test_compact_no_snapshots() {
 async fn test_compact_fewer_than_keep() {
     let storage = InMemoryStorage::new();
     storage
-        .insert("mydb/0001/0000000000000001-0000000000000001.ltx", vec![1])
+        .insert("mydb/0001/0000000000000001.hadbp", vec![1])
         .await;
     storage
-        .insert("mydb/0002/0000000000000001-0000000000000005.ltx", vec![1])
+        .insert("mydb/0002/0000000000000005.hadbp", vec![1])
         .await;
 
     // Keep 5, only 2 exist
@@ -343,12 +331,9 @@ async fn test_compact_fewer_than_keep() {
 #[tokio::test]
 async fn test_compact_deletes_oldest() {
     let storage = InMemoryStorage::new();
-    // 5 snapshots with increasing TXIDs
+    // 5 snapshots with increasing seqs
     for i in 1..=5u64 {
-        let key = format!(
-            "mydb/{:04x}/0000000000000001-{:016x}.ltx",
-            i, i * 10
-        );
+        let key = format!("mydb/{:04x}/{:016x}.hadbp", i, i * 10);
         storage.insert(&key, vec![1]).await;
     }
 
@@ -357,24 +342,21 @@ async fn test_compact_deletes_oldest() {
     assert_eq!(plan.keep_snapshots.len(), 2);
     assert_eq!(plan.delete_snapshots.len(), 3);
 
-    // Kept snapshots should be the newest (highest TXID)
-    assert_eq!(plan.keep_snapshots[0].max_txid, 50);
-    assert_eq!(plan.keep_snapshots[1].max_txid, 40);
+    // Kept snapshots should be the newest (highest seq)
+    assert_eq!(plan.keep_snapshots[0].seq, 50);
+    assert_eq!(plan.keep_snapshots[1].seq, 40);
 
     // Deleted should be the oldest
-    assert_eq!(plan.delete_snapshots[0].max_txid, 30);
-    assert_eq!(plan.delete_snapshots[1].max_txid, 20);
-    assert_eq!(plan.delete_snapshots[2].max_txid, 10);
+    assert_eq!(plan.delete_snapshots[0].seq, 30);
+    assert_eq!(plan.delete_snapshots[1].seq, 20);
+    assert_eq!(plan.delete_snapshots[2].seq, 10);
 }
 
 #[tokio::test]
 async fn test_compact_execute_deletes_files() {
     let storage = InMemoryStorage::new();
     for i in 1..=5u64 {
-        let key = format!(
-            "mydb/{:04x}/0000000000000001-{:016x}.ltx",
-            i, i * 10
-        );
+        let key = format!("mydb/{:04x}/{:016x}.hadbp", i, i * 10);
         storage.insert(&key, vec![1]).await;
     }
 
@@ -392,20 +374,19 @@ async fn test_compact_ignores_incrementals() {
     let storage = InMemoryStorage::new();
     // Snapshot
     storage
-        .insert("mydb/0001/0000000000000001-0000000000000001.ltx", vec![1])
+        .insert("mydb/0001/0000000000000001.hadbp", vec![1])
         .await;
     // Incrementals (generation 0) should not be touched
     storage
-        .insert("mydb/0000/0000000000000002-0000000000000002.ltx", vec![1])
+        .insert("mydb/0000/0000000000000002.hadbp", vec![1])
         .await;
     storage
-        .insert("mydb/0000/0000000000000003-0000000000000003.ltx", vec![1])
+        .insert("mydb/0000/0000000000000003.hadbp", vec![1])
         .await;
 
     let plan = ops::plan_compact(&storage, "", "mydb", 1).await.unwrap();
     assert_eq!(plan.keep_snapshots.len(), 1);
     assert!(plan.delete_snapshots.is_empty());
-    // The 2 incrementals should not appear in the plan at all
     assert!(plan.keep_snapshots[0].is_snapshot);
 }
 
@@ -416,53 +397,51 @@ async fn test_compact_ignores_incrementals() {
 #[tokio::test]
 async fn test_snapshot_nonexistent_db() {
     let storage = InMemoryStorage::new();
-    let err = ops::snapshot_database(&storage, "",Path::new("/nonexistent/test.db"))
+    let err = ops::snapshot_database(&storage, "", Path::new("/nonexistent/test.db"))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("Database not found"));
 }
 
 #[tokio::test]
-async fn test_snapshot_creates_ltx_file() {
+async fn test_snapshot_creates_hadbp_file() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("snap.db");
     create_test_db(&db_path);
 
     let storage = InMemoryStorage::new();
-    let result = ops::snapshot_database(&storage, "",&db_path).await.unwrap();
-    // SQLite file change counter is 2 after CREATE TABLE + INSERT (two transactions).
-    assert_eq!(result.txid, 2);
+    let result = ops::snapshot_database(&storage, "", &db_path).await.unwrap();
+    // seq starts at 0 + 1 = 1
+    assert_eq!(result.seq, 1);
 
-    // Verify the LTX file was uploaded
+    // Verify the HADBP file was uploaded
     let keys = storage.keys().await;
     assert_eq!(keys.len(), 1);
-    // Key should be: snap/0001/0000000000000001-0000000000000002.ltx
     assert!(keys[0].starts_with("snap/"));
     assert!(keys[0].contains("0001/"));
-    assert!(keys[0].ends_with(".ltx"));
+    assert!(keys[0].ends_with(".hadbp"));
 }
 
 #[tokio::test]
-async fn test_snapshot_increments_txid() {
+async fn test_snapshot_increments_seq() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("snap.db");
     create_test_db(&db_path);
 
     let storage = InMemoryStorage::new();
 
-    // First snapshot (change counter = 2 after CREATE + INSERT)
-    let result1 = ops::snapshot_database(&storage, "",&db_path).await.unwrap();
-    assert_eq!(result1.txid, 2);
+    // First snapshot
+    let result1 = ops::snapshot_database(&storage, "", &db_path).await.unwrap();
+    assert_eq!(result1.seq, 1);
 
-    // Second snapshot: take_snapshot reads the same file change counter (2),
-    // but current_txid is now 2, so cc > current_txid fails. The snapshot
-    // can only advance if the DB has been modified. Modify it to get txid=3.
+    // Second snapshot after modifying the DB
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("INSERT INTO t (val) VALUES ('world')", []).unwrap();
+        conn.execute("INSERT INTO t (val) VALUES ('world')", [])
+            .unwrap();
     }
-    let result2 = ops::snapshot_database(&storage, "",&db_path).await.unwrap();
-    assert_eq!(result2.txid, 3);
+    let result2 = ops::snapshot_database(&storage, "", &db_path).await.unwrap();
+    assert_eq!(result2.seq, 2);
 
     let keys = storage.keys().await;
     assert_eq!(keys.len(), 2);
@@ -513,41 +492,26 @@ async fn test_replica_state_missing_field() {
 // verify: overlap detection
 // ============================================================================
 
+/// Seq-based keys are unique in S3, so duplicate seqs are impossible by construction.
+/// This test verifies that inserting the same seq twice overwrites (S3 semantics)
+/// and doesn't create a duplicate.
 #[tokio::test]
-async fn test_verify_detects_txid_overlap() {
+async fn test_seq_keys_prevent_duplicates() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("test.db");
     create_test_db(&db_path);
 
-    let snapshot_data = encode_snapshot(&db_path, 1);
-
     let storage = InMemoryStorage::new();
-    // Snapshot
+    // Insert seq 1 twice -- second write overwrites the first (S3 semantics)
     storage
-        .insert(
-            "test/0001/0000000000000001-0000000000000001.ltx",
-            snapshot_data.clone(),
-        )
+        .insert("mydb/0000/0000000000000001.hadbp", vec![1])
         .await;
-    // Incremental 2-3
     storage
-        .insert(
-            "test/0000/0000000000000002-0000000000000003.ltx",
-            snapshot_data.clone(),
-        )
-        .await;
-    // Overlapping incremental 3-4 (starts at 3, expected 4)
-    storage
-        .insert(
-            "test/0000/0000000000000003-0000000000000004.ltx",
-            snapshot_data,
-        )
+        .insert("mydb/0000/0000000000000001.hadbp", vec![2])
         .await;
 
-    let result = ops::verify_database(&storage, "", "test").await.unwrap();
-    assert!(!result.is_valid());
-    assert_eq!(result.continuity_issues.len(), 1);
-    assert!(result.continuity_issues[0].contains("overlap"));
+    let files = ops::discover_ltx_files(&storage, "", "mydb").await.unwrap();
+    assert_eq!(files.len(), 1, "duplicate seq should not create two entries");
 }
 
 #[tokio::test]
@@ -556,41 +520,29 @@ async fn test_verify_no_issues_on_contiguous_incrementals() {
     let db_path = tmp.path().join("test.db");
     create_test_db(&db_path);
 
-    let snapshot_data = encode_snapshot(&db_path, 1);
-
     let storage = InMemoryStorage::new();
+    // Snapshot at seq 1
+    let snap = encode_snapshot(&db_path, 1);
     storage
-        .insert(
-            "test/0001/0000000000000001-0000000000000001.ltx",
-            snapshot_data.clone(),
-        )
+        .insert("test/0001/0000000000000001.hadbp", snap)
         .await;
-    // Contiguous: 2-2, 3-3, 4-4
-    storage
-        .insert(
-            "test/0000/0000000000000002-0000000000000002.ltx",
-            snapshot_data.clone(),
-        )
-        .await;
-    storage
-        .insert(
-            "test/0000/0000000000000003-0000000000000003.ltx",
-            snapshot_data.clone(),
-        )
-        .await;
-    storage
-        .insert(
-            "test/0000/0000000000000004-0000000000000004.ltx",
-            snapshot_data,
-        )
-        .await;
+    // Contiguous: 2, 3, 4
+    for seq in 2..=4 {
+        let data = encode_snapshot(&db_path, seq);
+        storage
+            .insert(
+                &format!("test/0000/{:016x}.hadbp", seq),
+                data,
+            )
+            .await;
+    }
 
     let result = ops::verify_database(&storage, "", "test").await.unwrap();
     assert!(result.continuity_issues.is_empty());
 }
 
 // ============================================================================
-// verify: download failures and TXID mismatches
+// verify: download failures
 // ============================================================================
 
 #[tokio::test]
@@ -600,8 +552,6 @@ async fn test_verify_download_failed() {
     create_test_db(&db_path);
     let snapshot_data = encode_snapshot(&db_path, 1);
 
-    // Create a storage that has the key in list_objects but fails on download.
-    // We'll use a wrapper that selectively fails downloads.
     let storage = FailingDownloadStorage::new(snapshot_data);
 
     let result = ops::verify_database(&storage, "", "test").await.unwrap();
@@ -640,13 +590,23 @@ impl walrust::StorageBackend for FailingDownloadStorage {
     async fn upload_bytes(&self, _key: &str, _data: Vec<u8>) -> Result<()> {
         Ok(())
     }
-    async fn upload_bytes_with_checksum(&self, _key: &str, _data: Vec<u8>, _checksum: &str) -> Result<()> {
+    async fn upload_bytes_with_checksum(
+        &self,
+        _key: &str,
+        _data: Vec<u8>,
+        _checksum: &str,
+    ) -> Result<()> {
         Ok(())
     }
     async fn upload_file(&self, _key: &str, _path: &Path) -> Result<()> {
         Ok(())
     }
-    async fn upload_file_with_checksum(&self, _key: &str, _path: &Path, _checksum: &str) -> Result<()> {
+    async fn upload_file_with_checksum(
+        &self,
+        _key: &str,
+        _path: &Path,
+        _checksum: &str,
+    ) -> Result<()> {
         Ok(())
     }
     async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
@@ -662,14 +622,24 @@ impl walrust::StorageBackend for FailingDownloadStorage {
     }
     async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
         let keys = vec![
-            "test/0001/0000000000000001-0000000000000001.ltx".to_string(),
-            "test/0000/0000000000000002-0000000000000002.ltx".to_string(),
+            "test/0001/0000000000000001.hadbp".to_string(),
+            "test/0000/0000000000000002.hadbp".to_string(),
         ];
-        Ok(keys.into_iter().filter(|k| k.starts_with(prefix)).collect())
+        Ok(keys
+            .into_iter()
+            .filter(|k| k.starts_with(prefix))
+            .collect())
     }
-    async fn list_objects_after(&self, prefix: &str, start_after: &str) -> Result<Vec<String>> {
+    async fn list_objects_after(
+        &self,
+        prefix: &str,
+        start_after: &str,
+    ) -> Result<Vec<String>> {
         let all = self.list_objects(prefix).await?;
-        Ok(all.into_iter().filter(|k| k.as_str() > start_after).collect())
+        Ok(all
+            .into_iter()
+            .filter(|k| k.as_str() > start_after)
+            .collect())
     }
     async fn exists(&self, _key: &str) -> Result<bool> {
         Ok(true)
@@ -692,76 +662,75 @@ impl walrust::StorageBackend for FailingDownloadStorage {
 #[tokio::test]
 async fn test_compact_identifies_stale_incrementals() {
     let storage = InMemoryStorage::new();
-    // 2 snapshots: gen1 at TXID 10, gen2 at TXID 20
+    // 2 snapshots: gen1 at seq 10, gen2 at seq 20
     storage
-        .insert("mydb/0001/0000000000000001-000000000000000a.ltx", vec![1])
+        .insert("mydb/0001/000000000000000a.hadbp", vec![1])
         .await;
     storage
-        .insert("mydb/0002/0000000000000001-0000000000000014.ltx", vec![1])
+        .insert("mydb/0002/0000000000000014.hadbp", vec![1])
         .await;
     // Incrementals: some before oldest kept snapshot, some after
     storage
-        .insert("mydb/0000/0000000000000001-0000000000000005.ltx", vec![1])
-        .await; // max_txid=5, stale (< snapshot min_txid=1... but wait, the oldest kept snapshot min_txid=1)
+        .insert("mydb/0000/0000000000000005.hadbp", vec![1])
+        .await; // seq 5
     storage
-        .insert("mydb/0000/0000000000000015-0000000000000015.ltx", vec![1])
-        .await; // max_txid=21, not stale
+        .insert("mydb/0000/0000000000000015.hadbp", vec![1])
+        .await; // seq 21, not stale
 
-    // Keep 1 (keeps gen2, TXID 20), deletes gen1
+    // Keep 1 (keeps gen2, seq 20), deletes gen1
     let plan = ops::plan_compact(&storage, "", "mydb", 1).await.unwrap();
     assert_eq!(plan.keep_snapshots.len(), 1);
-    assert_eq!(plan.keep_snapshots[0].max_txid, 20);
+    assert_eq!(plan.keep_snapshots[0].seq, 20);
     assert_eq!(plan.delete_snapshots.len(), 1);
-    assert_eq!(plan.delete_snapshots[0].max_txid, 10);
+    assert_eq!(plan.delete_snapshots[0].seq, 10);
 
-    // Stale incrementals: those with max_txid < oldest kept snapshot's min_txid (1)
-    // The incremental at TXID 1-5 has max_txid=5, and the kept snapshot has min_txid=1
-    // So 5 >= 1, meaning it's NOT stale
-    assert_eq!(plan.delete_stale_incrementals.len(), 0);
+    // Stale incrementals: seq 5 < kept snapshot seq 20
+    assert_eq!(plan.delete_stale_incrementals.len(), 1);
+    assert_eq!(plan.delete_stale_incrementals[0].seq, 5);
 }
 
 #[tokio::test]
 async fn test_compact_stale_incrementals_below_kept_snapshot() {
     let storage = InMemoryStorage::new();
-    // Snapshot gen1 at TXID 10-20 (keeps)
+    // Snapshot gen1 at seq 20 (keeps)
     storage
-        .insert("mydb/0001/000000000000000a-0000000000000014.ltx", vec![1])
+        .insert("mydb/0001/0000000000000014.hadbp", vec![1])
         .await;
-    // Old incrementals before the snapshot's min_txid
+    // Old incrementals before the snapshot's seq
     storage
-        .insert("mydb/0000/0000000000000001-0000000000000003.ltx", vec![1])
-        .await; // max_txid=3 < 10
+        .insert("mydb/0000/0000000000000003.hadbp", vec![1])
+        .await; // seq 3
     storage
-        .insert("mydb/0000/0000000000000004-0000000000000006.ltx", vec![1])
-        .await; // max_txid=6 < 10
+        .insert("mydb/0000/0000000000000006.hadbp", vec![1])
+        .await; // seq 6
     storage
-        .insert("mydb/0000/0000000000000007-0000000000000009.ltx", vec![1])
-        .await; // max_txid=9 < 10
+        .insert("mydb/0000/0000000000000009.hadbp", vec![1])
+        .await; // seq 9
     // Incrementals at/after the snapshot
     storage
-        .insert("mydb/0000/0000000000000015-0000000000000016.ltx", vec![1])
-        .await; // max_txid=22, not stale
+        .insert("mydb/0000/0000000000000016.hadbp", vec![1])
+        .await; // seq 22, not stale
 
     let plan = ops::plan_compact(&storage, "", "mydb", 1).await.unwrap();
     assert_eq!(plan.keep_snapshots.len(), 1);
-    assert!(plan.delete_snapshots.is_empty()); // only 1 snapshot, keeping 1
-    // 3 stale incrementals (max_txid 3,6,9 all < snapshot min_txid 10)
+    assert!(plan.delete_snapshots.is_empty());
+    // 3 stale incrementals (seq 3, 6, 9 all < snapshot seq 20)
     assert_eq!(plan.delete_stale_incrementals.len(), 3);
 }
 
 #[tokio::test]
 async fn test_compact_execute_deletes_stale_incrementals() {
     let storage = InMemoryStorage::new();
-    // Snapshot gen1 at TXID 10-20
+    // Snapshot gen1 at seq 20
     storage
-        .insert("mydb/0001/000000000000000a-0000000000000014.ltx", vec![1])
+        .insert("mydb/0001/0000000000000014.hadbp", vec![1])
         .await;
     // Stale incrementals
     storage
-        .insert("mydb/0000/0000000000000001-0000000000000003.ltx", vec![1])
+        .insert("mydb/0000/0000000000000003.hadbp", vec![1])
         .await;
     storage
-        .insert("mydb/0000/0000000000000004-0000000000000006.ltx", vec![1])
+        .insert("mydb/0000/0000000000000006.hadbp", vec![1])
         .await;
 
     let plan = ops::plan_compact(&storage, "", "mydb", 1).await.unwrap();
@@ -780,19 +749,19 @@ async fn test_compact_execute_deletes_stale_incrementals() {
 async fn test_compact_keep_zero_deletes_all_snapshots() {
     let storage = InMemoryStorage::new();
     storage
-        .insert("mydb/0001/0000000000000001-0000000000000005.ltx", vec![1])
+        .insert("mydb/0001/0000000000000005.hadbp", vec![1])
         .await;
     storage
-        .insert("mydb/0002/0000000000000001-000000000000000a.ltx", vec![1])
+        .insert("mydb/0002/000000000000000a.hadbp", vec![1])
         .await;
     storage
-        .insert("mydb/0000/000000000000000b-000000000000000c.ltx", vec![1])
+        .insert("mydb/0000/000000000000000c.hadbp", vec![1])
         .await;
 
     let plan = ops::plan_compact(&storage, "", "mydb", 0).await.unwrap();
     assert!(plan.keep_snapshots.is_empty());
     assert_eq!(plan.delete_snapshots.len(), 2);
-    // With no kept snapshots, oldest_kept_min_txid = u64::MAX, so all incrementals are stale
+    // With no kept snapshots, oldest_kept_seq = u64::MAX, so all incrementals are stale
     assert_eq!(plan.delete_stale_incrementals.len(), 1);
 }
 
@@ -802,16 +771,27 @@ async fn test_compact_keep_zero_deletes_all_snapshots() {
 
 #[tokio::test]
 async fn test_verify_is_valid_with_only_continuity_issues() {
-    // Manually construct a VerifyResult to test is_valid logic
     let result = ops::VerifyResult {
         total_files: 2,
         verified_count: 2,
         total_size: 100,
         file_results: vec![
-            ("a.ltx".to_string(), VerifyFileResult::Ok { txid_count: 1, size_bytes: 50 }),
-            ("b.ltx".to_string(), VerifyFileResult::Ok { txid_count: 1, size_bytes: 50 }),
+            (
+                "a.hadbp".to_string(),
+                VerifyFileResult::Ok {
+                    seq: 1,
+                    size_bytes: 50,
+                },
+            ),
+            (
+                "b.hadbp".to_string(),
+                VerifyFileResult::Ok {
+                    seq: 2,
+                    size_bytes: 50,
+                },
+            ),
         ],
-        continuity_issues: vec!["TXID gap: expected 2, got 5".to_string()],
+        continuity_issues: vec!["Seq gap: expected 2, got 5".to_string()],
     };
     // All files OK but continuity issue means not valid
     assert!(!result.is_valid());
@@ -828,10 +808,12 @@ async fn test_snapshot_then_verify() {
     create_test_db(&db_path);
 
     let storage = InMemoryStorage::new();
-    ops::snapshot_database(&storage, "",&db_path).await.unwrap();
+    ops::snapshot_database(&storage, "", &db_path).await.unwrap();
 
     // Verify the snapshot we just created
-    let result = ops::verify_database(&storage, "", "roundtrip").await.unwrap();
+    let result = ops::verify_database(&storage, "", "roundtrip")
+        .await
+        .unwrap();
     assert!(result.is_valid());
     assert_eq!(result.verified_count, 1);
     assert_eq!(result.total_files, 1);
@@ -847,7 +829,7 @@ async fn test_snapshot_list_verify_compact_roundtrip() {
 
     // Take 3 snapshots (each needs a new write to advance the change counter)
     for i in 0..3 {
-        ops::snapshot_database(&storage, "",&db_path).await.unwrap();
+        ops::snapshot_database(&storage, "", &db_path).await.unwrap();
         // Write between snapshots so the file change counter advances
         if i < 2 {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -887,66 +869,47 @@ async fn test_snapshot_list_verify_compact_roundtrip() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_discover_ltx_files_with_prefix() {
+async fn test_discover_files_with_prefix() {
     let storage = InMemoryStorage::new();
     storage
-        .insert(
-            "haqlite/mydb/0000/0000000000000001-0000000000000001.ltx",
-            vec![1],
-        )
+        .insert("haqlite/mydb/0000/0000000000000001.hadbp", vec![1])
         .await;
     storage
-        .insert(
-            "haqlite/mydb/0001/0000000000000001-0000000000000005.ltx",
-            vec![2],
-        )
+        .insert("haqlite/mydb/0001/0000000000000005.hadbp", vec![2])
         .await;
 
     let files = ops::discover_ltx_files(&storage, "haqlite/", "mydb")
         .await
         .unwrap();
     assert_eq!(files.len(), 2);
-    assert_eq!(files[0].min_txid, 1);
-    assert_eq!(files[0].max_txid, 1);
+    assert_eq!(files[0].seq, 1);
     assert!(!files[0].is_snapshot);
-    assert_eq!(files[1].min_txid, 1);
-    assert_eq!(files[1].max_txid, 5);
+    assert_eq!(files[1].seq, 5);
     assert!(files[1].is_snapshot);
 }
 
 #[tokio::test]
-async fn test_discover_ltx_files_prefix_isolation() {
+async fn test_discover_files_prefix_isolation() {
     let storage = InMemoryStorage::new();
-    // Files under haqlite/ prefix
     storage
-        .insert(
-            "haqlite/mydb/0000/0000000000000001-0000000000000001.ltx",
-            vec![1],
-        )
+        .insert("haqlite/mydb/0000/0000000000000001.hadbp", vec![1])
         .await;
-    // Files under other/ prefix
     storage
-        .insert(
-            "other/mydb/0000/0000000000000002-0000000000000002.ltx",
-            vec![2],
-        )
+        .insert("other/mydb/0000/0000000000000002.hadbp", vec![2])
         .await;
 
-    // With haqlite/ prefix, only see haqlite files
     let files = ops::discover_ltx_files(&storage, "haqlite/", "mydb")
         .await
         .unwrap();
     assert_eq!(files.len(), 1);
-    assert_eq!(files[0].min_txid, 1);
+    assert_eq!(files[0].seq, 1);
 
-    // With other/ prefix, only see other files
     let files = ops::discover_ltx_files(&storage, "other/", "mydb")
         .await
         .unwrap();
     assert_eq!(files.len(), 1);
-    assert_eq!(files[0].min_txid, 2);
+    assert_eq!(files[0].seq, 2);
 
-    // With no prefix, see nothing (files are all under prefixes)
     let files = ops::discover_ltx_files(&storage, "", "mydb")
         .await
         .unwrap();
@@ -957,16 +920,10 @@ async fn test_discover_ltx_files_prefix_isolation() {
 async fn test_discover_databases_with_prefix() {
     let storage = InMemoryStorage::new();
     storage
-        .insert(
-            "haqlite/alpha/0000/0000000000000001-0000000000000001.ltx",
-            vec![1],
-        )
+        .insert("haqlite/alpha/0000/0000000000000001.hadbp", vec![1])
         .await;
     storage
-        .insert(
-            "haqlite/beta/0001/0000000000000001-0000000000000001.ltx",
-            vec![1],
-        )
+        .insert("haqlite/beta/0001/0000000000000001.hadbp", vec![1])
         .await;
 
     let dbs = ops::discover_databases(&storage, "haqlite/").await.unwrap();
@@ -976,19 +933,11 @@ async fn test_discover_databases_with_prefix() {
 #[tokio::test]
 async fn test_discover_databases_ignores_other_prefixes() {
     let storage = InMemoryStorage::new();
-    // haqlite prefix
     storage
-        .insert(
-            "haqlite/alpha/0000/0000000000000001-0000000000000001.ltx",
-            vec![1],
-        )
+        .insert("haqlite/alpha/0000/0000000000000001.hadbp", vec![1])
         .await;
-    // other prefix
     storage
-        .insert(
-            "other/gamma/0000/0000000000000001-0000000000000001.ltx",
-            vec![1],
-        )
+        .insert("other/gamma/0000/0000000000000001.hadbp", vec![1])
         .await;
 
     let dbs = ops::discover_databases(&storage, "haqlite/").await.unwrap();
@@ -1004,16 +953,13 @@ async fn test_list_databases_with_prefix() {
     let snapshot_bytes = encode_snapshot(&db_path, 1);
 
     storage
-        .insert(
-            "haqlite/mydb/0001/0000000000000001-0000000000000001.ltx",
-            snapshot_bytes,
-        )
+        .insert("haqlite/mydb/0001/0000000000000001.hadbp", snapshot_bytes)
         .await;
 
     let dbs = ops::list_databases(&storage, "haqlite/").await.unwrap();
     assert_eq!(dbs.len(), 1);
     assert_eq!(dbs[0].name, "mydb");
-    assert_eq!(dbs[0].max_txid, 1);
+    assert_eq!(dbs[0].max_seq, 1);
 }
 
 #[tokio::test]
@@ -1026,10 +972,9 @@ async fn test_snapshot_with_prefix() {
     let result = ops::snapshot_database(&storage, "haqlite/", &db_path)
         .await
         .unwrap();
-    assert_eq!(result.txid, 2); // CREATE TABLE + INSERT = change counter 2
+    assert_eq!(result.seq, 1);
     assert_eq!(result.db_name, "prefixed");
 
-    // Verify the key is under the prefix
     let keys = storage.keys().await;
     assert_eq!(keys.len(), 1);
     assert!(
@@ -1037,7 +982,7 @@ async fn test_snapshot_with_prefix() {
         "expected key under haqlite/ prefix, got: {}",
         keys[0]
     );
-    assert!(keys[0].ends_with(".ltx"));
+    assert!(keys[0].ends_with(".hadbp"));
 }
 
 #[tokio::test]
@@ -1051,17 +996,14 @@ async fn test_snapshot_returns_db_name() {
         .await
         .unwrap();
     assert_eq!(result.db_name, "my_database");
-    assert_eq!(result.txid, 2); // CREATE TABLE + INSERT = change counter 2
+    assert_eq!(result.seq, 1);
 }
 
 #[tokio::test]
 async fn test_normalize_prefix_via_discover() {
     let storage = InMemoryStorage::new();
     storage
-        .insert(
-            "haqlite/mydb/0000/0000000000000001-0000000000000001.ltx",
-            vec![1],
-        )
+        .insert("haqlite/mydb/0000/0000000000000001.hadbp", vec![1])
         .await;
 
     // Without trailing slash - should still work (normalize_prefix adds it)
@@ -1092,10 +1034,7 @@ async fn test_verify_with_prefix() {
     let snapshot_bytes = encode_snapshot(&db_path, 1);
 
     storage
-        .insert(
-            "prod/test/0001/0000000000000001-0000000000000001.ltx",
-            snapshot_bytes,
-        )
+        .insert("prod/test/0001/0000000000000001.hadbp", snapshot_bytes)
         .await;
 
     let result = ops::verify_database(&storage, "prod/", "test")

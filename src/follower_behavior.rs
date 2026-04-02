@@ -14,7 +14,7 @@ use walrust::StorageBackend as WalrustStorageBackend;
 
 /// SQLite-specific follower behavior.
 ///
-/// Tracks TXIDs for incremental WAL replication using walrust.
+/// Tracks sequence numbers for incremental WAL replication using walrust.
 pub struct SqliteFollowerBehavior {
     /// walrust storage backend for SQLite WAL operations.
     walrust_storage: Arc<dyn WalrustStorageBackend>,
@@ -45,25 +45,25 @@ impl FollowerBehavior for SqliteFollowerBehavior {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let current_txid = position.load(Ordering::SeqCst);
+                    let current_seq = position.load(Ordering::SeqCst);
                     match walrust::sync::pull_incremental(
                         self.walrust_storage.as_ref(),
                         prefix,
                         db_name,
                         db_path,
-                        current_txid,
+                        current_seq,
                     ).await {
-                        Ok(new_txid) => {
-                            if new_txid > current_txid {
+                        Ok(new_seq) => {
+                            if new_seq > current_seq {
                                 // New data downloaded -- not caught up until replay completes.
                                 caught_up.store(false, Ordering::SeqCst);
                                 metrics.follower_caught_up.store(0, Ordering::Relaxed);
                                 tracing::debug!(
-                                    "Follower '{}': pulled TXID {} -> {}",
-                                    db_name, current_txid, new_txid
+                                    "Follower '{}': pulled seq {} -> {}",
+                                    db_name, current_seq, new_seq
                                 );
-                                position.store(new_txid, Ordering::SeqCst);
-                                metrics.follower_replay_position.store(new_txid, Ordering::Relaxed);
+                                position.store(new_seq, Ordering::SeqCst);
+                                metrics.follower_replay_position.store(new_seq, Ordering::Relaxed);
                                 metrics.inc(&metrics.follower_pulls_succeeded);
                                 // Replay succeeded (pull_incremental applies the WAL).
                                 caught_up.store(true, Ordering::SeqCst);
@@ -82,8 +82,8 @@ impl FollowerBehavior for SqliteFollowerBehavior {
                     }
                 }
                 _ = cancel_rx.changed() => {
-                    let current_txid = position.load(Ordering::SeqCst);
-                    tracing::info!("Follower '{}': cancelled at TXID {}", db_name, current_txid);
+                    let current_seq = position.load(Ordering::SeqCst);
+                    tracing::info!("Follower '{}': cancelled at seq {}", db_name, current_seq);
                     return Ok(());
                 }
             }
@@ -97,7 +97,7 @@ impl FollowerBehavior for SqliteFollowerBehavior {
         db_path: &PathBuf,
         position: u64,
     ) -> Result<()> {
-        let new_txid = walrust::sync::pull_incremental(
+        let new_seq = walrust::sync::pull_incremental(
             self.walrust_storage.as_ref(),
             prefix,
             db_name,
@@ -106,8 +106,8 @@ impl FollowerBehavior for SqliteFollowerBehavior {
         )
         .await?;
         tracing::info!(
-            "SqliteFollowerBehavior '{}': caught up TXID {} → {}",
-            db_name, position, new_txid
+            "SqliteFollowerBehavior '{}': caught up seq {} -> {}",
+            db_name, position, new_seq
         );
         Ok(())
     }

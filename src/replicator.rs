@@ -13,7 +13,7 @@ use hadb::Replicator;
 
 /// SQLite replicator wrapping walrust.
 ///
-/// Handles WAL replication via LTX files (SQLite-specific format).
+/// Handles WAL replication via HADBP changesets (SQLite-specific format).
 pub struct SqliteReplicator {
     inner: Arc<walrust::Replicator>,
 }
@@ -41,7 +41,7 @@ impl SqliteReplicator {
         &self.inner
     }
 
-    /// Restore a database from S3, returning the final TXID.
+    /// Restore a database from S3, returning the final seq.
     ///
     /// This is SQLite-specific and not part of the generic Replicator trait.
     pub async fn restore(&self, name: &str, output_path: &Path) -> Result<Option<u64>> {
