@@ -40,6 +40,113 @@ haqlite should support SQLite extensions (sqlite-vec, FTS5, sqlean, etc.) across
 - Test that missing extension on follower crashes immediately (not silent corruption)
 - Test S3 extension list verification (server mode)
 
+## HaQLiteLight: Lease-on-Write Mode (turbolite-backed)
+
+Low-write optimized mode. No persistent leader, no forwarding server, no background sync loops. Every node is equal. Writes acquire a short-lived lease, catch up, execute, checkpoint, and release. Reads are always local (accept staleness).
+
+**Core idea:** Instead of always-on leader election with continuous WAL shipping, treat each write as an atomic lease-guarded transaction against S3. Assumes writes are infrequent enough (seconds to minutes between writes) that the per-write overhead of lease acquire + sync + flush is acceptable.
+
+**Write flow (per `execute()` call):**
+1. Acquire local write mutex (serialize writes on this node)
+2. Acquire S3 lease via `LeaseStore::write_if_not_exists` / `write_if_match` (CAS)
+   - If lease held by another node and not expired: retry with backoff up to `write_timeout`
+   - If lease held but expired: take over via `write_if_match` with stale etag
+3. Catch up from former leaders: pull latest manifest / page groups from S3
+4. Execute write on local SQLite
+5. Checkpoint: encode dirty pages into new page groups, upload to S3, publish new manifest
+6. Release lease via `LeaseStore::delete` (only after checkpoint confirmed on S3)
+
+**Read flow (per `query_row()` / `query_values()` call):**
+- Open fresh read-only SQLite connection, query locally, close
+- No lease, no S3 calls — reads are always local
+- Staleness bounded by how recently this node has written (which triggers catchup) or by optional background manifest polling
+
+**Turbolite as the checkpoint/sync backend:**
+
+Turbolite's architecture is a natural fit for this pattern. Instead of WAL shipping (walrust HADBP changesets → LTX apply), turbolite's manifest + page group model gives us:
+
+- **Manifest = version signal.** A single small S3 object that is the source of truth for the current DB state. Readers check for a new manifest (one HEAD request) instead of polling for new LTX files. If the manifest hasn't changed, nothing has changed.
+
+- **Checkpoint = publish.** After a write, turbolite encodes dirty pages into new page groups (zstd-compressed, optionally AES-256 encrypted), uploads them, and atomically publishes a new manifest. The checkpoint IS the replication step — no separate WAL shipping stage.
+
+- **Catchup = manifest fetch + lazy page pull.** When acquiring the lease, fetch the latest manifest. That's the catch-up. You don't replay a WAL — you just point at the current state. Any pages you actually need get fetched on demand via S3 range GETs. Minimal bandwidth, no wasted work.
+
+- **No background sync loop.** No follower pull interval, no periodic flush. All sync is driven by writes. Reads that want freshness just check the manifest.
+
+This collapses the current walrust flow (WAL frames → HADBP changesets → S3 → LTX pull → apply to DB) into turbolite's flow (dirty pages → page groups → S3 → manifest → lazy page fetch).
+
+**Struct sketch:**
+
+```rust
+pub struct HaQLiteLight {
+    inner: Arc<HaQLiteLightInner>,
+}
+
+struct HaQLiteLightInner {
+    db_path: PathBuf,
+    db_name: String,
+    lease_store: Arc<dyn LeaseStore>,
+    // turbolite connection (replaces walrust_storage + replicator)
+    // turbolite handles: manifest tracking, page group upload/download,
+    // checkpoint, and lazy page fetching via its VFS
+    prefix: String,
+    instance_id: String,
+    lease_key: String,      // "{prefix}{db_name}/lease"
+    lease_ttl: Duration,    // safety net for crash recovery
+    write_timeout: Duration,
+    write_lock: tokio::sync::Mutex<()>,
+    closed: AtomicBool,
+}
+```
+
+**Builder API:**
+```rust
+let db = HaQLiteLight::builder("my-bucket")
+    .prefix("myapp/")
+    .endpoint("https://fly.storage.tigris.dev")
+    .lease_ttl(Duration::from_secs(30))
+    .write_timeout(Duration::from_secs(10))
+    .lease_store(custom_store)  // optional, default S3
+    .open("/data/my.db", "CREATE TABLE IF NOT EXISTS ...")
+    .await?;
+
+// Writes: lease-guarded, catch up + checkpoint automatically
+db.execute("INSERT ...", &[...]).await?;
+
+// Reads: always local, no lease needed
+let count: i64 = db.query_row("SELECT COUNT(*)", &[], |r| r.get(0))?;
+```
+
+**Error handling:**
+- New `HaQLiteError::LeaseContention(String)` variant for when write_timeout is exceeded
+- `HaQLiteError::CheckpointFailed(String)` for when S3 upload fails after local write
+  - On checkpoint failure: retry flush while lease is still valid (TTL is the retry budget)
+  - If retries exhaust and lease expires: the local write is lost. Return error to caller.
+  - This is the same risk as current leader crash between write and sync — acceptable.
+
+**Latency budget (typical):**
+- Lease acquire: ~20-50ms (S3 conditional PUT)
+- Catchup (manifest check, no new data): ~20-50ms (S3 HEAD/GET)
+- Catchup (new data from another writer): ~20-100ms (manifest + page group GETs)
+- SQLite write: ~10-50ms
+- Checkpoint + manifest publish: ~20-50ms (page group upload + manifest PUT)
+- Lease release: ~20-50ms
+- **Total: ~100-300ms per write** (acceptable for low-write workloads)
+
+**Design decisions:**
+- **No batching.** Per-write lease cycle. If writes are rare enough to use this mode, batching saves nothing and adds complexity.
+- **No lease hold timeout.** Release immediately after checkpoint. Re-acquire cost is cheap enough that speculative holding isn't worth the state.
+- **No forwarding server.** Every node is self-sufficient. No inter-node HTTP.
+- **No role concept.** No leader/follower distinction. Every node can read and write.
+- **Fresh connections per read.** Like current follower mode — avoids stale WAL snapshots after turbolite applies external page updates.
+- **Fencing via manifest.** Embed lease epoch/token in the manifest. Readers can verify they're reading from a legitimate writer's output. Prevents stale/split-brain writes from being visible.
+
+**Open questions:**
+- Should reads optionally check the manifest for freshness before querying? Could offer `query_row_fresh()` that does a manifest HEAD first.
+- Can we embed a monotonic epoch in the lease data AND the manifest, so that a turbolite VFS read can detect if its cached manifest is from the current lease holder vs a stale one?
+- Walrust fallback: should HaQLiteLight also support walrust as a backend (for users who don't use turbolite), or is this turbolite-only?
+- Mixed clusters: can a regular HaQLite leader coexist with HaQLiteLight nodes using the same S3 bucket? Probably not without careful manifest/WAL format alignment.
+
 ## crates.io Publish
 
 - Verify public API surface is clean (no accidental pub internals)
