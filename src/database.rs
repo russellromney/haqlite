@@ -792,14 +792,9 @@ impl HaQLite {
         let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
         match manifest_store.meta(&manifest_key).await {
             Ok(Some(meta)) if meta.version > cached => {
-                if let Some(ref ws) = self.inner.shared_walrust_storage {
-                    let current_seq = self.inner.follower_replay_position.load(Ordering::SeqCst);
-                    match walrust::sync::pull_incremental(
-                        ws.as_ref(), &self.inner.shared_prefix,
-                        &self.inner.db_name, &self.inner.db_path, current_seq,
-                    ).await {
-                        Ok(new_seq) => {
-                            self.inner.follower_replay_position.store(new_seq, Ordering::SeqCst);
+                if let Some(ref rep) = self.inner.shared_replicator {
+                    match rep.restore(&self.inner.db_name, &self.inner.db_path).await {
+                        Ok(_) => {
                             self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
                             // Reopen connection to see new data
                             if let Ok(new_conn) = open_leader_connection(&self.inner.db_path) {
@@ -848,6 +843,8 @@ impl HaQLite {
         let deadline = tokio::time::Instant::now() + self.inner.write_timeout;
         let mut attempt = 0u32;
         loop {
+            // First attempt: try to create the lease (no existing lease)
+            // Subsequent attempts: only try write_if_match if we confirmed lease is expired
             let result = match &lease_etag {
                 None => lease_store.write_if_not_exists(&lease_key, lease_data.clone()).await,
                 Some(etag) => lease_store.write_if_match(&lease_key, lease_data.clone(), etag).await,
@@ -858,18 +855,45 @@ impl HaQLite {
                     break;
                 }
                 Ok(_cas) => {
-                    // Lease held by another node. Check if expired.
+                    // Lease held by another node.
                     if tokio::time::Instant::now() >= deadline {
                         return Err(HaQLiteError::LeaseContention(
                             format!("could not acquire lease for '{}' within {:?}", self.inner.db_name, self.inner.write_timeout),
                         ));
                     }
-                    // Read current lease to get etag for takeover
+                    // Read current lease to check TTL expiry
                     match lease_store.read(&lease_key).await {
-                        Ok(Some((_data, etag))) => {
-                            lease_etag = Some(etag);
+                        Ok(Some((data, etag))) => {
+                            // Parse lease data to check TTL
+                            let expired = if let Ok(lease_json) = serde_json::from_slice::<serde_json::Value>(&data) {
+                                let lease_ts = lease_json.get("timestamp")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let lease_ttl = lease_json.get("ttl_secs")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(5);
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default().as_millis() as u64;
+                                now_ms > lease_ts + (lease_ttl * 1000)
+                            } else {
+                                // Can't parse lease data; treat as expired (stale/corrupt)
+                                true
+                            };
+
+                            if expired {
+                                // Lease expired: attempt takeover via CAS on next iteration
+                                lease_etag = Some(etag);
+                            } else {
+                                // Lease still valid: wait, don't try takeover yet
+                                lease_etag = None;
+                            }
                         }
-                        _ => {
+                        Ok(None) => {
+                            // Lease was deleted between our check; retry create
+                            lease_etag = None;
+                        }
+                        Err(_) => {
                             lease_etag = None;
                         }
                     }
@@ -888,16 +912,16 @@ impl HaQLite {
         let cached_version = self.inner.cached_manifest_version.load(Ordering::SeqCst);
         match manifest_store.meta(&manifest_key).await {
             Ok(Some(meta)) if meta.version > cached_version => {
-                // Pull incremental updates
-                let current_seq = self.inner.follower_replay_position.load(Ordering::SeqCst);
-                match walrust::sync::pull_incremental(
-                    walrust_storage.as_ref(), &self.inner.shared_prefix,
-                    &self.inner.db_name, &self.inner.db_path, current_seq,
-                ).await {
-                    Ok(new_seq) => {
-                        self.inner.follower_replay_position.store(new_seq, Ordering::SeqCst);
+                // Restore from S3 (full snapshot + incrementals from all writers)
+                match replicator.restore(&self.inner.db_name, &self.inner.db_path).await {
+                    Ok(_) => {
                         self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
-                        // Reopen connection after external WAL apply
+                        // Re-register with replicator so sync() uses the restored state
+                        let _ = replicator.inner().remove(&self.inner.db_name).await;
+                        if let Err(e) = replicator.add(&self.inner.db_name, &self.inner.db_path).await {
+                            tracing::warn!("re-register after restore failed: {}", e);
+                        }
+                        // Reopen connection after restore
                         let new_conn = open_leader_connection(&self.inner.db_path)
                             .map_err(|e| HaQLiteError::DatabaseError(format!("reopen after catch-up: {}", e)))?;
                         self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
@@ -918,6 +942,8 @@ impl HaQLite {
             .map_err(|e| HaQLiteError::ReplicationError(format!("checkpoint failed: {}", e)))?;
 
         // 6. Publish manifest
+        let current_seq = replicator.inner().current_seq(&self.inner.db_name).await.unwrap_or(0);
+        let changeset_prefix = format!("{}{}/", self.inner.shared_prefix, self.inner.db_name);
         let new_manifest = hadb::HaManifest {
             version: 0, // store assigns version
             writer_id: self.inner.shared_instance_id.clone(),
@@ -926,9 +952,9 @@ impl HaQLite {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_millis() as u64,
             storage: hadb::StorageManifest::Walrust {
-                txid: self.inner.follower_replay_position.load(Ordering::SeqCst),
-                changeset_prefix: format!("{}{}/", self.inner.shared_prefix, self.inner.db_name),
-                latest_changeset_key: String::new(), // walrust manages this internally
+                txid: current_seq,
+                changeset_prefix: changeset_prefix.clone(),
+                latest_changeset_key: format!("{}0000/{:016x}.hadbp", changeset_prefix, current_seq),
                 snapshot_key: None,
                 snapshot_txid: None,
             },
@@ -1218,11 +1244,14 @@ async fn open_shared(
 ) -> Result<HaQLite> {
     ensure_schema(&db_path, schema)?;
 
-    // Register database with replicator (required before sync() can flush WAL)
-    replicator.add(db_name, &db_path).await?;
-
-    // Initial catch-up: restore from S3 if data exists
+    // Initial catch-up: restore from S3 if data exists.
+    // Must happen BEFORE add() because add() takes a snapshot that would
+    // overwrite existing data in S3 with this node's (possibly empty) DB.
     let _ = replicator.restore(db_name, &db_path).await;
+
+    // Register database with replicator (required before sync() can flush WAL).
+    // This snapshots the current local DB (which now includes restored data).
+    replicator.add(db_name, &db_path).await?;
 
     // Check current manifest version
     let manifest_key = format!("{}{}/_manifest", prefix, db_name);
@@ -1298,13 +1327,10 @@ async fn run_manifest_poller(
                 Ok(Some(meta)) => {
                     let cached = inner.cached_manifest_version.load(Ordering::SeqCst);
                     if meta.version > cached {
-                        // Pull latest data
-                        if let Some(ref ws) = inner.shared_walrust_storage {
-                            match walrust::sync::pull_incremental(
-                                ws.as_ref(), &inner.shared_prefix,
-                                &db_name, &inner.db_path, cached,
-                            ).await {
-                                Ok(_new_seq) => {
+                        // Restore from S3 (full snapshot + all incrementals)
+                        if let Some(ref rep) = inner.shared_replicator {
+                            match rep.restore(&db_name, &inner.db_path).await {
+                                Ok(_) => {
                                     inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
                                     tracing::debug!(
                                         "manifest poller: caught up '{}' to v{}",
@@ -1312,7 +1338,7 @@ async fn run_manifest_poller(
                                     );
                                 }
                                 Err(e) => {
-                                    tracing::error!("manifest poller: pull failed for '{}': {}", db_name, e);
+                                    tracing::error!("manifest poller: restore failed for '{}': {}", db_name, e);
                                 }
                             }
                         }
