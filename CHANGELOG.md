@@ -1,5 +1,14 @@
 # haqlite Changelog
 
+## Phase Crest: HaMode::Shared (Lease-on-Write)
+
+- **HaMode::Shared**: Ephemeral compute coordination. Lease per write, no persistent leader, no forwarding. Builder: `.mode(HaMode::Shared)`, `.manifest_store()`, `.manifest_poll_interval()`, `.write_timeout()`.
+- **Shared mode write path**: mutex -> lease acquire -> manifest catch-up -> SQLite write -> checkpoint -> manifest publish (CAS) -> lease release. Works with both walrust and turbolite backends.
+- **Turbolite integration**: `TurboliteReplicator`, manifest conversion (`turbolite_to_ha_storage`/`ha_storage_to_turbolite`), `.turbolite_vfs()` builder method. 7 turbolite_shared tests.
+- **Manifest store features**: `nats-manifest` and `s3-manifest` Cargo features. `serve.rs` auto-configures from `WAL_MANIFEST_NATS_URL` env var (NATS) or falls back to S3. Dedicated mode now passes manifest_store to Coordinator for follower manifest polling.
+- **CLI**: `haqlite serve --mode shared` / `HAQLITE_MODE=shared` env var. Shared mode skips forwarding server and lease renewal loop.
+- Comprehensive tests: shared_mode.rs (single node, two node contention, failover, fresh reads) + turbolite_shared.rs (write/read, manifest publishing, conversion roundtrip).
+
 ## Phase Meridian: Wire Up CLI Commands
 
 - **Prefix threading**: All 7 ops functions (`discover_ltx_files`, `discover_databases`, `list_databases`, `verify_database`, `plan_compact`, `snapshot_database`, `replicate_database`) take `prefix: &str`. `normalize_prefix()` helper ensures trailing slash. CLI defaults to `"haqlite/"` via `resolve_prefix()`.

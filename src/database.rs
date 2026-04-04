@@ -294,7 +294,7 @@ impl HaQLiteBuilder {
                 let coordinator = Coordinator::new(
                     replicator,
                     Some(lease_store),
-                    None, // manifest_store (Phase Signal)
+                    self.manifest_store.clone(),
                     None, // node_registry
                     follower_behavior,
                     &self.prefix,

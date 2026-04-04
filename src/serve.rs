@@ -114,6 +114,54 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
         }
     }
 
+    // If NATS URL is set, try to use NATS for manifests (faster than S3).
+    // Falls back to S3 manifest store if NATS connection fails.
+    let mut manifest_store_configured = false;
+    // WAL_MANIFEST_NATS_URL takes priority; falls back to WAL_LEASE_NATS_URL
+    // so deployments using NATS for leases automatically get NATS manifests too.
+    #[cfg(feature = "nats-manifest")]
+    if let Ok(nats_url) = std::env::var("WAL_MANIFEST_NATS_URL")
+        .or_else(|_| std::env::var("WAL_LEASE_NATS_URL"))
+    {
+        match hadb_manifest_nats::NatsManifestStore::connect(&nats_url, "hadb-manifests").await {
+            Ok(store) => {
+                info!(url = %nats_url, "using NATS manifest store");
+                builder = builder.manifest_store(std::sync::Arc::new(store));
+                manifest_store_configured = true;
+            }
+            Err(e) => {
+                error!(url = %nats_url, error = %e, "NATS manifest store connection failed, falling back to S3");
+            }
+        }
+    }
+
+    // If S3 manifest store feature is enabled and NATS wasn't successfully configured,
+    // build an S3 manifest store from the same S3 config used for storage.
+    #[cfg(feature = "s3-manifest")]
+    if !manifest_store_configured {
+        let s3_config = match &shared.s3.endpoint {
+            Some(endpoint) => {
+                aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .endpoint_url(endpoint)
+                    .load()
+                    .await
+            }
+            None => {
+                aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .load()
+                    .await
+            }
+        };
+        let s3_client = aws_sdk_s3::Client::new(&s3_config);
+        let s3_manifest = hadb_manifest_s3::S3ManifestStore::new(s3_client, shared.s3.bucket.clone());
+        builder = builder.manifest_store(std::sync::Arc::new(s3_manifest));
+        manifest_store_configured = true;
+        info!("using S3 manifest store");
+    }
+
+    // Suppress unused warning when neither manifest feature is enabled.
+    let _ = manifest_store_configured;
+
     let db_path_str = db_path
         .to_str()
         .ok_or_else(|| anyhow!("db_path is not valid UTF-8"))?;

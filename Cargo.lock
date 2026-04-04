@@ -914,15 +914,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc32c"
-version = "0.6.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
-dependencies = [
- "rustc_version",
-]
-
-[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1436,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "hadb"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1454,11 +1445,10 @@ dependencies = [
 
 [[package]]
 name = "hadb-changeset"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "crc32c",
  "hadb-io",
  "sha2",
  "thiserror 2.0.18",
@@ -1468,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "hadb-cli"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1484,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "hadb-io"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1505,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "hadb-lease-nats"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -1517,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "hadb-lease-s3"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1533,8 +1523,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "hadb-manifest-nats"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "bytes",
+ "hadb",
+ "rmp-serde",
+ "tokio",
+]
+
+[[package]]
+name = "hadb-manifest-s3"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "aws-smithy-types",
+ "hadb",
+ "rmp-serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "haqlite"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -1550,6 +1568,8 @@ dependencies = [
  "hadb-cli",
  "hadb-lease-nats",
  "hadb-lease-s3",
+ "hadb-manifest-nats",
+ "hadb-manifest-s3",
  "hostname",
  "hrana-server",
  "http 1.4.0",
@@ -3581,7 +3601,7 @@ dependencies = [
 
 [[package]]
 name = "turbolite"
-version = "0.2.19"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -3726,7 +3746,7 @@ dependencies = [
 
 [[package]]
 name = "walrust"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
