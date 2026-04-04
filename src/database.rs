@@ -84,6 +84,8 @@ pub struct HaQLiteBuilder {
     manifest_poll_interval: Option<Duration>,
     write_timeout: Option<Duration>,
     walrust_storage: Option<Arc<dyn walrust::StorageBackend>>,
+    #[cfg(feature = "turbolite")]
+    turbolite_vfs: Option<(turbolite::tiered::SharedTurboliteVfs, String)>,
 }
 
 impl HaQLiteBuilder {
@@ -105,6 +107,8 @@ impl HaQLiteBuilder {
             manifest_poll_interval: None,
             write_timeout: None,
             walrust_storage: None,
+            #[cfg(feature = "turbolite")]
+            turbolite_vfs: None,
         }
     }
 
@@ -202,6 +206,16 @@ impl HaQLiteBuilder {
     /// For testing with in-memory storage.
     pub fn walrust_storage(mut self, storage: Arc<dyn walrust::StorageBackend>) -> Self {
         self.walrust_storage = Some(storage);
+        self
+    }
+
+    /// Use a turbolite VFS as the storage engine (Shared mode only).
+    ///
+    /// `vfs` is the TurboliteVfs (must already be registered with SQLite).
+    /// `vfs_name` is the name used in the VFS URI (e.g. "mydb").
+    #[cfg(feature = "turbolite")]
+    pub fn turbolite_vfs(mut self, vfs: turbolite::tiered::SharedTurboliteVfs, vfs_name: &str) -> Self {
+        self.turbolite_vfs = Some((vfs, vfs_name.to_string()));
         self
     }
 
@@ -308,6 +322,15 @@ impl HaQLiteBuilder {
                 let write_timeout = self.write_timeout
                     .unwrap_or(Duration::from_secs(5));
 
+                #[cfg(feature = "turbolite")]
+                if let Some((vfs, vfs_name)) = self.turbolite_vfs {
+                    return open_shared_turbolite(
+                        lease_store, manifest_store, vfs, &vfs_name,
+                        db_path, &db_name, schema, &self.prefix, &instance_id,
+                        poll_interval, write_timeout, self.read_concurrency,
+                    ).await;
+                }
+
                 open_shared(
                     lease_store,
                     manifest_store,
@@ -382,6 +405,12 @@ pub(crate) struct HaQLiteInner {
     write_timeout: Duration,
     /// Lease TTL for shared mode leases.
     lease_ttl: u64,
+    /// Turbolite VFS for Shared mode turbolite path.
+    #[cfg(feature = "turbolite")]
+    shared_turbolite_vfs: Option<turbolite::tiered::SharedTurboliteVfs>,
+    /// VFS name for reopening turbolite connections.
+    #[cfg(feature = "turbolite")]
+    shared_turbolite_vfs_name: Option<String>,
 }
 
 impl HaQLiteInner {
@@ -463,6 +492,10 @@ impl HaQLite {
             cached_manifest_version: AtomicU64::new(0),
             write_timeout: DEFAULT_FORWARD_TIMEOUT,
             lease_ttl: 5,
+            #[cfg(feature = "turbolite")]
+            shared_turbolite_vfs: None,
+            #[cfg(feature = "turbolite")]
+            shared_turbolite_vfs_name: None,
         });
 
         // No forwarding server or role listener in local mode.
@@ -792,6 +825,20 @@ impl HaQLite {
         let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
         match manifest_store.meta(&manifest_key).await {
             Ok(Some(meta)) if meta.version > cached => {
+                // Turbolite path: apply manifest to VFS
+                #[cfg(feature = "turbolite")]
+                if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
+                    if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
+                        if let hadb::StorageManifest::Turbolite { .. } = &ha_manifest.storage {
+                            let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
+                            vfs.set_manifest(tl_manifest);
+                            self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                        }
+                    }
+                    return Ok(());
+                }
+
+                // Walrust path: restore from S3
                 if let Some(ref rep) = self.inner.shared_replicator {
                     match rep.restore(&self.inner.db_name, &self.inner.db_path).await {
                         Ok(_) => {
@@ -817,6 +864,12 @@ impl HaQLite {
     // ========================================================================
 
     async fn execute_shared(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
+        // Dispatch to turbolite path if turbolite VFS is configured.
+        #[cfg(feature = "turbolite")]
+        if self.inner.shared_turbolite_vfs.is_some() {
+            return self.execute_shared_turbolite(sql, params).await;
+        }
+
         let lease_store = self.inner.shared_lease_store.as_ref()
             .expect("shared_lease_store required in Shared mode");
         let manifest_store = self.inner.shared_manifest_store.as_ref()
@@ -981,6 +1034,132 @@ impl HaQLite {
         Ok(rows)
     }
 
+    /// Turbolite path for execute_shared: lease -> catch-up -> write -> publish -> release.
+    #[cfg(feature = "turbolite")]
+    async fn execute_shared_turbolite(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
+        let lease_store = self.inner.shared_lease_store.as_ref()
+            .expect("shared_lease_store required in Shared mode");
+        let manifest_store = self.inner.shared_manifest_store.as_ref()
+            .expect("shared_manifest_store required in Shared mode");
+        let vfs = self.inner.shared_turbolite_vfs.as_ref()
+            .expect("shared_turbolite_vfs required for turbolite path");
+
+        // 1. Serialize writes on this node
+        let _write_guard = self.inner.write_mutex.lock().await;
+
+        // 2. Acquire lease with retry + backoff (same logic as walrust path)
+        let lease_key = format!("{}{}/_lease", self.inner.shared_prefix, self.inner.db_name);
+        let lease_data = serde_json::to_vec(&serde_json::json!({
+            "instance_id": self.inner.shared_instance_id,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_millis() as u64,
+            "ttl_secs": self.inner.lease_ttl,
+        })).unwrap_or_default();
+
+        let mut lease_etag: Option<String> = None;
+        let deadline = tokio::time::Instant::now() + self.inner.write_timeout;
+        let mut attempt = 0u32;
+        loop {
+            let result = match &lease_etag {
+                None => lease_store.write_if_not_exists(&lease_key, lease_data.clone()).await,
+                Some(etag) => lease_store.write_if_match(&lease_key, lease_data.clone(), etag).await,
+            };
+            match result {
+                Ok(cas) if cas.success => {
+                    lease_etag = cas.etag;
+                    break;
+                }
+                Ok(_cas) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(HaQLiteError::LeaseContention(
+                            format!("could not acquire lease for '{}' within {:?}", self.inner.db_name, self.inner.write_timeout),
+                        ));
+                    }
+                    match lease_store.read(&lease_key).await {
+                        Ok(Some((data, etag))) => {
+                            let expired = if let Ok(lease_json) = serde_json::from_slice::<serde_json::Value>(&data) {
+                                let lease_ts = lease_json.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let lease_ttl = lease_json.get("ttl_secs").and_then(|v| v.as_u64()).unwrap_or(5);
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default().as_millis() as u64;
+                                now_ms > lease_ts + (lease_ttl * 1000)
+                            } else {
+                                true
+                            };
+                            if expired {
+                                lease_etag = Some(etag);
+                            } else {
+                                lease_etag = None;
+                            }
+                        }
+                        Ok(None) => { lease_etag = None; }
+                        Err(_) => { lease_etag = None; }
+                    }
+                    let backoff = Duration::from_millis(100 * 2u64.pow(attempt.min(4)));
+                    tokio::time::sleep(backoff.min(Duration::from_secs(2))).await;
+                    attempt += 1;
+                }
+                Err(e) => {
+                    return Err(HaQLiteError::CoordinatorError(format!("lease acquire failed: {}", e)));
+                }
+            }
+        }
+
+        // 3. Catch up from manifest (apply turbolite manifest to VFS)
+        let manifest_key = format!("{}{}/_manifest", self.inner.shared_prefix, self.inner.db_name);
+        let cached_version = self.inner.cached_manifest_version.load(Ordering::SeqCst);
+        match manifest_store.meta(&manifest_key).await {
+            Ok(Some(meta)) if meta.version > cached_version => {
+                if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
+                    if let hadb::StorageManifest::Turbolite { .. } = &ha_manifest.storage {
+                        let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
+                        vfs.set_manifest(tl_manifest);
+                        self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                    }
+                }
+            }
+            _ => {} // already up to date or no manifest
+        }
+
+        // 4. Execute SQL locally
+        let rows = self.execute_local(sql, params)?;
+
+        // 5. Publish manifest with turbolite state
+        let tl_manifest = vfs.manifest();
+        let storage = crate::turbolite_replicator::turbolite_to_ha_storage(&tl_manifest);
+        let new_manifest = hadb::HaManifest {
+            version: 0, // store assigns version
+            writer_id: self.inner.shared_instance_id.clone(),
+            lease_epoch: 0,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_millis() as u64,
+            storage,
+        };
+        let expected_version = if cached_version > 0 { Some(cached_version) } else { None };
+        match manifest_store.put(&manifest_key, &new_manifest, expected_version).await {
+            Ok(cas) if cas.success => {
+                let new_version = cached_version + 1;
+                self.inner.cached_manifest_version.store(new_version, Ordering::SeqCst);
+            }
+            Ok(_) => {
+                tracing::warn!("manifest publish CAS failed for '{}' (stale writer?)", self.inner.db_name);
+            }
+            Err(e) => {
+                tracing::error!("manifest publish failed for '{}': {}", self.inner.db_name, e);
+            }
+        }
+
+        // 6. Release lease
+        if let Err(e) = lease_store.delete(&lease_key).await {
+            tracing::warn!("lease release failed for '{}': {}", self.inner.db_name, e);
+        }
+
+        Ok(rows)
+    }
+
     fn execute_local(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
         let conn_arc = self
             .inner
@@ -1125,6 +1304,10 @@ async fn open_with_coordinator(
         cached_manifest_version: AtomicU64::new(0),
         write_timeout: DEFAULT_FORWARD_TIMEOUT,
         lease_ttl: 5,
+        #[cfg(feature = "turbolite")]
+        shared_turbolite_vfs: None,
+        #[cfg(feature = "turbolite")]
+        shared_turbolite_vfs_name: None,
     });
 
     // If leader, open rw connection.
@@ -1288,6 +1471,10 @@ async fn open_shared(
         cached_manifest_version: AtomicU64::new(cached_version),
         write_timeout,
         lease_ttl: 5,
+        #[cfg(feature = "turbolite")]
+        shared_turbolite_vfs: None,
+        #[cfg(feature = "turbolite")]
+        shared_turbolite_vfs_name: None,
     });
 
     // Spawn manifest polling background task
@@ -1347,6 +1534,155 @@ async fn run_manifest_poller(
                 Ok(None) => {} // no manifest yet
                 Err(e) => {
                     tracing::error!("manifest poller: meta check failed for '{}': {}", db_name, e);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Turbolite shared mode: open + manifest poller
+// ============================================================================
+
+#[cfg(feature = "turbolite")]
+#[allow(clippy::too_many_arguments)]
+async fn open_shared_turbolite(
+    lease_store: Arc<dyn hadb::LeaseStore>,
+    manifest_store: Arc<dyn hadb::ManifestStore>,
+    vfs: turbolite::tiered::SharedTurboliteVfs,
+    vfs_name: &str,
+    db_path: PathBuf,
+    db_name: &str,
+    schema: &str,
+    prefix: &str,
+    instance_id: &str,
+    manifest_poll_interval: Duration,
+    write_timeout: Duration,
+    read_concurrency: usize,
+) -> Result<HaQLite> {
+    // Initial catch-up from manifest
+    let replicator = Arc::new(crate::turbolite_replicator::TurboliteReplicator::new(
+        vfs.clone(), manifest_store.clone(), prefix, db_name,
+    ));
+    let _ = replicator.pull(db_name, &db_path).await;
+
+    // Ensure schema via turbolite VFS connection
+    let vfs_uri = format!("file:{}?vfs={}", db_path.display(), vfs_name);
+    {
+        let conn = rusqlite::Connection::open_with_flags(
+            &vfs_uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.execute_batch(schema)?;
+    }
+
+    // Open persistent connection via turbolite VFS
+    let conn = rusqlite::Connection::open_with_flags(
+        &vfs_uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+
+    let manifest_key = format!("{}{}/_manifest", prefix, db_name);
+    let cached_version = match manifest_store.meta(&manifest_key).await? {
+        Some(meta) => meta.version,
+        None => 0,
+    };
+
+    let db_name_owned = db_name.to_string();
+    let inner = Arc::new(HaQLiteInner {
+        coordinator: None,
+        db_name: db_name_owned.clone(),
+        db_path: db_path.clone(),
+        role: AtomicU8::new(ROLE_LEADER),
+        conn: RwLock::new(Some(Arc::new(Mutex::new(conn)))),
+        leader_address: RwLock::new(String::new()),
+        http_client: reqwest::Client::new(),
+        secret: None,
+        read_semaphore: tokio::sync::Semaphore::new(read_concurrency),
+        follower_caught_up: Arc::new(AtomicBool::new(true)),
+        follower_replay_position: Arc::new(AtomicU64::new(0)),
+        // Shared mode fields
+        mode: HaMode::Shared,
+        shared_lease_store: Some(lease_store),
+        shared_manifest_store: Some(manifest_store.clone()),
+        shared_replicator: None, // walrust replicator not used
+        shared_walrust_storage: None,
+        shared_prefix: prefix.to_string(),
+        shared_instance_id: instance_id.to_string(),
+        write_mutex: tokio::sync::Mutex::new(()),
+        cached_manifest_version: AtomicU64::new(cached_version),
+        write_timeout,
+        lease_ttl: 5,
+        shared_turbolite_vfs: Some(vfs.clone()),
+        shared_turbolite_vfs_name: Some(vfs_name.to_string()),
+    });
+
+    // Manifest poller (turbolite variant)
+    let poller_inner = inner.clone();
+    let poller_manifest_key = manifest_key;
+    let poller_vfs = vfs.clone();
+    let role_handle = tokio::spawn(async move {
+        run_manifest_poller_turbolite(
+            poller_inner, poller_manifest_key,
+            manifest_poll_interval, poller_vfs,
+        ).await;
+    });
+
+    // No forwarding server in Shared mode
+    let fwd_handle = tokio::spawn(async {});
+
+    tracing::info!(
+        "HaQLite opened in Shared+Turbolite mode: db='{}', manifest_poll={}ms",
+        db_name, manifest_poll_interval.as_millis(),
+    );
+
+    Ok(HaQLite {
+        inner,
+        _fwd_handle: fwd_handle,
+        _role_handle: role_handle,
+    })
+}
+
+#[cfg(feature = "turbolite")]
+async fn run_manifest_poller_turbolite(
+    inner: Arc<HaQLiteInner>,
+    manifest_key: String,
+    poll_interval: Duration,
+    vfs: turbolite::tiered::SharedTurboliteVfs,
+) {
+    let mut interval = tokio::time::interval(poll_interval);
+    loop {
+        interval.tick().await;
+        if let Some(ref ms) = inner.shared_manifest_store {
+            match ms.meta(&manifest_key).await {
+                Ok(Some(meta)) => {
+                    let cached = inner.cached_manifest_version.load(Ordering::SeqCst);
+                    if meta.version > cached {
+                        match ms.get(&manifest_key).await {
+                            Ok(Some(ha_manifest)) => {
+                                if let hadb::StorageManifest::Turbolite { .. } = &ha_manifest.storage {
+                                    let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
+                                    vfs.set_manifest(tl_manifest);
+                                    inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                                    tracing::debug!(
+                                        "turbolite manifest poller: caught up to v{}",
+                                        meta.version,
+                                    );
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::error!("turbolite manifest poller: get failed: {}", e);
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {} // no manifest yet
+                Err(e) => {
+                    tracing::error!("turbolite manifest poller: meta check failed: {}", e);
                 }
             }
         }
