@@ -26,6 +26,9 @@ pub enum HaQLiteError {
 
     /// Engine is closed (semaphore closed, tasks aborted).
     EngineClosed,
+
+    /// Lease contention in Shared mode (could not acquire lease within timeout).
+    LeaseContention(String),
 }
 
 impl fmt::Display for HaQLiteError {
@@ -37,6 +40,7 @@ impl fmt::Display for HaQLiteError {
             Self::ReplicationError(msg) => write!(f, "Replication error: {msg}"),
             Self::CoordinatorError(msg) => write!(f, "Coordinator error: {msg}"),
             Self::EngineClosed => write!(f, "Engine closed"),
+            Self::LeaseContention(msg) => write!(f, "Lease contention: {msg}"),
         }
     }
 }
@@ -128,6 +132,7 @@ mod tests {
             HaQLiteError::ReplicationError("test".into()),
             HaQLiteError::CoordinatorError("test".into()),
             HaQLiteError::EngineClosed,
+            HaQLiteError::LeaseContention("test".into()),
         ];
         for err in errors {
             match err {
@@ -137,6 +142,7 @@ mod tests {
                 HaQLiteError::ReplicationError(_) => {}
                 HaQLiteError::CoordinatorError(_) => {}
                 HaQLiteError::EngineClosed => {}
+                HaQLiteError::LeaseContention(_) => {}
             }
         }
     }

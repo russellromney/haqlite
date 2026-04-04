@@ -43,6 +43,10 @@ pub struct ServeConfig {
     /// Follower WAL pull interval in milliseconds.
     #[serde(default = "default_follower_pull_ms")]
     pub follower_pull_ms: u64,
+
+    /// Coordination mode: "dedicated" (default) or "shared".
+    #[serde(default = "default_mode")]
+    pub mode: String,
 }
 
 fn default_port() -> u16 {
@@ -59,4 +63,7 @@ fn default_sync_interval_ms() -> u64 {
 }
 fn default_follower_pull_ms() -> u64 {
     1000
+}
+fn default_mode() -> String {
+    "dedicated".to_string()
 }

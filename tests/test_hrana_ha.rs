@@ -59,7 +59,8 @@ fn build_coordinator(
     Coordinator::new(
         replicator,
         Some(lease_store),
-        None,
+        None, // manifest_store
+        None, // node_registry
         follower_behavior,
         "test/",
         config,
@@ -1420,7 +1421,8 @@ fn build_coordinator_fast(
     Coordinator::new(
         replicator,
         Some(lease_store),
-        None,
+        None, // manifest_store
+        None, // node_registry
         follower_behavior,
         "test-fast/",
         config,

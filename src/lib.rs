@@ -33,7 +33,7 @@ pub mod replicator;
 pub mod serve;
 
 // Re-export HaQLite as the primary API.
-pub use database::{HaQLite, HaQLiteBuilder};
+pub use database::{HaQLite, HaQLiteBuilder, HaMode};
 pub use error::HaQLiteError;
 pub use client::{HaQLiteClient, HaQLiteClientBuilder};
 pub use forwarding::SqlValue;
@@ -46,6 +46,7 @@ pub use hadb::{
     Coordinator, CoordinatorConfig, HaMetrics, HaNode, HaNodeConfig,
     InMemoryLeaseStore, JoinResult, LeaseConfig, LeaseData, LeaseStore, MetricsSnapshot,
     NodeRegistration, NodeRegistry, Role, RoleEvent,
+    ManifestStore, HaManifest, StorageManifest, InMemoryManifestStore,
 };
 
 // Re-export hadb-lease-s3 implementations.

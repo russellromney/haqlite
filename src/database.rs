@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::routing::post;
-use hadb::{CoordinatorConfig, Coordinator, JoinResult, LeaseConfig, Role, RoleEvent};
+use hadb::{CoordinatorConfig, Coordinator, JoinResult, LeaseConfig, Replicator, Role, RoleEvent};
 use hadb_lease_s3::S3LeaseStore;
 
 use crate::error::HaQLiteError;
@@ -36,6 +36,17 @@ const DEFAULT_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 const ROLE_LEADER: u8 = 0;
 const ROLE_FOLLOWER: u8 = 1;
+
+/// Coordination mode for HaQLite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HaMode {
+    /// Persistent leader. Continuous sync. Write forwarding.
+    #[default]
+    Dedicated,
+    /// Ephemeral leader. Lease per write. No forwarding.
+    /// For Lambda, Fly scale-to-zero, and other ephemeral compute.
+    Shared,
+}
 
 /// Builder for creating an HA SQLite instance.
 ///
@@ -68,6 +79,11 @@ pub struct HaQLiteBuilder {
     secret: Option<String>,
     read_concurrency: usize,
     lease_store: Option<Arc<dyn hadb::LeaseStore>>,
+    mode: HaMode,
+    manifest_store: Option<Arc<dyn hadb::ManifestStore>>,
+    manifest_poll_interval: Option<Duration>,
+    write_timeout: Option<Duration>,
+    walrust_storage: Option<Arc<dyn walrust::StorageBackend>>,
 }
 
 impl HaQLiteBuilder {
@@ -84,6 +100,11 @@ impl HaQLiteBuilder {
             secret: None,
             read_concurrency: DEFAULT_READ_CONCURRENCY,
             lease_store: None,
+            mode: HaMode::Dedicated,
+            manifest_store: None,
+            manifest_poll_interval: None,
+            write_timeout: None,
+            walrust_storage: None,
         }
     }
 
@@ -153,6 +174,37 @@ impl HaQLiteBuilder {
         self
     }
 
+    /// Set the coordination mode. Default: `HaMode::Dedicated`.
+    pub fn mode(mut self, mode: HaMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Use a ManifestStore (required for `HaMode::Shared`).
+    pub fn manifest_store(mut self, store: Arc<dyn hadb::ManifestStore>) -> Self {
+        self.manifest_store = Some(store);
+        self
+    }
+
+    /// Manifest polling interval for Shared mode. Default: 1s.
+    pub fn manifest_poll_interval(mut self, interval: Duration) -> Self {
+        self.manifest_poll_interval = Some(interval);
+        self
+    }
+
+    /// Write timeout for lease acquisition in Shared mode. Default: 5s.
+    pub fn write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = Some(timeout);
+        self
+    }
+
+    /// Use a custom walrust StorageBackend instead of building from S3 env.
+    /// For testing with in-memory storage.
+    pub fn walrust_storage(mut self, storage: Arc<dyn walrust::StorageBackend>) -> Self {
+        self.walrust_storage = Some(storage);
+        self
+    }
+
     /// Open the database and join the HA cluster.
     ///
     /// `schema` is run once on first open (e.g. CREATE TABLE IF NOT EXISTS ...).
@@ -173,10 +225,13 @@ impl HaQLiteBuilder {
             detect_address(&instance_id, self.forwarding_port)
         });
 
-        // Build walrust S3 storage backend (for SQLite WAL operations).
-        let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(
-            walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
-        );
+        // Build walrust storage backend (injected for tests, S3 by default).
+        let walrust_storage: Arc<dyn walrust::StorageBackend> = match self.walrust_storage {
+            Some(storage) => storage,
+            None => Arc::new(
+                walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
+            ),
+        };
 
         // Use custom lease store if provided, otherwise build S3 lease store.
         // Only construct the S3 client when we actually need it for S3LeaseStore.
@@ -216,30 +271,60 @@ impl HaQLiteBuilder {
             &self.prefix,
             replication_config,
         ));
-        let follower_behavior = Arc::new(SqliteFollowerBehavior::new(walrust_storage));
 
-        // Build hadb Coordinator.
-        let coordinator = Coordinator::new(
-            replicator,
-            Some(lease_store),
-            None, // node_registry
-            follower_behavior,
-            &self.prefix,
-            config,
-        );
+        match self.mode {
+            HaMode::Dedicated => {
+                let follower_behavior = Arc::new(SqliteFollowerBehavior::new(walrust_storage));
 
-        open_with_coordinator(
-            coordinator,
-            db_path,
-            &db_name,
-            schema,
-            &address,
-            self.forwarding_port,
-            self.forward_timeout,
-            self.secret,
-            self.read_concurrency,
-        )
-        .await
+                // Build hadb Coordinator.
+                let coordinator = Coordinator::new(
+                    replicator,
+                    Some(lease_store),
+                    None, // manifest_store (Phase Signal)
+                    None, // node_registry
+                    follower_behavior,
+                    &self.prefix,
+                    config,
+                );
+
+                open_with_coordinator(
+                    coordinator,
+                    db_path,
+                    &db_name,
+                    schema,
+                    &address,
+                    self.forwarding_port,
+                    self.forward_timeout,
+                    self.secret,
+                    self.read_concurrency,
+                )
+                .await
+            }
+            HaMode::Shared => {
+                let manifest_store = self.manifest_store
+                    .expect("Shared mode requires manifest_store");
+                let poll_interval = self.manifest_poll_interval
+                    .unwrap_or(Duration::from_secs(1));
+                let write_timeout = self.write_timeout
+                    .unwrap_or(Duration::from_secs(5));
+
+                open_shared(
+                    lease_store,
+                    manifest_store,
+                    replicator,
+                    walrust_storage,
+                    db_path,
+                    &db_name,
+                    schema,
+                    &self.prefix,
+                    &instance_id,
+                    poll_interval,
+                    write_timeout,
+                    self.read_concurrency,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -275,6 +360,28 @@ pub(crate) struct HaQLiteInner {
     follower_caught_up: Arc<AtomicBool>,
     /// Current follower replay position (TXID).
     follower_replay_position: Arc<AtomicU64>,
+    // --- Phase Crest: Shared mode fields ---
+    mode: HaMode,
+    /// Direct lease store access (Shared mode, bypasses Coordinator).
+    shared_lease_store: Option<Arc<dyn hadb::LeaseStore>>,
+    /// Direct manifest store access (Shared mode).
+    shared_manifest_store: Option<Arc<dyn hadb::ManifestStore>>,
+    /// Direct replicator access (Shared mode).
+    shared_replicator: Option<Arc<SqliteReplicator>>,
+    /// Walrust storage backend for pull_incremental.
+    shared_walrust_storage: Option<Arc<dyn walrust::StorageBackend>>,
+    /// S3 prefix for lease/manifest keys.
+    shared_prefix: String,
+    /// Instance ID for this node.
+    shared_instance_id: String,
+    /// Serializes all writes in Shared mode.
+    write_mutex: tokio::sync::Mutex<()>,
+    /// Cached manifest version for freshness checks.
+    cached_manifest_version: AtomicU64,
+    /// Write timeout for lease acquisition.
+    write_timeout: Duration,
+    /// Lease TTL for shared mode leases.
+    lease_ttl: u64,
 }
 
 impl HaQLiteInner {
@@ -345,6 +452,17 @@ impl HaQLite {
             read_semaphore: tokio::sync::Semaphore::new(DEFAULT_READ_CONCURRENCY),
             follower_caught_up: Arc::new(AtomicBool::new(true)),
             follower_replay_position: Arc::new(AtomicU64::new(0)),
+            mode: HaMode::Dedicated,
+            shared_lease_store: None,
+            shared_manifest_store: None,
+            shared_replicator: None,
+            shared_walrust_storage: None,
+            shared_prefix: String::new(),
+            shared_instance_id: String::new(),
+            write_mutex: tokio::sync::Mutex::new(()),
+            cached_manifest_version: AtomicU64::new(0),
+            write_timeout: DEFAULT_FORWARD_TIMEOUT,
+            lease_ttl: 5,
         });
 
         // No forwarding server or role listener in local mode.
@@ -411,11 +529,15 @@ impl HaQLite {
     /// On the leader: executes locally.
     /// On a follower: forwards to the leader via HTTP.
     pub async fn execute(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
-        let role = self.inner.current_role();
-
-        match role {
-            Some(Role::Leader) | None => self.execute_local(sql, params),
-            Some(Role::Follower) => self.execute_forwarded(sql, params).await,
+        match self.inner.mode {
+            HaMode::Shared => self.execute_shared(sql, params).await,
+            HaMode::Dedicated => {
+                let role = self.inner.current_role();
+                match role {
+                    Some(Role::Leader) | None => self.execute_local(sql, params),
+                    Some(Role::Follower) => self.execute_forwarded(sql, params).await,
+                }
+            }
         }
     }
 
@@ -637,9 +759,201 @@ impl HaQLite {
         Ok(())
     }
 
+    /// Read with freshness guarantee: checks manifest and catches up before querying.
+    /// In Dedicated mode, this is equivalent to `query_row()`.
+    pub async fn query_row_fresh<T, F>(
+        &self, sql: &str, params: &[&dyn rusqlite::types::ToSql], f: F,
+    ) -> std::result::Result<T, HaQLiteError>
+    where
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.ensure_fresh().await?;
+        self.query_row(sql, params, f)
+    }
+
+    /// Read with freshness guarantee (multi-row version).
+    pub async fn query_values_fresh(
+        &self, sql: &str, params: &[SqlValue],
+    ) -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
+        self.ensure_fresh().await?;
+        self.query_values(sql, params)
+    }
+
+    /// Check manifest freshness and catch up if stale.
+    async fn ensure_fresh(&self) -> std::result::Result<(), HaQLiteError> {
+        if self.inner.mode != HaMode::Shared {
+            return Ok(());
+        }
+        let manifest_store = match &self.inner.shared_manifest_store {
+            Some(ms) => ms,
+            None => return Ok(()),
+        };
+        let manifest_key = format!("{}{}/_manifest", self.inner.shared_prefix, self.inner.db_name);
+        let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
+        match manifest_store.meta(&manifest_key).await {
+            Ok(Some(meta)) if meta.version > cached => {
+                if let Some(ref ws) = self.inner.shared_walrust_storage {
+                    let current_seq = self.inner.follower_replay_position.load(Ordering::SeqCst);
+                    match walrust::sync::pull_incremental(
+                        ws.as_ref(), &self.inner.shared_prefix,
+                        &self.inner.db_name, &self.inner.db_path, current_seq,
+                    ).await {
+                        Ok(new_seq) => {
+                            self.inner.follower_replay_position.store(new_seq, Ordering::SeqCst);
+                            self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                            // Reopen connection to see new data
+                            if let Ok(new_conn) = open_leader_connection(&self.inner.db_path) {
+                                self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("ensure_fresh catch-up failed: {}", e);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     // ========================================================================
     // Internal
     // ========================================================================
+
+    async fn execute_shared(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
+        let lease_store = self.inner.shared_lease_store.as_ref()
+            .expect("shared_lease_store required in Shared mode");
+        let manifest_store = self.inner.shared_manifest_store.as_ref()
+            .expect("shared_manifest_store required in Shared mode");
+        let replicator = self.inner.shared_replicator.as_ref()
+            .expect("shared_replicator required in Shared mode");
+        let walrust_storage = self.inner.shared_walrust_storage.as_ref()
+            .expect("shared_walrust_storage required in Shared mode");
+
+        // 1. Serialize writes on this node
+        let _write_guard = self.inner.write_mutex.lock().await;
+
+        // 2. Acquire lease with retry + backoff
+        let lease_key = format!("{}{}/_lease", self.inner.shared_prefix, self.inner.db_name);
+        let lease_data = serde_json::to_vec(&serde_json::json!({
+            "instance_id": self.inner.shared_instance_id,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_millis() as u64,
+            "ttl_secs": self.inner.lease_ttl,
+        })).unwrap_or_default();
+
+        let mut lease_etag: Option<String> = None;
+        let deadline = tokio::time::Instant::now() + self.inner.write_timeout;
+        let mut attempt = 0u32;
+        loop {
+            let result = match &lease_etag {
+                None => lease_store.write_if_not_exists(&lease_key, lease_data.clone()).await,
+                Some(etag) => lease_store.write_if_match(&lease_key, lease_data.clone(), etag).await,
+            };
+            match result {
+                Ok(cas) if cas.success => {
+                    lease_etag = cas.etag;
+                    break;
+                }
+                Ok(_cas) => {
+                    // Lease held by another node. Check if expired.
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(HaQLiteError::LeaseContention(
+                            format!("could not acquire lease for '{}' within {:?}", self.inner.db_name, self.inner.write_timeout),
+                        ));
+                    }
+                    // Read current lease to get etag for takeover
+                    match lease_store.read(&lease_key).await {
+                        Ok(Some((_data, etag))) => {
+                            lease_etag = Some(etag);
+                        }
+                        _ => {
+                            lease_etag = None;
+                        }
+                    }
+                    let backoff = Duration::from_millis(100 * 2u64.pow(attempt.min(4)));
+                    tokio::time::sleep(backoff.min(Duration::from_secs(2))).await;
+                    attempt += 1;
+                }
+                Err(e) => {
+                    return Err(HaQLiteError::CoordinatorError(format!("lease acquire failed: {}", e)));
+                }
+            }
+        }
+
+        // 3. Catch up from manifest
+        let manifest_key = format!("{}{}/_manifest", self.inner.shared_prefix, self.inner.db_name);
+        let cached_version = self.inner.cached_manifest_version.load(Ordering::SeqCst);
+        match manifest_store.meta(&manifest_key).await {
+            Ok(Some(meta)) if meta.version > cached_version => {
+                // Pull incremental updates
+                let current_seq = self.inner.follower_replay_position.load(Ordering::SeqCst);
+                match walrust::sync::pull_incremental(
+                    walrust_storage.as_ref(), &self.inner.shared_prefix,
+                    &self.inner.db_name, &self.inner.db_path, current_seq,
+                ).await {
+                    Ok(new_seq) => {
+                        self.inner.follower_replay_position.store(new_seq, Ordering::SeqCst);
+                        self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                        // Reopen connection after external WAL apply
+                        let new_conn = open_leader_connection(&self.inner.db_path)
+                            .map_err(|e| HaQLiteError::DatabaseError(format!("reopen after catch-up: {}", e)))?;
+                        self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
+                    }
+                    Err(e) => {
+                        tracing::warn!("shared mode catch-up failed (proceeding): {}", e);
+                    }
+                }
+            }
+            _ => {} // already up to date or no manifest
+        }
+
+        // 4. Execute SQL locally
+        let rows = self.execute_local(sql, params)?;
+
+        // 5. Checkpoint: flush WAL to S3
+        replicator.sync(&self.inner.db_name).await
+            .map_err(|e| HaQLiteError::ReplicationError(format!("checkpoint failed: {}", e)))?;
+
+        // 6. Publish manifest
+        let new_manifest = hadb::HaManifest {
+            version: 0, // store assigns version
+            writer_id: self.inner.shared_instance_id.clone(),
+            lease_epoch: 0,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_millis() as u64,
+            storage: hadb::StorageManifest::Walrust {
+                txid: self.inner.follower_replay_position.load(Ordering::SeqCst),
+                changeset_prefix: format!("{}{}/", self.inner.shared_prefix, self.inner.db_name),
+                latest_changeset_key: String::new(), // walrust manages this internally
+                snapshot_key: None,
+                snapshot_txid: None,
+            },
+        };
+        let expected_version = if cached_version > 0 { Some(cached_version) } else { None };
+        match manifest_store.put(&manifest_key, &new_manifest, expected_version).await {
+            Ok(cas) if cas.success => {
+                let new_version = cached_version + 1;
+                self.inner.cached_manifest_version.store(new_version, Ordering::SeqCst);
+            }
+            Ok(_) => {
+                tracing::warn!("manifest publish CAS failed for '{}' (stale writer?)", self.inner.db_name);
+            }
+            Err(e) => {
+                tracing::error!("manifest publish failed for '{}': {}", self.inner.db_name, e);
+            }
+        }
+
+        // 7. Release lease
+        if let Err(e) = lease_store.delete(&lease_key).await {
+            tracing::warn!("lease release failed for '{}': {}", self.inner.db_name, e);
+        }
+
+        Ok(rows)
+    }
 
     fn execute_local(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
         let conn_arc = self
@@ -774,6 +1088,17 @@ async fn open_with_coordinator(
         read_semaphore: tokio::sync::Semaphore::new(read_concurrency),
         follower_caught_up: caught_up,
         follower_replay_position: position,
+        mode: HaMode::Dedicated,
+        shared_lease_store: None,
+        shared_manifest_store: None,
+        shared_replicator: None,
+        shared_walrust_storage: None,
+        shared_prefix: String::new(),
+        shared_instance_id: String::new(),
+        write_mutex: tokio::sync::Mutex::new(()),
+        cached_manifest_version: AtomicU64::new(0),
+        write_timeout: DEFAULT_FORWARD_TIMEOUT,
+        lease_ttl: 5,
     });
 
     // If leader, open rw connection.
@@ -861,9 +1186,142 @@ async fn run_role_listener(
                 inner.set_conn(None);
             }
             Ok(RoleEvent::Joined { .. }) => {}
+            Ok(RoleEvent::ManifestChanged { db_name, version }) => {
+                tracing::debug!("manifest changed for '{}' to v{}", db_name, version);
+            }
             Err(_) => {
                 tracing::error!("HaQLite: role event channel closed");
                 break;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Shared mode: open + manifest poller
+// ============================================================================
+
+#[allow(clippy::too_many_arguments)]
+async fn open_shared(
+    lease_store: Arc<dyn hadb::LeaseStore>,
+    manifest_store: Arc<dyn hadb::ManifestStore>,
+    replicator: Arc<SqliteReplicator>,
+    walrust_storage: Arc<dyn walrust::StorageBackend>,
+    db_path: PathBuf,
+    db_name: &str,
+    schema: &str,
+    prefix: &str,
+    instance_id: &str,
+    manifest_poll_interval: Duration,
+    write_timeout: Duration,
+    read_concurrency: usize,
+) -> Result<HaQLite> {
+    ensure_schema(&db_path, schema)?;
+
+    // Register database with replicator (required before sync() can flush WAL)
+    replicator.add(db_name, &db_path).await?;
+
+    // Initial catch-up: restore from S3 if data exists
+    let _ = replicator.restore(db_name, &db_path).await;
+
+    // Check current manifest version
+    let manifest_key = format!("{}{}/_manifest", prefix, db_name);
+    let cached_version = match manifest_store.meta(&manifest_key).await? {
+        Some(meta) => meta.version,
+        None => 0,
+    };
+
+    // Open RW connection (every node can write in Shared mode)
+    let conn = open_leader_connection(&db_path)?;
+
+    let db_name_owned = db_name.to_string();
+    let inner = Arc::new(HaQLiteInner {
+        coordinator: None,
+        db_name: db_name_owned.clone(),
+        db_path: db_path.clone(),
+        role: AtomicU8::new(ROLE_LEADER), // Shared mode: always "leader" locally
+        conn: RwLock::new(Some(Arc::new(Mutex::new(conn)))),
+        leader_address: RwLock::new(String::new()),
+        http_client: reqwest::Client::new(),
+        secret: None,
+        read_semaphore: tokio::sync::Semaphore::new(read_concurrency),
+        follower_caught_up: Arc::new(AtomicBool::new(true)),
+        follower_replay_position: Arc::new(AtomicU64::new(0)),
+        // Shared mode fields
+        mode: HaMode::Shared,
+        shared_lease_store: Some(lease_store),
+        shared_manifest_store: Some(manifest_store),
+        shared_replicator: Some(replicator),
+        shared_walrust_storage: Some(walrust_storage),
+        shared_prefix: prefix.to_string(),
+        shared_instance_id: instance_id.to_string(),
+        write_mutex: tokio::sync::Mutex::new(()),
+        cached_manifest_version: AtomicU64::new(cached_version),
+        write_timeout,
+        lease_ttl: 5,
+    });
+
+    // Spawn manifest polling background task
+    let poller_inner = inner.clone();
+    let poller_db_name = db_name_owned.clone();
+    let poller_manifest_key = manifest_key.clone();
+    let role_handle = tokio::spawn(async move {
+        run_manifest_poller(poller_inner, poller_db_name, poller_manifest_key, manifest_poll_interval).await;
+    });
+
+    // No forwarding server in Shared mode
+    let fwd_handle = tokio::spawn(async {});
+
+    tracing::info!(
+        "HaQLite opened in Shared mode: db='{}', manifest_poll={}ms",
+        db_name, manifest_poll_interval.as_millis(),
+    );
+
+    Ok(HaQLite {
+        inner,
+        _fwd_handle: fwd_handle,
+        _role_handle: role_handle,
+    })
+}
+
+async fn run_manifest_poller(
+    inner: Arc<HaQLiteInner>,
+    db_name: String,
+    manifest_key: String,
+    poll_interval: Duration,
+) {
+    let mut interval = tokio::time::interval(poll_interval);
+    loop {
+        interval.tick().await;
+        if let Some(ref ms) = inner.shared_manifest_store {
+            match ms.meta(&manifest_key).await {
+                Ok(Some(meta)) => {
+                    let cached = inner.cached_manifest_version.load(Ordering::SeqCst);
+                    if meta.version > cached {
+                        // Pull latest data
+                        if let Some(ref ws) = inner.shared_walrust_storage {
+                            match walrust::sync::pull_incremental(
+                                ws.as_ref(), &inner.shared_prefix,
+                                &db_name, &inner.db_path, cached,
+                            ).await {
+                                Ok(_new_seq) => {
+                                    inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                                    tracing::debug!(
+                                        "manifest poller: caught up '{}' to v{}",
+                                        db_name, meta.version,
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!("manifest poller: pull failed for '{}': {}", db_name, e);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {} // no manifest yet
+                Err(e) => {
+                    tracing::error!("manifest poller: meta check failed for '{}': {}", db_name, e);
+                }
             }
         }
     }

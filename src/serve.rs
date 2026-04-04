@@ -18,7 +18,7 @@ use hadb::{CoordinatorConfig, LeaseConfig, Role};
 use hadb_cli::SharedConfig;
 
 use crate::cli_config::ServeConfig;
-use crate::database::HaQLite;
+use crate::database::{HaQLite, HaMode};
 
 /// Shared state for HTTP handlers.
 pub struct AppState {
@@ -75,8 +75,17 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
         ..Default::default()
     };
 
+    // Parse mode from env or config.
+    let mode_str = std::env::var("HAQLITE_MODE")
+        .unwrap_or_else(|_| serve.mode.clone());
+    let ha_mode = match mode_str.as_str() {
+        "shared" => HaMode::Shared,
+        _ => HaMode::Dedicated,
+    };
+
     // Build HaQLite.
     let mut builder = HaQLite::builder(&shared.s3.bucket)
+        .mode(ha_mode)
         .prefix(&serve.prefix)
         .forwarding_port(serve.forwarding_port)
         .instance_id(&instance_id)

@@ -185,6 +185,7 @@ async fn test_serve_rejects_empty_bucket() {
         secret: None,
         sync_interval_ms: 1000,
         follower_pull_ms: 1000,
+        mode: "dedicated".to_string(),
     };
     let err = haqlite::serve::run(&shared, &serve).await.unwrap_err();
     assert!(

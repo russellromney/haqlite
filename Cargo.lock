@@ -1381,7 +1381,7 @@ dependencies = [
 
 [[package]]
 name = "hadb"
-version = "0.2.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1389,6 +1389,7 @@ dependencies = [
  "chrono",
  "rand 0.8.5",
  "reqwest",
+ "rmp-serde",
  "serde",
  "serde_json",
  "tokio",
@@ -1398,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "hadb-changeset"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1412,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "hadb-cli"
-version = "0.2.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1428,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "hadb-io"
-version = "0.2.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1449,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "hadb-lease-nats"
-version = "0.2.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -1461,7 +1462,7 @@ dependencies = [
 
 [[package]]
 name = "hadb-lease-s3"
-version = "0.2.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2561,6 +2562,25 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rmp"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "rmp-serde"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
+dependencies = [
+ "rmp",
+ "serde",
 ]
 
 [[package]]
