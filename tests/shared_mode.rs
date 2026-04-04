@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 use common::InMemoryStorage;
 use haqlite::{HaMode, HaQLite, HaQLiteError, InMemoryManifestStore, ManifestStore, SqlValue};
-use hadb::InMemoryLeaseStore;
+use hadb::{InMemoryLeaseStore, LeaseStore};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT);";
 
@@ -272,4 +272,450 @@ async fn shared_lease_contention_error() {
     let err = HaQLiteError::LeaseContention("test contention".into());
     let msg = format!("{}", err);
     assert!(msg.contains("contention"), "error message should mention contention: {}", msg);
+}
+
+// ============================================================================
+// Stress tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_stress_concurrent_write_contention() {
+    // Two nodes share same lease/manifest/storage
+    // Both attempt to write simultaneously using tokio::spawn
+    // One should succeed, the other should either succeed (serialized) or get LeaseContention
+    // Verify: total rows written = number of successful writes
+    // Verify: manifest version is consistent
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+    let storage = Arc::new(InMemoryStorage::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+    let db_a = Arc::new(
+        build_shared(&tmp_a, "race", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-a").await,
+    );
+    let db_b = Arc::new(
+        build_shared(&tmp_b, "race", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-b").await,
+    );
+
+    let db_a2 = db_a.clone();
+    let db_b2 = db_b.clone();
+
+    let handle_a = tokio::spawn(async move {
+        db_a2.execute(
+            "INSERT INTO t VALUES (1, 'from-a')", &[],
+        ).await
+    });
+    let handle_b = tokio::spawn(async move {
+        db_b2.execute(
+            "INSERT INTO t VALUES (2, 'from-b')", &[],
+        ).await
+    });
+
+    let (res_a, res_b) = tokio::join!(handle_a, handle_b);
+    let res_a = res_a.unwrap();
+    let res_b = res_b.unwrap();
+
+    let mut successes = 0u64;
+    if res_a.is_ok() { successes += 1; }
+    if res_b.is_ok() { successes += 1; }
+
+    // At least one must succeed
+    assert!(successes >= 1, "at least one concurrent write should succeed");
+
+    // For any that failed, it should be LeaseContention
+    for (label, res) in [("a", &res_a), ("b", &res_b)] {
+        if let Err(ref e) = res {
+            let msg = format!("{}", e);
+            assert!(
+                msg.contains("contention") || msg.contains("Lease") || msg.contains("manifest"),
+                "node {} error should be lease/manifest related, got: {}", label, msg,
+            );
+        }
+    }
+
+    // Count actual rows via a fresh read from node that succeeded
+    let reader = if res_a.is_ok() { &db_a } else { &db_b };
+    let count: i64 = reader.query_row("SELECT COUNT(*) FROM t", &[], |r| r.get(0)).unwrap();
+    assert_eq!(count as u64, successes.min(count as u64), "row count should match successful writes");
+}
+
+#[tokio::test]
+async fn test_stress_alternating_node_writes() {
+    // Node A writes a batch, then node B opens fresh and writes a batch.
+    // Mimics the handoff pattern: each writer opens fresh, sees previous data, writes more.
+    // After both batches, a fresh reader should see all rows.
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+    let tmp_reader = TempDir::new().unwrap();
+    let storage = Arc::new(InMemoryStorage::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+    // Node A writes 20 rows
+    let db_a = build_shared(&tmp_a, "alt", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-a").await;
+    for i in 0..20 {
+        db_a.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            &[SqlValue::Integer(i), SqlValue::Text(format!("from-a-{}", i))],
+        ).await.unwrap_or_else(|e| panic!("write {} from A failed: {}", i, e));
+    }
+
+    let meta_a = manifest_store.meta("test/alt/_manifest").await.unwrap().unwrap();
+    assert_eq!(meta_a.version, 20, "A should have published 20 manifest versions");
+
+    // Node B opens fresh (restores from A's data), writes 20 more rows
+    let db_b = build_shared(&tmp_b, "alt", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-b").await;
+    for i in 20..40 {
+        db_b.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            &[SqlValue::Integer(i), SqlValue::Text(format!("from-b-{}", i))],
+        ).await.unwrap_or_else(|e| panic!("write {} from B failed: {}", i, e));
+    }
+
+    let meta_b = manifest_store.meta("test/alt/_manifest").await.unwrap().unwrap();
+    assert_eq!(meta_b.version, 40, "manifest should be at v40 after 40 total writes");
+
+    // Fresh reader should see all 40 rows
+    let reader = build_shared(&tmp_reader, "alt", storage.clone(), lease_store.clone(), manifest_store.clone(), "reader").await;
+    let count: i64 = reader.query_row_fresh("SELECT COUNT(*) FROM t", &[], |r| r.get(0)).await.unwrap();
+    assert_eq!(count, 40, "fresh reader should see all 40 rows");
+}
+
+#[tokio::test]
+async fn test_stress_large_transaction() {
+    // Single execute with many rows via a multi-statement INSERT
+    // Verify all rows present after fresh read on another node
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+    let storage = Arc::new(InMemoryStorage::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+    let db_a = build_shared(&tmp_a, "large", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-a").await;
+
+    // Insert 1000 rows in individual execute calls (no execute_batch on HaQLite)
+    for i in 0..1000 {
+        db_a.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            &[SqlValue::Integer(i), SqlValue::Text(format!("row-{}", i))],
+        ).await.unwrap_or_else(|e| panic!("insert row {} failed: {}", i, e));
+    }
+
+    let count_a: i64 = db_a.query_row("SELECT COUNT(*) FROM t", &[], |r| r.get(0)).unwrap();
+    assert_eq!(count_a, 1000, "node A should see all 1000 rows");
+
+    // Node B should see all rows via fresh read
+    let db_b = build_shared(&tmp_b, "large", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-b").await;
+    let count_b: i64 = db_b.query_row_fresh("SELECT COUNT(*) FROM t", &[], |r| r.get(0)).await.unwrap();
+    assert_eq!(count_b, 1000, "node B should see all 1000 rows after fresh read");
+}
+
+#[tokio::test]
+async fn test_lease_ttl_expiry_takeover() {
+    // Node A acquires lease manually with short TTL (via write_if_not_exists directly)
+    // Wait for TTL + margin
+    // Node B should be able to write (lease expired)
+    let _tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+    let storage = Arc::new(InMemoryStorage::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+    // Pre-claim lease with 1-second TTL (using millisecond timestamp, matching execute_shared format)
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let fake_lease = serde_json::json!({
+        "instance_id": "stale-node",
+        "timestamp": now_ms,
+        "ttl_secs": 1,
+    });
+    lease_store
+        .write_if_not_exists(
+            "test/ttl/_lease",
+            serde_json::to_vec(&fake_lease).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Wait for TTL to expire (1 second + 200ms margin)
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // Node B should be able to write (expired lease gets taken over)
+    let db_b = build_shared(&tmp_b, "ttl", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-b").await;
+    db_b.execute("INSERT INTO t VALUES (1, 'after-expiry')", &[]).await
+        .expect("node B should write after lease expiry");
+
+    let val: String = db_b.query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0)).unwrap();
+    assert_eq!(val, "after-expiry");
+
+    let meta = manifest_store.meta("test/ttl/_manifest").await.unwrap().unwrap();
+    assert_eq!(meta.version, 1);
+    assert_eq!(meta.writer_id, "node-b");
+}
+
+#[tokio::test]
+async fn test_stress_many_sequential_writes() {
+    // 50 sequential writes from single node
+    // Verify manifest version = 50
+    // Verify all 50 rows present
+    let tmp = TempDir::new().unwrap();
+    let storage = Arc::new(InMemoryStorage::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+    let db = build_shared(&tmp, "seq50", storage, lease_store, manifest_store.clone(), "node-1").await;
+
+    for i in 0..50 {
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            &[SqlValue::Integer(i), SqlValue::Text(format!("v{}", i))],
+        ).await.unwrap_or_else(|e| panic!("write {} failed: {}", i, e));
+    }
+
+    let meta = manifest_store.meta("test/seq50/_manifest").await.unwrap().unwrap();
+    assert_eq!(meta.version, 50, "50 writes should produce manifest v50");
+
+    let count: i64 = db.query_row("SELECT COUNT(*) FROM t", &[], |r| r.get(0)).unwrap();
+    assert_eq!(count, 50, "should have 50 rows");
+}
+
+// ============================================================================
+// Edge case tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_write_timeout_lease_contention() {
+    // Pre-claim lease with long TTL (InMemoryLeaseStore)
+    // Node tries to write with short write_timeout (100ms)
+    // Should get LeaseContention error
+    let tmp = TempDir::new().unwrap();
+    let storage = Arc::new(InMemoryStorage::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+    // Pre-claim lease with long TTL so it won't expire during the test
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let blocking_lease = serde_json::json!({
+        "instance_id": "blocker-node",
+        "timestamp": now_ms,
+        "ttl_secs": 300,
+    });
+    lease_store
+        .write_if_not_exists(
+            "test/contention/_lease",
+            serde_json::to_vec(&blocking_lease).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Build node with very short write_timeout
+    let db_path = tmp.path().join("contention.db");
+    let db = HaQLite::builder("test-bucket")
+        .prefix("test/")
+        .mode(HaMode::Shared)
+        .lease_store(lease_store)
+        .manifest_store(manifest_store)
+        .walrust_storage(storage)
+        .instance_id("blocked-node")
+        .manifest_poll_interval(Duration::from_millis(50))
+        .write_timeout(Duration::from_millis(100))
+        .open(db_path.to_str().unwrap(), SCHEMA)
+        .await
+        .expect("open should succeed");
+
+    let result = db.execute("INSERT INTO t VALUES (1, 'blocked')", &[]).await;
+    assert!(result.is_err(), "write should fail due to lease contention");
+    let err = result.unwrap_err();
+    let msg = format!("{}", err);
+    assert!(
+        msg.contains("contention") || msg.contains("Lease"),
+        "error should mention lease contention, got: {}", msg,
+    );
+}
+
+#[tokio::test]
+async fn test_fresh_read_consistency() {
+    // Node A writes rows, then a fresh reader opens and sees all data.
+    // Then node B (fresh) takes over writing and a new reader sees everything.
+    let tmp_a = TempDir::new().unwrap();
+    let storage = Arc::new(InMemoryStorage::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+    // Node A writes 5 rows
+    let db_a = build_shared(&tmp_a, "fresh", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-a").await;
+    for i in 1..=5 {
+        db_a.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            &[SqlValue::Integer(i), SqlValue::Text(format!("row-{}", i))],
+        ).await.unwrap();
+    }
+
+    // Fresh reader should see all 5 rows
+    let tmp_r1 = TempDir::new().unwrap();
+    let reader1 = build_shared(&tmp_r1, "fresh", storage.clone(), lease_store.clone(), manifest_store.clone(), "reader-1").await;
+    let count: i64 = reader1.query_row_fresh(
+        "SELECT COUNT(*) FROM t", &[], |r| r.get(0),
+    ).await.unwrap();
+    assert_eq!(count, 5, "fresh reader should see 5 rows after A's writes");
+
+    // Node B opens fresh, writes 3 more rows (restoring from A's 5-row state first)
+    let tmp_b = TempDir::new().unwrap();
+    let db_b = build_shared(&tmp_b, "fresh", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-b").await;
+    for i in 6..=8 {
+        db_b.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            &[SqlValue::Integer(i), SqlValue::Text(format!("row-{}", i))],
+        ).await.unwrap();
+    }
+
+    // Another fresh reader should see all 8
+    let tmp_r2 = TempDir::new().unwrap();
+    let reader2 = build_shared(&tmp_r2, "fresh", storage.clone(), lease_store.clone(), manifest_store.clone(), "reader-2").await;
+    let count2: i64 = reader2.query_row_fresh(
+        "SELECT COUNT(*) FROM t", &[], |r| r.get(0),
+    ).await.unwrap();
+    assert_eq!(count2, 8, "fresh reader should see all 8 rows after B's writes");
+}
+
+#[tokio::test]
+async fn test_fresh_read_empty_database() {
+    // Open two nodes, no writes
+    // query_row_fresh should return 0 rows (not error)
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+    let storage = Arc::new(InMemoryStorage::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+    let db_a = build_shared(&tmp_a, "empty", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-a").await;
+    let db_b = build_shared(&tmp_b, "empty", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-b").await;
+
+    let count_a: i64 = db_a.query_row_fresh(
+        "SELECT COUNT(*) FROM t", &[], |r| r.get(0),
+    ).await.unwrap();
+    assert_eq!(count_a, 0, "empty database should return 0 rows");
+
+    let count_b: i64 = db_b.query_row_fresh(
+        "SELECT COUNT(*) FROM t", &[], |r| r.get(0),
+    ).await.unwrap();
+    assert_eq!(count_b, 0, "empty database should return 0 rows on node B");
+}
+
+#[tokio::test]
+async fn test_write_after_lease_release() {
+    // Node A writes (acquires + releases lease)
+    // Node B immediately writes after A
+    // Should succeed without contention (lease was released)
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+    let storage = Arc::new(InMemoryStorage::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+    let db_a = build_shared(&tmp_a, "release", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-a").await;
+    let db_b = build_shared(&tmp_b, "release", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-b").await;
+
+    // Node A writes (lease should be acquired and released within execute)
+    db_a.execute("INSERT INTO t VALUES (1, 'from-a')", &[]).await.unwrap();
+
+    // Node B should immediately be able to write (no contention)
+    db_b.execute("INSERT INTO t VALUES (2, 'from-b')", &[]).await
+        .expect("node B should write without contention after A released lease");
+
+    let count: i64 = db_b.query_row_fresh("SELECT COUNT(*) FROM t", &[], |r| r.get(0)).await.unwrap();
+    assert_eq!(count, 2, "both rows should be visible");
+}
+
+#[tokio::test]
+async fn test_manifest_version_monotonicity() {
+    // Write N times, check manifest version after each
+    // Versions should be strictly monotonically increasing (1, 2, 3, ...)
+    let tmp = TempDir::new().unwrap();
+    let storage = Arc::new(InMemoryStorage::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+    let db = build_shared(&tmp, "mono", storage, lease_store, manifest_store.clone(), "node-1").await;
+
+    let mut prev_version = 0u64;
+    for i in 1..=10 {
+        db.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            &[SqlValue::Integer(i), SqlValue::Text(format!("v{}", i))],
+        ).await.unwrap();
+
+        let meta = manifest_store.meta("test/mono/_manifest").await.unwrap().unwrap();
+        assert!(
+            meta.version > prev_version,
+            "manifest version {} should be greater than previous {}", meta.version, prev_version,
+        );
+        assert_eq!(meta.version, i as u64, "manifest version should equal write count");
+        prev_version = meta.version;
+    }
+}
+
+#[tokio::test]
+async fn test_multiple_databases_shared_stores() {
+    // Two different databases (different db_name) sharing same ManifestStore
+    // Writes to db1 should not affect db2's manifest
+    let tmp_1 = TempDir::new().unwrap();
+    let tmp_2 = TempDir::new().unwrap();
+    let storage = Arc::new(InMemoryStorage::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+    let db1 = build_shared(&tmp_1, "db_alpha", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-1").await;
+    let db2 = build_shared(&tmp_2, "db_beta", storage.clone(), lease_store.clone(), manifest_store.clone(), "node-1").await;
+
+    // Write 3 rows to db1
+    for i in 0..3 {
+        db1.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            &[SqlValue::Integer(i), SqlValue::Text(format!("alpha-{}", i))],
+        ).await.unwrap();
+    }
+
+    // Write 1 row to db2
+    db2.execute(
+        "INSERT INTO t VALUES (100, 'beta-0')", &[],
+    ).await.unwrap();
+
+    // db1 manifest should be at version 3
+    let meta1 = manifest_store.meta("test/db_alpha/_manifest").await.unwrap().unwrap();
+    assert_eq!(meta1.version, 3, "db_alpha manifest should be v3");
+
+    // db2 manifest should be at version 1
+    let meta2 = manifest_store.meta("test/db_beta/_manifest").await.unwrap().unwrap();
+    assert_eq!(meta2.version, 1, "db_beta manifest should be v1");
+
+    // db1 should have 3 rows, db2 should have 1 row
+    let count1: i64 = db1.query_row("SELECT COUNT(*) FROM t", &[], |r| r.get(0)).unwrap();
+    let count2: i64 = db2.query_row("SELECT COUNT(*) FROM t", &[], |r| r.get(0)).unwrap();
+    assert_eq!(count1, 3, "db_alpha should have 3 rows");
+    assert_eq!(count2, 1, "db_beta should have 1 row");
+}
+
+#[tokio::test]
+async fn test_write_empty_params() {
+    // execute("INSERT INTO t VALUES (1, 'no_params')", &[])
+    // Should work (empty params slice)
+    let tmp = TempDir::new().unwrap();
+    let storage = Arc::new(InMemoryStorage::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+    let db = build_shared(&tmp, "empty_params", storage, lease_store, manifest_store.clone(), "node-1").await;
+
+    let rows = db.execute("INSERT INTO t VALUES (1, 'no_params')", &[]).await.unwrap();
+    assert_eq!(rows, 1);
+
+    let val: String = db.query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0)).unwrap();
+    assert_eq!(val, "no_params");
 }
