@@ -843,6 +843,11 @@ impl HaQLite {
                     match rep.restore(&self.inner.db_name, &self.inner.db_path).await {
                         Ok(_) => {
                             self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                            // Re-register replicator after restore so sync() uses restored state
+                            let _ = rep.inner().remove(&self.inner.db_name).await;
+                            if let Err(e) = rep.add(&self.inner.db_name, &self.inner.db_path).await {
+                                tracing::warn!("re-register after restore in ensure_fresh failed: {}", e);
+                            }
                             // Reopen connection to see new data
                             if let Ok(new_conn) = open_leader_connection(&self.inner.db_path) {
                                 self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
@@ -960,78 +965,89 @@ impl HaQLite {
             }
         }
 
-        // 3. Catch up from manifest
+        // 3-6. Critical section: catch-up, execute, sync, publish.
+        // Wrap in a closure so lease is always released even on error.
         let manifest_key = format!("{}{}/_manifest", self.inner.shared_prefix, self.inner.db_name);
         let cached_version = self.inner.cached_manifest_version.load(Ordering::SeqCst);
-        match manifest_store.meta(&manifest_key).await {
-            Ok(Some(meta)) if meta.version > cached_version => {
-                // Restore from S3 (full snapshot + incrementals from all writers)
-                match replicator.restore(&self.inner.db_name, &self.inner.db_path).await {
-                    Ok(_) => {
-                        self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
-                        // Re-register with replicator so sync() uses the restored state
-                        let _ = replicator.inner().remove(&self.inner.db_name).await;
-                        if let Err(e) = replicator.add(&self.inner.db_name, &self.inner.db_path).await {
-                            tracing::warn!("re-register after restore failed: {}", e);
+
+        let result: std::result::Result<u64, HaQLiteError> = async {
+            // 3. Catch up from manifest
+            match manifest_store.meta(&manifest_key).await {
+                Ok(Some(meta)) if meta.version > cached_version => {
+                    // Restore from S3 (full snapshot + incrementals from all writers)
+                    match replicator.restore(&self.inner.db_name, &self.inner.db_path).await {
+                        Ok(_) => {
+                            self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                            // Re-register with replicator so sync() uses the restored state
+                            let _ = replicator.inner().remove(&self.inner.db_name).await;
+                            if let Err(e) = replicator.add(&self.inner.db_name, &self.inner.db_path).await {
+                                tracing::warn!("re-register after restore failed: {}", e);
+                            }
+                            // Reopen connection after restore
+                            let new_conn = open_leader_connection(&self.inner.db_path)
+                                .map_err(|e| HaQLiteError::DatabaseError(format!("reopen after catch-up: {}", e)))?;
+                            self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
                         }
-                        // Reopen connection after restore
-                        let new_conn = open_leader_connection(&self.inner.db_path)
-                            .map_err(|e| HaQLiteError::DatabaseError(format!("reopen after catch-up: {}", e)))?;
-                        self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
-                    }
-                    Err(e) => {
-                        tracing::warn!("shared mode catch-up failed (proceeding): {}", e);
+                        Err(e) => {
+                            tracing::warn!("shared mode catch-up failed (proceeding): {}", e);
+                        }
                     }
                 }
+                _ => {} // already up to date or no manifest
             }
-            _ => {} // already up to date or no manifest
-        }
 
-        // 4. Execute SQL locally
-        let rows = self.execute_local(sql, params)?;
+            // 4. Execute SQL locally
+            let rows = self.execute_local(sql, params)?;
 
-        // 5. Checkpoint: flush WAL to S3
-        replicator.sync(&self.inner.db_name).await
-            .map_err(|e| HaQLiteError::ReplicationError(format!("checkpoint failed: {}", e)))?;
+            // 5. Checkpoint: flush WAL to S3
+            replicator.sync(&self.inner.db_name).await
+                .map_err(|e| HaQLiteError::ReplicationError(format!("checkpoint failed: {}", e)))?;
 
-        // 6. Publish manifest
-        let current_seq = replicator.inner().current_seq(&self.inner.db_name).await.unwrap_or(0);
-        let changeset_prefix = format!("{}{}/", self.inner.shared_prefix, self.inner.db_name);
-        let new_manifest = hadb::HaManifest {
-            version: 0, // store assigns version
-            writer_id: self.inner.shared_instance_id.clone(),
-            lease_epoch: 0,
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_millis() as u64,
-            storage: hadb::StorageManifest::Walrust {
-                txid: current_seq,
-                changeset_prefix: changeset_prefix.clone(),
-                latest_changeset_key: format!("{}0000/{:016x}.hadbp", changeset_prefix, current_seq),
-                snapshot_key: None,
-                snapshot_txid: None,
-            },
-        };
-        let expected_version = if cached_version > 0 { Some(cached_version) } else { None };
-        match manifest_store.put(&manifest_key, &new_manifest, expected_version).await {
-            Ok(cas) if cas.success => {
-                let new_version = cached_version + 1;
-                self.inner.cached_manifest_version.store(new_version, Ordering::SeqCst);
+            // 6. Publish manifest
+            let current_seq = replicator.inner().current_seq(&self.inner.db_name).await.unwrap_or(0);
+            let changeset_prefix = format!("{}{}/", self.inner.shared_prefix, self.inner.db_name);
+            let new_manifest = hadb::HaManifest {
+                version: 0, // store assigns version
+                writer_id: self.inner.shared_instance_id.clone(),
+                lease_epoch: 0,
+                timestamp_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_millis() as u64,
+                storage: hadb::StorageManifest::Walrust {
+                    txid: current_seq,
+                    changeset_prefix: changeset_prefix.clone(),
+                    latest_changeset_key: format!("{}0000/{:016x}.hadbp", changeset_prefix, current_seq),
+                    snapshot_key: None,
+                    snapshot_txid: None,
+                },
+            };
+            let expected_version = if cached_version > 0 { Some(cached_version) } else { None };
+            match manifest_store.put(&manifest_key, &new_manifest, expected_version).await {
+                Ok(cas) if cas.success => {
+                    let new_version = cached_version + 1;
+                    self.inner.cached_manifest_version.store(new_version, Ordering::SeqCst);
+                }
+                Ok(_) => {
+                    // CAS failed: refresh version for next attempt
+                    if let Ok(Some(meta)) = manifest_store.meta(&manifest_key).await {
+                        self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                    }
+                    tracing::warn!("manifest publish CAS failed for '{}' (stale writer?)", self.inner.db_name);
+                }
+                Err(e) => {
+                    tracing::error!("manifest publish failed for '{}': {}", self.inner.db_name, e);
+                }
             }
-            Ok(_) => {
-                tracing::warn!("manifest publish CAS failed for '{}' (stale writer?)", self.inner.db_name);
-            }
-            Err(e) => {
-                tracing::error!("manifest publish failed for '{}': {}", self.inner.db_name, e);
-            }
-        }
 
-        // 7. Release lease
+            Ok(rows)
+        }.await;
+
+        // 7. Always release lease, even on error
         if let Err(e) = lease_store.delete(&lease_key).await {
             tracing::warn!("lease release failed for '{}': {}", self.inner.db_name, e);
         }
 
-        Ok(rows)
+        result
     }
 
     /// Turbolite path for execute_shared: lease -> catch-up -> write -> publish -> release.
@@ -1107,57 +1123,68 @@ impl HaQLite {
             }
         }
 
-        // 3. Catch up from manifest (apply turbolite manifest to VFS)
+        // 3-5. Critical section: catch-up, execute, publish.
+        // Wrap in a closure so lease is always released even on error.
         let manifest_key = format!("{}{}/_manifest", self.inner.shared_prefix, self.inner.db_name);
         let cached_version = self.inner.cached_manifest_version.load(Ordering::SeqCst);
-        match manifest_store.meta(&manifest_key).await {
-            Ok(Some(meta)) if meta.version > cached_version => {
-                if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
-                    if let hadb::StorageManifest::Turbolite { .. } = &ha_manifest.storage {
-                        let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
-                        vfs.set_manifest(tl_manifest);
-                        self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+
+        let result: std::result::Result<u64, HaQLiteError> = async {
+            // 3. Catch up from manifest (apply turbolite manifest to VFS)
+            match manifest_store.meta(&manifest_key).await {
+                Ok(Some(meta)) if meta.version > cached_version => {
+                    if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
+                        if let hadb::StorageManifest::Turbolite { .. } = &ha_manifest.storage {
+                            let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
+                            vfs.set_manifest(tl_manifest);
+                            self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                        }
                     }
                 }
+                _ => {} // already up to date or no manifest
             }
-            _ => {} // already up to date or no manifest
-        }
 
-        // 4. Execute SQL locally
-        let rows = self.execute_local(sql, params)?;
+            // 4. Execute SQL locally
+            let rows = self.execute_local(sql, params)?;
 
-        // 5. Publish manifest with turbolite state
-        let tl_manifest = vfs.manifest();
-        let storage = crate::turbolite_replicator::turbolite_to_ha_storage(&tl_manifest);
-        let new_manifest = hadb::HaManifest {
-            version: 0, // store assigns version
-            writer_id: self.inner.shared_instance_id.clone(),
-            lease_epoch: 0,
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_millis() as u64,
-            storage,
-        };
-        let expected_version = if cached_version > 0 { Some(cached_version) } else { None };
-        match manifest_store.put(&manifest_key, &new_manifest, expected_version).await {
-            Ok(cas) if cas.success => {
-                let new_version = cached_version + 1;
-                self.inner.cached_manifest_version.store(new_version, Ordering::SeqCst);
+            // 5. Publish manifest with turbolite state
+            let tl_manifest = vfs.manifest();
+            let storage = crate::turbolite_replicator::turbolite_to_ha_storage(&tl_manifest);
+            let new_manifest = hadb::HaManifest {
+                version: 0, // store assigns version
+                writer_id: self.inner.shared_instance_id.clone(),
+                lease_epoch: 0,
+                timestamp_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_millis() as u64,
+                storage,
+            };
+            let expected_version = if cached_version > 0 { Some(cached_version) } else { None };
+            match manifest_store.put(&manifest_key, &new_manifest, expected_version).await {
+                Ok(cas) if cas.success => {
+                    let new_version = cached_version + 1;
+                    self.inner.cached_manifest_version.store(new_version, Ordering::SeqCst);
+                }
+                Ok(_) => {
+                    // CAS failed: refresh version for next attempt
+                    if let Ok(Some(meta)) = manifest_store.meta(&manifest_key).await {
+                        self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                    }
+                    tracing::warn!("manifest publish CAS failed for '{}' (stale writer?)", self.inner.db_name);
+                }
+                Err(e) => {
+                    tracing::error!("manifest publish failed for '{}': {}", self.inner.db_name, e);
+                }
             }
-            Ok(_) => {
-                tracing::warn!("manifest publish CAS failed for '{}' (stale writer?)", self.inner.db_name);
-            }
-            Err(e) => {
-                tracing::error!("manifest publish failed for '{}': {}", self.inner.db_name, e);
-            }
-        }
 
-        // 6. Release lease
+            Ok(rows)
+        }.await;
+
+        // 6. Always release lease, even on error
         if let Err(e) = lease_store.delete(&lease_key).await {
             tracing::warn!("lease release failed for '{}': {}", self.inner.db_name, e);
         }
 
-        Ok(rows)
+        result
     }
 
     fn execute_local(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
