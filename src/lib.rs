@@ -32,7 +32,6 @@ pub mod ops;
 pub mod replicator;
 pub mod serve;
 
-#[cfg(feature = "turbolite")]
 pub mod turbolite_replicator;
 
 // Re-export HaQLite as the primary API.

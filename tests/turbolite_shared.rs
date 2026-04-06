@@ -3,7 +3,6 @@
 //! Uses turbolite with StorageBackend::Local (no cloud/S3 needed).
 //! Tests the per-write lease cycle with turbolite as the storage engine.
 
-#![cfg(feature = "turbolite")]
 
 mod common;
 
@@ -61,7 +60,7 @@ async fn build_turbolite_shared(
 // Happy path
 // ============================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn turbolite_shared_single_write_read() {
     let tmp = TempDir::new().expect("temp dir");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
@@ -95,7 +94,7 @@ async fn turbolite_shared_single_write_read() {
     assert_eq!(val, "hello");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn turbolite_shared_manifest_published_after_write() {
     let tmp = TempDir::new().expect("temp dir");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
@@ -140,7 +139,7 @@ async fn turbolite_shared_manifest_published_after_write() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn turbolite_shared_sequential_writes_increment_manifest() {
     let tmp = TempDir::new().expect("temp dir");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
@@ -183,7 +182,7 @@ async fn turbolite_shared_sequential_writes_increment_manifest() {
 // Manifest content verification
 // ============================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn turbolite_shared_manifest_has_turbolite_fields() {
     let tmp = TempDir::new().expect("temp dir");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
@@ -231,7 +230,7 @@ async fn turbolite_shared_manifest_has_turbolite_fields() {
 // Conversion round-trip
 // ============================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn turbolite_manifest_conversion_roundtrip() {
     use haqlite::turbolite_replicator::{ha_storage_to_turbolite, turbolite_to_ha_storage};
     use std::collections::HashMap;
@@ -278,6 +277,7 @@ async fn turbolite_manifest_conversion_roundtrip() {
         page_to_tree_name: HashMap::new(),
         tree_name_to_groups: HashMap::new(),
         group_to_tree_name: HashMap::new(),
+        db_header: None,
     };
 
     let ha = turbolite_to_ha_storage(&tl);
@@ -302,7 +302,7 @@ async fn turbolite_manifest_conversion_roundtrip() {
 // Edge cases
 // ============================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn turbolite_shared_empty_table_read() {
     let tmp = TempDir::new().expect("temp dir");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
@@ -326,7 +326,7 @@ async fn turbolite_shared_empty_table_read() {
     assert_eq!(count, 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn turbolite_shared_manifest_writer_id_set() {
     let tmp = TempDir::new().expect("temp dir");
     let lease_store = Arc::new(InMemoryLeaseStore::new());

@@ -74,7 +74,6 @@ impl Replicator for TurboliteReplicator {
     async fn sync(&self, _name: &str) -> Result<()> {
         // In cloud mode, flush pending uploads to S3.
         // In local mode, sync happens via the VFS xSync callback during checkpoint.
-        #[cfg(feature = "turbolite-cloud")]
         self.vfs
             .flush_to_s3()
             .map_err(|e| anyhow::anyhow!("turbolite flush_to_s3 failed: {}", e))?;
@@ -346,6 +345,7 @@ mod tests {
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
+            db_header: None,
         };
 
         let ha = turbolite_to_ha_storage(&tl);
@@ -405,6 +405,7 @@ mod tests {
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
+            db_header: None,
         };
 
         let ha = turbolite_to_ha_storage(&tl);

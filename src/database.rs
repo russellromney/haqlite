@@ -85,7 +85,6 @@ pub struct HaQLiteBuilder {
     write_timeout: Option<Duration>,
     walrust_storage: Option<Arc<dyn walrust::StorageBackend>>,
     lease_ttl: Option<u64>,
-    #[cfg(feature = "turbolite")]
     turbolite_vfs: Option<(turbolite::tiered::SharedTurboliteVfs, String)>,
 }
 
@@ -109,7 +108,6 @@ impl HaQLiteBuilder {
             write_timeout: None,
             walrust_storage: None,
             lease_ttl: None,
-            #[cfg(feature = "turbolite")]
             turbolite_vfs: None,
         }
     }
@@ -222,7 +220,6 @@ impl HaQLiteBuilder {
     ///
     /// `vfs` is the TurboliteVfs (must already be registered with SQLite).
     /// `vfs_name` is the name used in the VFS URI (e.g. "mydb").
-    #[cfg(feature = "turbolite")]
     pub fn turbolite_vfs(mut self, vfs: turbolite::tiered::SharedTurboliteVfs, vfs_name: &str) -> Self {
         self.turbolite_vfs = Some((vfs, vfs_name.to_string()));
         self
@@ -254,16 +251,9 @@ impl HaQLiteBuilder {
         let walrust_storage_opt: Option<Arc<dyn walrust::StorageBackend>> = match self.walrust_storage {
             Some(storage) => Some(storage),
             None => {
-                #[cfg(feature = "turbolite")]
                 if self.turbolite_vfs.is_some() {
                     None // Mode F: no walrust needed
                 } else {
-                    Some(Arc::new(
-                        walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
-                    ))
-                }
-                #[cfg(not(feature = "turbolite"))]
-                {
                     Some(Arc::new(
                         walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
                     ))
@@ -350,7 +340,6 @@ impl HaQLiteBuilder {
 
                 let lease_ttl = self.lease_ttl.unwrap_or(5);
 
-                #[cfg(feature = "turbolite")]
                 if let Some((vfs, vfs_name)) = self.turbolite_vfs {
                     return open_shared_turbolite(
                         lease_store, manifest_store, vfs, &vfs_name,
@@ -467,10 +456,8 @@ pub(crate) struct HaQLiteInner {
     /// Lease TTL for shared mode leases.
     lease_ttl: u64,
     /// Turbolite VFS for Shared mode turbolite path.
-    #[cfg(feature = "turbolite")]
     shared_turbolite_vfs: Option<turbolite::tiered::SharedTurboliteVfs>,
     /// VFS name for reopening turbolite connections.
-    #[cfg(feature = "turbolite")]
     shared_turbolite_vfs_name: Option<String>,
 }
 
@@ -567,9 +554,7 @@ impl HaQLite {
             cached_manifest_version: AtomicU64::new(0),
             write_timeout: DEFAULT_FORWARD_TIMEOUT,
             lease_ttl: 5,
-            #[cfg(feature = "turbolite")]
             shared_turbolite_vfs: None,
-            #[cfg(feature = "turbolite")]
             shared_turbolite_vfs_name: None,
         });
 
@@ -936,7 +921,6 @@ impl HaQLite {
         match manifest_store.meta(&manifest_key).await {
             Ok(Some(meta)) if meta.version > cached => {
                 // Turbolite-only path (Mode F): catch up via set_manifest
-                #[cfg(feature = "turbolite")]
                 if self.inner.shared_replicator.is_none() {
                     if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
                         if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
@@ -965,7 +949,6 @@ impl HaQLite {
                     self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
 
                     // If turbolite VFS, sync bitmap after walrust restore
-                    #[cfg(feature = "turbolite")]
                     if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
                         let page_count = read_page_count_from_file(&wp).unwrap_or(0);
                         if page_count > 0 {
@@ -981,7 +964,6 @@ impl HaQLite {
                     }
 
                     // Reopen connection (via VFS URI if turbolite, else raw path)
-                    #[cfg(feature = "turbolite")]
                     let new_conn = if let Some(ref vfs_name) = self.inner.shared_turbolite_vfs_name {
                         let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
                         rusqlite::Connection::open_with_flags(
@@ -998,14 +980,6 @@ impl HaQLite {
                                 format!("reopen after ensure_fresh for '{}': {}", self.inner.db_name, e)
                             ))?
                     };
-                    #[cfg(not(feature = "turbolite"))]
-                    let new_conn = open_leader_connection(&self.inner.db_path)
-                        .map_err(|e| HaQLiteError::DatabaseError(
-                            format!("reopen after ensure_fresh for '{}': {}", self.inner.db_name, e)
-                        ))?;
-                    new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
-                        .map_err(|e| HaQLiteError::DatabaseError(format!("WAL pragma: {}", e)))?;
-                    self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
                 }
             }
             _ => {}
@@ -1020,7 +994,6 @@ impl HaQLite {
     async fn execute_shared(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
         // Dispatch to turbolite-only path (Mode F/G: S3Primary, no walrust)
         // if turbolite VFS is present but walrust replicator is not.
-        #[cfg(feature = "turbolite")]
         if self.inner.shared_turbolite_vfs.is_some() && self.inner.shared_replicator.is_none() {
             return self.execute_shared_turbolite(sql, params).await;
         }
@@ -1126,7 +1099,6 @@ impl HaQLite {
             match manifest_store.meta(&manifest_key).await {
                 Ok(Some(meta)) if meta.version > cached_version => {
                     // For TurboliteWalrust (Mode I), apply turbolite base state first
-                    #[cfg(feature = "turbolite")]
                     if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
                         if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
                             let is_tl = matches!(
@@ -1150,7 +1122,6 @@ impl HaQLite {
                     self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
 
                     // If turbolite VFS is present, sync bitmap after walrust restore
-                    #[cfg(feature = "turbolite")]
                     if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
                         let page_count = read_page_count_from_file(&wp).unwrap_or(0);
                         if page_count > 0 {
@@ -1163,7 +1134,6 @@ impl HaQLite {
                     // file from offset 0 and uploads new frames.
 
                     // Reopen connection after restore (via VFS URI if turbolite, else raw path)
-                    #[cfg(feature = "turbolite")]
                     let new_conn = if let Some(ref vfs_name) = self.inner.shared_turbolite_vfs_name {
                         let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
                         rusqlite::Connection::open_with_flags(
@@ -1180,14 +1150,6 @@ impl HaQLite {
                                 format!("reopen after catch-up for '{}': {}", self.inner.db_name, e)
                             ))?
                     };
-                    #[cfg(not(feature = "turbolite"))]
-                    let new_conn = open_leader_connection(&self.inner.db_path)
-                        .map_err(|e| HaQLiteError::DatabaseError(
-                            format!("reopen after catch-up for '{}': {}", self.inner.db_name, e)
-                        ))?;
-                    new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
-                        .map_err(|e| HaQLiteError::DatabaseError(format!("WAL pragma: {}", e)))?;
-                    self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
                 }
                 _ => {} // already up to date or no manifest
             }
@@ -1242,7 +1204,6 @@ impl HaQLite {
             let changeset_prefix = format!("{}{}/", self.inner.shared_prefix, self.inner.db_name);
 
             // Build storage manifest: TurboliteWalrust if turbolite VFS present, else Walrust
-            #[cfg(feature = "turbolite")]
             let storage = if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
                 let tl_manifest = vfs.manifest();
                 crate::turbolite_replicator::turbolite_walrust_to_ha_storage(
@@ -1257,15 +1218,6 @@ impl HaQLite {
                     snapshot_txid: None,
                 }
             };
-            #[cfg(not(feature = "turbolite"))]
-            let storage = hadb::StorageManifest::Walrust {
-                txid: current_seq,
-                changeset_prefix: changeset_prefix.clone(),
-                latest_changeset_key: format!("{}0000/{:016x}.hadbp", changeset_prefix, current_seq),
-                snapshot_key: None,
-                snapshot_txid: None,
-            };
-
             let new_manifest = hadb::HaManifest {
                 version: 0,
                 writer_id: self.inner.shared_instance_id.clone(),
@@ -1310,7 +1262,6 @@ impl HaQLite {
     }
 
     /// Turbolite path for execute_shared: lease -> catch-up -> write -> publish -> release.
-    #[cfg(feature = "turbolite")]
     async fn execute_shared_turbolite(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
         let lease_store = self.inner.shared_lease_store.as_ref()
             .ok_or(HaQLiteError::ConfigurationError("shared_lease_store required in Shared mode".into()))?;
@@ -1418,6 +1369,7 @@ impl HaQLite {
                     // VFS::open uses warm reconnect (no S3 fetch) since
                     // eager_index_load=false avoids group 0 eager fetch.
                     self.inner.set_conn(None);
+                    turbolite::clear_all_caches();
                     let vfs_name = self.inner.shared_turbolite_vfs_name.as_ref()
                         .ok_or(HaQLiteError::ConfigurationError("VFS name required".into()))?;
                     let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
@@ -1429,7 +1381,7 @@ impl HaQLite {
                     ).map_err(|e| HaQLiteError::DatabaseError(
                         format!("reopen after set_manifest for '{}': {}", self.inner.db_name, e)
                     ))?;
-                    new_conn.execute_batch("PRAGMA journal_mode=OFF;")
+                    new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
                         .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma: {}", e)))?;
                     self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
                 }
@@ -1668,9 +1620,7 @@ async fn open_with_coordinator(
         cached_manifest_version: AtomicU64::new(0),
         write_timeout: DEFAULT_FORWARD_TIMEOUT,
         lease_ttl: 5,
-        #[cfg(feature = "turbolite")]
         shared_turbolite_vfs: None,
-        #[cfg(feature = "turbolite")]
         shared_turbolite_vfs_name: None,
     });
 
@@ -1837,9 +1787,7 @@ async fn open_shared(
         cached_manifest_version: AtomicU64::new(cached_version),
         write_timeout,
         lease_ttl,
-        #[cfg(feature = "turbolite")]
         shared_turbolite_vfs: None,
-        #[cfg(feature = "turbolite")]
         shared_turbolite_vfs_name: None,
     });
 
@@ -1911,7 +1859,6 @@ async fn run_manifest_poller(
 // Turbolite shared mode: open + manifest poller
 // ============================================================================
 
-#[cfg(feature = "turbolite")]
 #[allow(clippy::too_many_arguments)]
 async fn open_shared_turbolite(
     lease_store: Arc<dyn hadb::LeaseStore>,
@@ -1993,20 +1940,19 @@ async fn open_shared_turbolite(
             .map_err(|e| anyhow::anyhow!("walrust add failed for '{}': {}", db_name, e))?;
     }
 
+    // Clear in-process locks from schema connection before opening persistent connection
+    turbolite::clear_all_caches();
+
     // Open persistent connection via turbolite VFS
     let conn = rusqlite::Connection::open_with_flags(
         &vfs_uri,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
             | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
-    // journal_mode depends on whether walrust is used:
-    // - With walrust (Mode I): WAL mode (walrust ships WAL frames)
-    // - Without walrust (Mode F): OFF mode (S3Primary, no WAL needed)
-    if replicator.is_some() {
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
-    } else {
-        conn.execute_batch("PRAGMA journal_mode=OFF;")?;
-    }
+    // WAL mode is the safe default for all turbolite configurations.
+    // Mode F (S3Primary) overrides this via turbolite_migrate_to_s3_primary
+    // before the builder opens, which sets journal_mode=OFF.
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
 
     let manifest_key = format!("{}{}/_manifest", prefix, db_name);
     let cached_version = match manifest_store.meta(&manifest_key).await? {
@@ -2077,7 +2023,6 @@ fn read_page_count_from_file(path: &Path) -> std::io::Result<u64> {
     Ok(page_count)
 }
 
-#[cfg(feature = "turbolite")]
 async fn run_manifest_poller_turbolite(
     inner: Arc<HaQLiteInner>,
     manifest_key: String,

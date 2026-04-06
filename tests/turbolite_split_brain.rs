@@ -6,7 +6,6 @@
 //!
 //! No S3 needed: turbolite uses StorageBackend::Local, walrust uses InMemoryStorage.
 
-#![cfg(feature = "turbolite")]
 
 mod common;
 
