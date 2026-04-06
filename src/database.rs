@@ -337,6 +337,8 @@ impl HaQLiteBuilder {
                 if let Some((vfs, vfs_name)) = self.turbolite_vfs {
                     return open_shared_turbolite(
                         lease_store, manifest_store, vfs, &vfs_name,
+                        replicator,
+                        walrust_storage,
                         db_path, &db_name, schema, &self.prefix, &instance_id,
                         poll_interval, write_timeout, self.read_concurrency,
                         lease_ttl,
@@ -904,40 +906,55 @@ impl HaQLite {
         let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
         match manifest_store.meta(&manifest_key).await {
             Ok(Some(meta)) if meta.version > cached => {
-                // Turbolite path: apply manifest to VFS + reopen connection
-                #[cfg(feature = "turbolite")]
-                if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
-                    if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
-                        if let hadb::StorageManifest::Turbolite { .. } = &ha_manifest.storage {
-                            let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
-                            vfs.set_manifest(tl_manifest);
-                            self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
-                            // No reopen needed. set_manifest evicts changed groups,
-                            // VFS will fetch from S3 on next read.
-                        }
-                    }
-                    return Ok(());
-                }
-
-                // Walrust path: restore from S3
+                // Unified walrust path: restore from S3 (works with or without turbolite VFS)
                 if let Some(ref rep) = self.inner.shared_replicator {
                     rep.restore(&self.inner.db_name, &self.inner.db_path).await
                         .map_err(|e| HaQLiteError::ReplicationError(
                             format!("ensure_fresh catch-up failed for '{}': {}", self.inner.db_name, e)
                         ))?;
                     self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
-                    // Re-register replicator after restore so sync() uses restored state
+
+                    // If turbolite VFS, sync bitmap after walrust restore
+                    #[cfg(feature = "turbolite")]
+                    if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
+                        let page_count = read_page_count_from_file(&self.inner.db_path).unwrap_or(0);
+                        if page_count > 0 {
+                            vfs.sync_after_external_restore(page_count);
+                        }
+                    }
+
                     let _ = rep.inner().remove(&self.inner.db_name).await;
                     if let Err(e) = rep.add(&self.inner.db_name, &self.inner.db_path).await {
                         return Err(HaQLiteError::ReplicationError(
-                            format!("re-register after ensure_fresh restore failed for '{}': {}", self.inner.db_name, e)
+                            format!("re-register after ensure_fresh restore for '{}': {}", self.inner.db_name, e)
                         ));
                     }
-                    // Reopen connection to see restored data
+
+                    // Reopen connection (via VFS URI if turbolite, else raw path)
+                    #[cfg(feature = "turbolite")]
+                    let new_conn = if let Some(ref vfs_name) = self.inner.shared_turbolite_vfs_name {
+                        let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
+                        rusqlite::Connection::open_with_flags(
+                            &vfs_uri,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                        ).map_err(|e| HaQLiteError::DatabaseError(
+                            format!("reopen via VFS after ensure_fresh for '{}': {}", self.inner.db_name, e)
+                        ))?
+                    } else {
+                        open_leader_connection(&self.inner.db_path)
+                            .map_err(|e| HaQLiteError::DatabaseError(
+                                format!("reopen after ensure_fresh for '{}': {}", self.inner.db_name, e)
+                            ))?
+                    };
+                    #[cfg(not(feature = "turbolite"))]
                     let new_conn = open_leader_connection(&self.inner.db_path)
                         .map_err(|e| HaQLiteError::DatabaseError(
-                            format!("reopen after ensure_fresh restore failed for '{}': {}", self.inner.db_name, e)
+                            format!("reopen after ensure_fresh for '{}': {}", self.inner.db_name, e)
                         ))?;
+                    new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                        .map_err(|e| HaQLiteError::DatabaseError(format!("WAL pragma: {}", e)))?;
                     self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
                 }
             }
@@ -951,11 +968,7 @@ impl HaQLite {
     // ========================================================================
 
     async fn execute_shared(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
-        // Dispatch to turbolite path if turbolite VFS is configured.
-        #[cfg(feature = "turbolite")]
-        if self.inner.shared_turbolite_vfs.is_some() {
-            return self.execute_shared_turbolite(sql, params).await;
-        }
+        // Unified path: walrust handles replication for both plain and turbolite-backed databases.
 
         let lease_store = self.inner.shared_lease_store.as_ref()
             .ok_or(HaQLiteError::ConfigurationError("shared_lease_store required in Shared mode".into()))?;
@@ -1062,6 +1075,16 @@ impl HaQLite {
                             format!("shared mode catch-up failed for '{}', refusing stale write: {}", self.inner.db_name, e)
                         ))?;
                     self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+
+                    // If turbolite VFS is present, sync bitmap after walrust restore
+                    #[cfg(feature = "turbolite")]
+                    if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
+                        let page_count = read_page_count_from_file(&self.inner.db_path).unwrap_or(0);
+                        if page_count > 0 {
+                            vfs.sync_after_external_restore(page_count);
+                        }
+                    }
+
                     // Re-register with replicator so sync() uses the restored state
                     let _ = replicator.inner().remove(&self.inner.db_name).await;
                     if let Err(e) = replicator.add(&self.inner.db_name, &self.inner.db_path).await {
@@ -1069,11 +1092,32 @@ impl HaQLite {
                             format!("re-register after restore failed for '{}': {}", self.inner.db_name, e)
                         ));
                     }
-                    // Reopen connection after restore
+
+                    // Reopen connection after restore (via VFS URI if turbolite, else raw path)
+                    #[cfg(feature = "turbolite")]
+                    let new_conn = if let Some(ref vfs_name) = self.inner.shared_turbolite_vfs_name {
+                        let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
+                        rusqlite::Connection::open_with_flags(
+                            &vfs_uri,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                        ).map_err(|e| HaQLiteError::DatabaseError(
+                            format!("reopen via VFS after catch-up for '{}': {}", self.inner.db_name, e)
+                        ))?
+                    } else {
+                        open_leader_connection(&self.inner.db_path)
+                            .map_err(|e| HaQLiteError::DatabaseError(
+                                format!("reopen after catch-up for '{}': {}", self.inner.db_name, e)
+                            ))?
+                    };
+                    #[cfg(not(feature = "turbolite"))]
                     let new_conn = open_leader_connection(&self.inner.db_path)
                         .map_err(|e| HaQLiteError::DatabaseError(
                             format!("reopen after catch-up for '{}': {}", self.inner.db_name, e)
                         ))?;
+                    new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                        .map_err(|e| HaQLiteError::DatabaseError(format!("WAL pragma: {}", e)))?;
                     self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
                 }
                 _ => {} // already up to date or no manifest
@@ -1787,6 +1831,8 @@ async fn open_shared_turbolite(
     manifest_store: Arc<dyn hadb::ManifestStore>,
     vfs: turbolite::tiered::SharedTurboliteVfs,
     vfs_name: &str,
+    replicator: Arc<SqliteReplicator>,
+    walrust_storage: Arc<dyn walrust::StorageBackend>,
     db_path: PathBuf,
     db_name: &str,
     schema: &str,
@@ -1797,13 +1843,7 @@ async fn open_shared_turbolite(
     read_concurrency: usize,
     lease_ttl: u64,
 ) -> Result<HaQLite> {
-    // Initial catch-up from manifest
-    let replicator = Arc::new(crate::turbolite_replicator::TurboliteReplicator::new(
-        vfs.clone(), manifest_store.clone(), prefix, db_name,
-    ));
-    let _ = replicator.pull(db_name, &db_path).await;
-
-    // Ensure schema via turbolite VFS connection
+    // Ensure schema via turbolite VFS connection first (creates the file)
     let vfs_uri = format!("file:{}?vfs={}", db_path.display(), vfs_name);
     {
         let conn = rusqlite::Connection::open_with_flags(
@@ -1815,12 +1855,29 @@ async fn open_shared_turbolite(
         conn.execute_batch(schema)?;
     }
 
+    // Initial catch-up via walrust: restore WAL frames to the raw cache file.
+    // walrust writes directly to db_path (turbolite's cache file).
+    if let Ok(Some(_txid)) = replicator.restore(db_name, &db_path).await {
+        // After walrust wrote pages to the cache file, sync turbolite's bitmap.
+        let page_count = read_page_count_from_file(&db_path).unwrap_or(0);
+        if page_count > 0 {
+            vfs.sync_after_external_restore(page_count);
+        }
+    }
+
+    // Register with walrust replicator (takes snapshot for subsequent WAL sync)
+    let _ = replicator.inner().remove(db_name).await;
+    if let Err(e) = replicator.add(db_name, &db_path).await {
+        tracing::warn!("walrust re-register after turbolite open: {}", e);
+    }
+
     // Open persistent connection via turbolite VFS
     let conn = rusqlite::Connection::open_with_flags(
         &vfs_uri,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
             | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
 
     let manifest_key = format!("{}{}/_manifest", prefix, db_name);
     let cached_version = match manifest_store.meta(&manifest_key).await? {
@@ -1841,12 +1898,12 @@ async fn open_shared_turbolite(
         read_semaphore: tokio::sync::Semaphore::new(read_concurrency),
         follower_caught_up: Arc::new(AtomicBool::new(true)),
         follower_replay_position: Arc::new(AtomicU64::new(0)),
-        // Shared mode fields
+        // Shared mode fields -- both walrust AND turbolite
         mode: HaMode::Shared,
         shared_lease_store: Some(lease_store),
         shared_manifest_store: Some(manifest_store.clone()),
-        shared_replicator: None, // walrust replicator not used
-        shared_walrust_storage: None,
+        shared_replicator: Some(replicator),
+        shared_walrust_storage: Some(walrust_storage),
         shared_prefix: prefix.to_string(),
         shared_instance_id: instance_id.to_string(),
         write_mutex: tokio::sync::Mutex::new(()),
@@ -1857,22 +1914,19 @@ async fn open_shared_turbolite(
         shared_turbolite_vfs_name: Some(vfs_name.to_string()),
     });
 
-    // Manifest poller (turbolite variant)
+    // Use standard manifest poller (walrust-based, not turbolite-based)
     let poller_inner = inner.clone();
+    let poller_db_name = db_name_owned.clone();
     let poller_manifest_key = manifest_key;
-    let poller_vfs = vfs.clone();
     let role_handle = tokio::spawn(async move {
-        run_manifest_poller_turbolite(
-            poller_inner, poller_manifest_key,
-            manifest_poll_interval, poller_vfs,
-        ).await;
+        run_manifest_poller(poller_inner, poller_db_name, poller_manifest_key, manifest_poll_interval).await;
     });
 
     // No forwarding server in Shared mode
     let fwd_handle = tokio::spawn(async {});
 
     tracing::info!(
-        "HaQLite opened in Shared+Turbolite mode: db='{}', manifest_poll={}ms",
+        "HaQLite opened in Shared+Turbolite+Walrust mode: db='{}', manifest_poll={}ms",
         db_name, manifest_poll_interval.as_millis(),
     );
 
@@ -1882,6 +1936,16 @@ async fn open_shared_turbolite(
         _role_handle: role_handle,
         closed: false,
     })
+}
+
+/// Read SQLite page count from database file header (bytes 28-31).
+fn read_page_count_from_file(path: &Path) -> std::io::Result<u64> {
+    use std::io::Read;
+    let mut header = [0u8; 100];
+    let mut f = std::fs::File::open(path)?;
+    f.read_exact(&mut header)?;
+    let page_count = u32::from_be_bytes([header[28], header[29], header[30], header[31]]) as u64;
+    Ok(page_count)
 }
 
 #[cfg(feature = "turbolite")]
