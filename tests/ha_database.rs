@@ -65,7 +65,7 @@ async fn single_node_local_mode() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("local.db");
 
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     // Execute a write.
     let rows = db
@@ -115,7 +115,7 @@ async fn single_node_execute_and_query() {
         "http://localhost:19001",
     );
 
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator,
         db_path.to_str().unwrap(),
         SCHEMA,
@@ -174,7 +174,7 @@ async fn two_node_forwarded_write() {
         "leader-node",
         "http://localhost:19010",
     );
-    let leader = HaQLite::from_coordinator(
+    let mut leader = HaQLite::from_coordinator(
         leader_coordinator,
         leader_path.to_str().unwrap(),
         SCHEMA,
@@ -195,7 +195,7 @@ async fn two_node_forwarded_write() {
         "follower-node",
         "http://localhost:19011",
     );
-    let follower = HaQLite::from_coordinator(
+    let mut follower = HaQLite::from_coordinator(
         follower_coordinator,
         follower_path.to_str().unwrap(),
         SCHEMA,
@@ -267,7 +267,7 @@ async fn forwarding_error_no_leader() {
         "orphan-node",
         "http://localhost:19020",
     );
-    let follower = HaQLite::from_coordinator(
+    let mut follower = HaQLite::from_coordinator(
         follower_coordinator,
         follower_path.to_str().unwrap(),
         SCHEMA,
@@ -297,7 +297,7 @@ async fn close_is_clean() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("clean.db");
 
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     db.execute(
         "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
@@ -313,7 +313,7 @@ async fn close_is_clean() {
     assert!(db_path.exists());
 
     // Can reopen.
-    let db2 = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db2 = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
     let count: i64 = db2
         .query_row("SELECT COUNT(*) FROM test_data", &[], |r| r.get(0))
         .unwrap();
@@ -341,7 +341,7 @@ async fn auth_rejects_wrong_secret() {
         "auth-leader",
         "http://localhost:19030",
     );
-    let leader = HaQLite::from_coordinator_with_secret(
+    let mut leader = HaQLite::from_coordinator_with_secret(
         leader_coordinator,
         leader_path.to_str().unwrap(),
         SCHEMA,
@@ -362,7 +362,7 @@ async fn auth_rejects_wrong_secret() {
         "auth-follower",
         "http://localhost:19031",
     );
-    let follower = HaQLite::from_coordinator_with_secret(
+    let mut follower = HaQLite::from_coordinator_with_secret(
         follower_coordinator,
         follower_path.to_str().unwrap(),
         SCHEMA,
@@ -413,7 +413,7 @@ async fn auth_accepts_correct_secret() {
         "auth-ok-leader",
         "http://localhost:19040",
     );
-    let leader = HaQLite::from_coordinator_with_secret(
+    let mut leader = HaQLite::from_coordinator_with_secret(
         leader_coordinator,
         leader_path.to_str().unwrap(),
         SCHEMA,
@@ -433,7 +433,7 @@ async fn auth_accepts_correct_secret() {
         "auth-ok-follower",
         "http://localhost:19041",
     );
-    let follower = HaQLite::from_coordinator_with_secret(
+    let mut follower = HaQLite::from_coordinator_with_secret(
         follower_coordinator,
         follower_path.to_str().unwrap(),
         SCHEMA,
@@ -623,7 +623,7 @@ async fn error_execute_on_follower_with_dead_leader_returns_leader_unavailable()
     let coordinator = build_coordinator(
         walrust_storage, lease_store, "orphan", "http://localhost:19050",
     );
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator, follower_path.to_str().unwrap(), SCHEMA, 19050, Duration::from_millis(500),
     )
     .await
@@ -648,7 +648,7 @@ async fn error_execute_on_follower_with_dead_leader_returns_leader_unavailable()
 async fn error_query_row_bad_sql_returns_database_error() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("err.db");
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     let result: std::result::Result<i64, HaQLiteError> =
         db.query_row("SELECT * FROM nonexistent_table", &[], |r| r.get(0));
@@ -667,7 +667,7 @@ async fn error_query_row_bad_sql_returns_database_error() {
 async fn error_execute_bad_sql_returns_database_error() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("err.db");
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     let result = db
         .execute("INSERT INTO nonexistent (x) VALUES (1)", &[])
@@ -687,7 +687,7 @@ async fn error_execute_bad_sql_returns_database_error() {
 async fn error_query_values_bad_sql_returns_database_error() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("err.db");
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     let result = db.query_values("INVALID SQL GARBAGE", &[]);
 
@@ -715,7 +715,7 @@ async fn retry_forwarding_does_not_retry_4xx() {
     let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
-    let leader = HaQLite::from_coordinator_with_secret(
+    let mut leader = HaQLite::from_coordinator_with_secret(
         build_coordinator(walrust_storage.clone(), lease_store.clone(), "l", "http://localhost:19060"),
         leader_dir.join("ha.db").to_str().unwrap(),
         SCHEMA, 19060, Duration::from_secs(5), Some("secret".into()),
@@ -725,7 +725,7 @@ async fn retry_forwarding_does_not_retry_4xx() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let follower = HaQLite::from_coordinator_with_secret(
+    let mut follower = HaQLite::from_coordinator_with_secret(
         build_coordinator(walrust_storage.clone(), lease_store.clone(), "f", "http://localhost:19061"),
         follower_dir.join("ha.db").to_str().unwrap(),
         SCHEMA, 19061, Duration::from_secs(1), Some("wrong-secret".into()),
@@ -767,7 +767,7 @@ async fn retry_forwarding_succeeds_on_first_attempt() {
     let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
-    let leader = HaQLite::from_coordinator(
+    let mut leader = HaQLite::from_coordinator(
         build_coordinator(walrust_storage.clone(), lease_store.clone(), "l", "http://localhost:19070"),
         leader_dir.join("ha.db").to_str().unwrap(),
         SCHEMA, 19070, Duration::from_secs(5),
@@ -777,7 +777,7 @@ async fn retry_forwarding_succeeds_on_first_attempt() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let follower = HaQLite::from_coordinator(
+    let mut follower = HaQLite::from_coordinator(
         build_coordinator(walrust_storage.clone(), lease_store.clone(), "f", "http://localhost:19071"),
         follower_dir.join("ha.db").to_str().unwrap(),
         SCHEMA, 19071, Duration::from_secs(5),
@@ -831,7 +831,7 @@ async fn retry_forwarding_retries_on_connection_error() {
     let coordinator = build_coordinator(
         walrust_storage, lease_store, "retry-node", "http://localhost:19080",
     );
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator, follower_path.to_str().unwrap(), SCHEMA, 19080, Duration::from_millis(200),
     )
     .await
@@ -865,7 +865,7 @@ async fn retry_forwarding_retries_on_connection_error() {
 async fn semaphore_does_not_block_leader_reads() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("sem.db");
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     // Leader reads should work regardless of semaphore state.
     db.execute("INSERT INTO test_data (id, value) VALUES (1, 'a')", &[])
@@ -885,7 +885,7 @@ async fn semaphore_does_not_block_leader_reads() {
 async fn semaphore_query_values_also_bounded() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("sem.db");
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     db.execute("INSERT INTO test_data (id, value) VALUES (1, 'a')", &[])
         .await
@@ -907,7 +907,7 @@ async fn close_then_reopen_preserves_data() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("persist.db");
 
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
     for i in 1..=10 {
         db.execute(
             "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
@@ -919,7 +919,7 @@ async fn close_then_reopen_preserves_data() {
     db.close().await.unwrap();
 
     // Reopen and verify all data persisted.
-    let db2 = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db2 = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
     let count: i64 = db2.query_row("SELECT COUNT(*) FROM test_data", &[], |r| r.get(0)).unwrap();
     assert_eq!(count, 10);
     db2.close().await.unwrap();
@@ -936,7 +936,7 @@ async fn close_ha_node_is_clean() {
     let coordinator = build_coordinator(
         walrust_storage, lease_store, "close-node", "http://localhost:19090",
     );
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator, db_path.to_str().unwrap(), SCHEMA, 19090, Duration::from_secs(5),
     )
     .await
@@ -961,7 +961,7 @@ async fn close_ha_node_is_clean() {
 async fn execute_empty_params() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("edge.db");
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     // Execute with no params.
     db.execute("INSERT INTO test_data (id, value) VALUES (1, 'bare')", &[])
@@ -978,7 +978,7 @@ async fn execute_empty_params() {
 async fn query_values_empty_result() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("edge.db");
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     let rows = db.query_values("SELECT * FROM test_data WHERE id = 999", &[]).unwrap();
     assert!(rows.is_empty());
@@ -1011,7 +1011,7 @@ async fn error_not_leader_when_no_address() {
     let coordinator = build_coordinator(
         walrust_storage, lease_store, "no-addr-node", "http://localhost:19100",
     );
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator, follower_path.to_str().unwrap(), SCHEMA, 19100, Duration::from_secs(1),
     )
     .await
@@ -1035,7 +1035,7 @@ async fn error_not_leader_when_no_address() {
 async fn handoff_on_local_mode_returns_false() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("local.db");
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     let result = db.handoff().await.unwrap();
     assert!(!result); // local mode has no coordinator
@@ -1051,7 +1051,7 @@ async fn handoff_on_local_mode_returns_false() {
 async fn leader_is_always_caught_up() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("leader.db");
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     assert!(db.is_caught_up());
     assert_eq!(db.replay_position(), 0);
@@ -1070,7 +1070,7 @@ async fn ha_leader_is_caught_up() {
     let coordinator = build_coordinator(
         walrust_storage, lease_store, "leader", "http://localhost:19110",
     );
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator, db_path.to_str().unwrap(), SCHEMA, 19110, Duration::from_secs(5),
     )
     .await
@@ -1093,7 +1093,7 @@ async fn prometheus_contains_readiness_gauges() {
     let coordinator = build_coordinator(
         walrust_storage, lease_store, "prom-node", "http://localhost:19120",
     );
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator, db_path.to_str().unwrap(), SCHEMA, 19120, Duration::from_secs(5),
     )
     .await
@@ -1112,7 +1112,7 @@ async fn prometheus_contains_readiness_gauges() {
 async fn local_mode_no_prometheus_metrics() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("local.db");
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     assert!(db.prometheus_metrics().is_none());
 
@@ -1136,7 +1136,7 @@ async fn regression_hadb_prometheus_has_nonzero_caught_up_for_leader() {
     let coordinator = build_coordinator(
         walrust_storage, lease_store, "prom-regression", "http://localhost:19130",
     );
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator, db_path.to_str().unwrap(), SCHEMA, 19130, Duration::from_secs(5),
     )
     .await
@@ -1167,7 +1167,7 @@ async fn regression_close_completes_fully() {
     let coordinator = build_coordinator(
         walrust_storage, lease_store, "close-regression", "http://localhost:19140",
     );
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator, db_path.to_str().unwrap(), SCHEMA, 19140, Duration::from_secs(5),
     )
     .await
@@ -1191,7 +1191,7 @@ async fn regression_close_completes_fully() {
 async fn error_query_values_on_nonexistent_table() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("err.db");
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     let result = db.query_values("SELECT * FROM nonexistent_table", &[]);
     match result {
@@ -1215,7 +1215,7 @@ async fn handoff_ha_leader_succeeds() {
     let coordinator = build_coordinator(
         walrust_storage, lease_store, "handoff-leader", "http://localhost:19150",
     );
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator, db_path.to_str().unwrap(), SCHEMA, 19150, Duration::from_secs(5),
     )
     .await
@@ -1245,7 +1245,7 @@ async fn handoff_preserves_data() {
     let coordinator = build_coordinator(
         walrust_storage, lease_store, "handoff-data", "http://localhost:19160",
     );
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator, db_path.to_str().unwrap(), SCHEMA, 19160, Duration::from_secs(5),
     )
     .await

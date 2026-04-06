@@ -366,10 +366,36 @@ impl HaQLiteBuilder {
 ///
 /// Create via `HaQLite::builder("bucket").open(path, schema).await?`
 /// or `HaQLite::local(path, schema)?` for single-node mode.
+/// HA SQLite database with transparent write forwarding, local reads, and automatic failover.
+///
+/// **You MUST call [`.close().await`](HaQLite::close) before dropping.** If dropped without
+/// close(), background tasks are aborted and the lease is not cleanly released, which may
+/// block other nodes from acquiring the lease until TTL expires.
+///
+/// Create via `HaQLite::builder("bucket").open(path, schema).await?`
+/// or `HaQLite::local(path, schema)?` for single-node mode.
 pub struct HaQLite {
     inner: Arc<HaQLiteInner>,
     _fwd_handle: tokio::task::JoinHandle<()>,
     _role_handle: tokio::task::JoinHandle<()>,
+    closed: bool,
+}
+
+impl Drop for HaQLite {
+    fn drop(&mut self) {
+        if !self.closed {
+            // Abort background tasks so they don't leak.
+            // Note: this does NOT cleanly release the lease. Call close().await for that.
+            self._fwd_handle.abort();
+            self._role_handle.abort();
+            self.inner.read_semaphore.close();
+            tracing::warn!(
+                "HaQLite dropped without close() for '{}'. Background tasks aborted, lease not cleanly released. \
+                 Call .close().await before dropping for clean shutdown.",
+                self.inner.db_name,
+            );
+        }
+    }
 }
 
 /// Internal state shared between HaQLite, forwarding handler, and role listener.
@@ -523,6 +549,7 @@ impl HaQLite {
             inner,
             _fwd_handle: fwd_handle,
             _role_handle: role_handle,
+            closed: false,
         })
     }
 
@@ -591,11 +618,15 @@ impl HaQLite {
         }
     }
 
-    /// Query a single row. Always executes locally.
+    /// Query a single row from local state. Does NOT catch up from manifest.
     ///
-    /// On the leader: uses the persistent rw connection.
-    /// On a follower: opens a fresh read-only connection (sees LTX updates).
-    pub fn query_row<T, F>(
+    /// **In Shared mode, this may return stale data.** If another node has written
+    /// since this node last caught up, `query_row_local` will not see those writes.
+    /// Use [`query_row_fresh`] for consistency in Shared mode.
+    ///
+    /// In Dedicated mode: leader reads from persistent connection, follower opens
+    /// a fresh read-only connection (sees walrust LTX updates).
+    pub fn query_row_local<T, F>(
         &self,
         sql: &str,
         params: &[&dyn rusqlite::types::ToSql],
@@ -640,11 +671,27 @@ impl HaQLite {
         }
     }
 
-    /// Query and return rows as Vec<Vec<SqlValue>>. Always executes locally.
+    /// Deprecated: use [`query_row_local`] (stale reads ok) or [`query_row_fresh`] (consistency required).
+    #[deprecated(note = "use query_row_local (stale reads ok) or query_row_fresh (consistency required)")]
+    pub fn query_row<T, F>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::types::ToSql],
+        f: F,
+    ) -> std::result::Result<T, HaQLiteError>
+    where
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.query_row_local(sql, params, f)
+    }
+
+    /// Query rows from local state. Does NOT catch up from manifest.
+    ///
+    /// **In Shared mode, this may return stale data.** Use [`query_values_fresh`] for consistency.
     ///
     /// Returns all matching rows. Each row is a Vec of column values.
     /// Returns an empty Vec if no rows match (not an error).
-    pub fn query_values(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
+    pub fn query_values_local(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
         let rusqlite_params: Vec<rusqlite::types::Value> =
             params.iter().map(|p| p.to_rusqlite()).collect();
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -706,6 +753,12 @@ impl HaQLite {
                 query_with(&conn)
             }
         }
+    }
+
+    /// Deprecated: use [`query_values_local`] (stale reads ok) or [`query_values_fresh`] (consistency required).
+    #[deprecated(note = "use query_values_local (stale reads ok) or query_values_fresh (consistency required)")]
+    pub fn query_values(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
+        self.query_values_local(sql, params)
     }
 
     /// Get the current role of this node.
@@ -787,7 +840,15 @@ impl HaQLite {
     }
 
     /// Cleanly shut down: drain in-flight operations, leave cluster, abort background tasks.
-    pub async fn close(self) -> std::result::Result<(), HaQLiteError> {
+    ///
+    /// Must be called before dropping. If not called, Drop will abort tasks and log a warning,
+    /// but the lease will not be cleanly released.
+    pub async fn close(&mut self) -> std::result::Result<(), HaQLiteError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+
         // 1. Close read semaphore -- new reads get EngineClosed immediately.
         self.inner.read_semaphore.close();
 
@@ -802,17 +863,15 @@ impl HaQLite {
                 .map_err(|e| HaQLiteError::CoordinatorError(e.to_string()))?;
         }
 
-        // 4. Abort background tasks and wait for them to finish.
+        // 4. Abort background tasks.
         self._fwd_handle.abort();
         self._role_handle.abort();
-        let _ = self._fwd_handle.await;
-        let _ = self._role_handle.await;
 
         Ok(())
     }
 
     /// Read with freshness guarantee: checks manifest and catches up before querying.
-    /// In Dedicated mode, this is equivalent to `query_row()`.
+    /// In Dedicated mode, this is equivalent to `query_row_local()`.
     pub async fn query_row_fresh<T, F>(
         &self, sql: &str, params: &[&dyn rusqlite::types::ToSql], f: F,
     ) -> std::result::Result<T, HaQLiteError>
@@ -820,7 +879,7 @@ impl HaQLite {
         F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     {
         self.ensure_fresh().await?;
-        self.query_row(sql, params, f)
+        self.query_row_local(sql, params, f)
     }
 
     /// Read with freshness guarantee (multi-row version).
@@ -828,7 +887,7 @@ impl HaQLite {
         &self, sql: &str, params: &[SqlValue],
     ) -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
         self.ensure_fresh().await?;
-        self.query_values(sql, params)
+        self.query_values_local(sql, params)
     }
 
     /// Check manifest freshness and catch up if stale.
@@ -1481,6 +1540,7 @@ async fn open_with_coordinator(
         inner,
         _fwd_handle: fwd_handle,
         _role_handle: role_handle,
+        closed: false,
     })
 }
 
@@ -1630,6 +1690,7 @@ async fn open_shared(
         inner,
         _fwd_handle: fwd_handle,
         _role_handle: role_handle,
+        closed: false,
     })
 }
 
@@ -1776,6 +1837,7 @@ async fn open_shared_turbolite(
         inner,
         _fwd_handle: fwd_handle,
         _role_handle: role_handle,
+        closed: false,
     })
 }
 

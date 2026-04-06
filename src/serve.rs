@@ -214,7 +214,7 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
     info!("shutting down");
 
     match Arc::try_unwrap(db) {
-        Ok(db) => {
+        Ok(mut db) => {
             if let Err(e) = db.close().await {
                 error!("failed to close haqlite: {e}");
             }

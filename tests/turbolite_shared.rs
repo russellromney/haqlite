@@ -68,7 +68,7 @@ async fn turbolite_shared_single_write_read() {
     let manifest_store = Arc::new(InMemoryManifestStore::new());
     let vfs_name = format!("tl_single_{}", std::process::id());
 
-    let db = build_turbolite_shared(
+    let mut db = build_turbolite_shared(
         tmp.path(),
         "test",
         lease_store,
@@ -102,7 +102,7 @@ async fn turbolite_shared_manifest_published_after_write() {
     let manifest_store = Arc::new(InMemoryManifestStore::new());
     let vfs_name = format!("tl_manifest_{}", std::process::id());
 
-    let db = build_turbolite_shared(
+    let mut db = build_turbolite_shared(
         tmp.path(),
         "test",
         lease_store,
@@ -147,7 +147,7 @@ async fn turbolite_shared_sequential_writes_increment_manifest() {
     let manifest_store = Arc::new(InMemoryManifestStore::new());
     let vfs_name = format!("tl_seq_{}", std::process::id());
 
-    let db = build_turbolite_shared(
+    let mut db = build_turbolite_shared(
         tmp.path(),
         "test",
         lease_store,
@@ -190,7 +190,7 @@ async fn turbolite_shared_manifest_has_turbolite_fields() {
     let manifest_store = Arc::new(InMemoryManifestStore::new());
     let vfs_name = format!("tl_fields_{}", std::process::id());
 
-    let db = build_turbolite_shared(
+    let mut db = build_turbolite_shared(
         tmp.path(),
         "test",
         lease_store,
@@ -309,7 +309,7 @@ async fn turbolite_shared_empty_table_read() {
     let manifest_store = Arc::new(InMemoryManifestStore::new());
     let vfs_name = format!("tl_empty_{}", std::process::id());
 
-    let db = build_turbolite_shared(
+    let mut db = build_turbolite_shared(
         tmp.path(),
         "test",
         lease_store,
@@ -333,7 +333,7 @@ async fn turbolite_shared_manifest_writer_id_set() {
     let manifest_store = Arc::new(InMemoryManifestStore::new());
     let vfs_name = format!("tl_writer_{}", std::process::id());
 
-    let db = build_turbolite_shared(
+    let mut db = build_turbolite_shared(
         tmp.path(),
         "test",
         lease_store,

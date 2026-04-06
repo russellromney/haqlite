@@ -368,7 +368,7 @@ async fn many_writers_short_lease_no_corruption() {
 
         handles.push(tokio::spawn(async move {
             let tmp = TempDir::new().expect("tmp");
-            let db = build_node(
+            let mut db = build_node(
                 &tmp, "stress", storage, lease_store, manifest_store,
                 &format!("node-{}", node_id), 2, 10,
             ).await;

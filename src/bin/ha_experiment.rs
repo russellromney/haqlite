@@ -384,7 +384,7 @@ async fn main() -> Result<()> {
     // HaQLite handles cleanup: close connection, leave cluster, abort tasks.
     // We need to unwrap the Arc first.
     match Arc::try_unwrap(db) {
-        Ok(db) => {
+        Ok(mut db) => {
             if let Err(e) = db.close().await {
                 error!("Failed to close HaQLite: {}", e);
             }

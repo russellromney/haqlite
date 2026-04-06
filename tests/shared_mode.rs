@@ -51,7 +51,7 @@ async fn shared_single_node_write_read() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-    let db = build_shared(&tmp, "test", storage, lease_store, manifest_store.clone(), "node-1").await;
+    let mut db = build_shared(&tmp, "test", storage, lease_store, manifest_store.clone(), "node-1").await;
 
     // Write
     let rows = db.execute(
@@ -77,7 +77,7 @@ async fn shared_sequential_writes_increment_manifest() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-    let db = build_shared(&tmp, "test", storage, lease_store, manifest_store.clone(), "node-1").await;
+    let mut db = build_shared(&tmp, "test", storage, lease_store, manifest_store.clone(), "node-1").await;
 
     for i in 0..3 {
         db.execute(
@@ -102,7 +102,7 @@ async fn shared_mode_no_forwarding_server() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-    let db = build_shared(&tmp, "test", storage, lease_store, manifest_store, "node-1").await;
+    let mut db = build_shared(&tmp, "test", storage, lease_store, manifest_store, "node-1").await;
 
     // If forwarding server was started, this test would fail on port conflict
     // when run in parallel with other tests using the same port.
@@ -122,7 +122,7 @@ async fn dedicated_local_mode_still_works() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("local.db");
 
-    let db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     let rows = db.execute(
         "INSERT INTO t VALUES (?1, ?2)",
@@ -245,7 +245,7 @@ async fn shared_manifest_version_tracks_writes() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-    let db = build_shared(&tmp, "test", storage, lease_store, manifest_store.clone(), "node-1").await;
+    let mut db = build_shared(&tmp, "test", storage, lease_store, manifest_store.clone(), "node-1").await;
 
     db.execute("INSERT INTO t VALUES (1, 'v1')", &[]).await.unwrap();
 
@@ -466,7 +466,7 @@ async fn test_stress_many_sequential_writes() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-    let db = build_shared(&tmp, "seq50", storage, lease_store, manifest_store.clone(), "node-1").await;
+    let mut db = build_shared(&tmp, "seq50", storage, lease_store, manifest_store.clone(), "node-1").await;
 
     for i in 0..50 {
         db.execute(
@@ -516,7 +516,7 @@ async fn test_write_timeout_lease_contention() {
 
     // Build node with very short write_timeout
     let db_path = tmp.path().join("contention.db");
-    let db = HaQLite::builder("test-bucket")
+    let mut db = HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
         .lease_store(lease_store)
@@ -642,7 +642,7 @@ async fn test_manifest_version_monotonicity() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-    let db = build_shared(&tmp, "mono", storage, lease_store, manifest_store.clone(), "node-1").await;
+    let mut db = build_shared(&tmp, "mono", storage, lease_store, manifest_store.clone(), "node-1").await;
 
     let mut prev_version = 0u64;
     for i in 1..=10 {
@@ -711,7 +711,7 @@ async fn test_write_empty_params() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-    let db = build_shared(&tmp, "empty_params", storage, lease_store, manifest_store.clone(), "node-1").await;
+    let mut db = build_shared(&tmp, "empty_params", storage, lease_store, manifest_store.clone(), "node-1").await;
 
     let rows = db.execute("INSERT INTO t VALUES (1, 'no_params')", &[]).await.unwrap();
     assert_eq!(rows, 1);

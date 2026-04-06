@@ -98,3 +98,5 @@ tower = { version = "0.5", features = ["util"] }
 http = "1"
 http-body-util = "0.1"
 axum = "0.8"
+proptest = "1.5"
+proptest-derive = "0.5"

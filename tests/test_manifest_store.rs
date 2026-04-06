@@ -35,7 +35,7 @@ async fn dedicated_mode_with_manifest_store() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-    let db = HaQLite::builder("test-bucket")
+    let mut db = HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Dedicated)
         .lease_store(lease_store)
@@ -68,7 +68,7 @@ async fn dedicated_mode_without_manifest_store_still_works() {
     let storage = Arc::new(InMemoryStorage::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
 
-    let db = HaQLite::builder("test-bucket")
+    let mut db = HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Dedicated)
         .lease_store(lease_store)
@@ -105,7 +105,7 @@ async fn shared_mode_manifest_published_on_write() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-    let db = HaQLite::builder("test-bucket")
+    let mut db = HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
         .lease_store(lease_store)
@@ -150,7 +150,7 @@ async fn shared_mode_sequential_writes_increment_manifest_version() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-    let db = HaQLite::builder("test-bucket")
+    let mut db = HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
         .lease_store(lease_store)
@@ -215,7 +215,7 @@ async fn shared_mode_two_writers_see_each_others_data() {
     .expect("insert from writer 1");
 
     // Writer 2 opens and writes (should catch up from manifest first)
-    let db2 = HaQLite::builder("test-bucket")
+    let mut db2 = HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
         .lease_store(lease_store.clone())

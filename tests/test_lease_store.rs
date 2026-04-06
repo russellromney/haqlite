@@ -143,7 +143,7 @@ async fn custom_lease_store_is_used() {
         "http://localhost:19100",
     );
 
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator,
         db_path.to_str().unwrap(),
         SCHEMA,
@@ -210,7 +210,7 @@ async fn builder_lease_store_method_compiles_and_sets() {
         "http://localhost:19101",
     );
 
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator,
         db_path.to_str().unwrap(),
         SCHEMA,
@@ -246,7 +246,7 @@ async fn lease_renewal_uses_custom_store() {
         "http://localhost:19104",
     );
 
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator,
         db_path.to_str().unwrap(),
         SCHEMA,
@@ -296,7 +296,7 @@ async fn two_nodes_custom_lease_store() {
         "leader-node",
         "http://localhost:19110",
     );
-    let leader = HaQLite::from_coordinator(
+    let mut leader = HaQLite::from_coordinator(
         leader_coordinator,
         leader_path.to_str().unwrap(),
         SCHEMA,
@@ -316,7 +316,7 @@ async fn two_nodes_custom_lease_store() {
         "follower-node",
         "http://localhost:19111",
     );
-    let follower = HaQLite::from_coordinator(
+    let mut follower = HaQLite::from_coordinator(
         follower_coordinator,
         follower_path.to_str().unwrap(),
         SCHEMA,
@@ -363,7 +363,7 @@ async fn default_lease_store_still_works() {
         "http://localhost:19102",
     );
 
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator,
         db_path.to_str().unwrap(),
         SCHEMA,
@@ -439,7 +439,7 @@ async fn nats_lease_store_integration() {
         "http://localhost:19103",
     );
 
-    let db = HaQLite::from_coordinator(
+    let mut db = HaQLite::from_coordinator(
         coordinator,
         db_path.to_str().unwrap(),
         SCHEMA,
