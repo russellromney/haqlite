@@ -851,23 +851,24 @@ impl HaQLite {
 
                 // Walrust path: restore from S3
                 if let Some(ref rep) = self.inner.shared_replicator {
-                    match rep.restore(&self.inner.db_name, &self.inner.db_path).await {
-                        Ok(_) => {
-                            self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
-                            // Re-register replicator after restore so sync() uses restored state
-                            let _ = rep.inner().remove(&self.inner.db_name).await;
-                            if let Err(e) = rep.add(&self.inner.db_name, &self.inner.db_path).await {
-                                tracing::warn!("re-register after restore in ensure_fresh failed: {}", e);
-                            }
-                            // Reopen connection to see new data
-                            if let Ok(new_conn) = open_leader_connection(&self.inner.db_path) {
-                                self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("ensure_fresh catch-up failed: {}", e);
-                        }
+                    rep.restore(&self.inner.db_name, &self.inner.db_path).await
+                        .map_err(|e| HaQLiteError::ReplicationError(
+                            format!("ensure_fresh catch-up failed for '{}': {}", self.inner.db_name, e)
+                        ))?;
+                    self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                    // Re-register replicator after restore so sync() uses restored state
+                    let _ = rep.inner().remove(&self.inner.db_name).await;
+                    if let Err(e) = rep.add(&self.inner.db_name, &self.inner.db_path).await {
+                        return Err(HaQLiteError::ReplicationError(
+                            format!("re-register after ensure_fresh restore failed for '{}': {}", self.inner.db_name, e)
+                        ));
                     }
+                    // Reopen connection to see restored data
+                    let new_conn = open_leader_connection(&self.inner.db_path)
+                        .map_err(|e| HaQLiteError::DatabaseError(
+                            format!("reopen after ensure_fresh restore failed for '{}': {}", self.inner.db_name, e)
+                        ))?;
+                    self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
                 }
             }
             _ => {}
@@ -986,23 +987,24 @@ impl HaQLite {
             match manifest_store.meta(&manifest_key).await {
                 Ok(Some(meta)) if meta.version > cached_version => {
                     // Restore from S3 (full snapshot + incrementals from all writers)
-                    match replicator.restore(&self.inner.db_name, &self.inner.db_path).await {
-                        Ok(_) => {
-                            self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
-                            // Re-register with replicator so sync() uses the restored state
-                            let _ = replicator.inner().remove(&self.inner.db_name).await;
-                            if let Err(e) = replicator.add(&self.inner.db_name, &self.inner.db_path).await {
-                                tracing::warn!("re-register after restore failed: {}", e);
-                            }
-                            // Reopen connection after restore
-                            let new_conn = open_leader_connection(&self.inner.db_path)
-                                .map_err(|e| HaQLiteError::DatabaseError(format!("reopen after catch-up: {}", e)))?;
-                            self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
-                        }
-                        Err(e) => {
-                            tracing::warn!("shared mode catch-up failed (proceeding): {}", e);
-                        }
+                    replicator.restore(&self.inner.db_name, &self.inner.db_path).await
+                        .map_err(|e| HaQLiteError::ReplicationError(
+                            format!("shared mode catch-up failed for '{}', refusing stale write: {}", self.inner.db_name, e)
+                        ))?;
+                    self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                    // Re-register with replicator so sync() uses the restored state
+                    let _ = replicator.inner().remove(&self.inner.db_name).await;
+                    if let Err(e) = replicator.add(&self.inner.db_name, &self.inner.db_path).await {
+                        return Err(HaQLiteError::ReplicationError(
+                            format!("re-register after restore failed for '{}': {}", self.inner.db_name, e)
+                        ));
                     }
+                    // Reopen connection after restore
+                    let new_conn = open_leader_connection(&self.inner.db_path)
+                        .map_err(|e| HaQLiteError::DatabaseError(
+                            format!("reopen after catch-up for '{}': {}", self.inner.db_name, e)
+                        ))?;
+                    self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
                 }
                 _ => {} // already up to date or no manifest
             }
