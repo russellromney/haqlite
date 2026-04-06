@@ -50,10 +50,12 @@ fn unique_prefix(name: &str) -> String {
 }
 
 /// Build a turbolite-backed shared mode node with S3 storage.
+/// Each node gets its own S3 prefix (turbolite is single-writer per VFS).
+/// Shared mode coordination happens via lease_store + manifest_store.
 async fn build_tl_node(
     cache_dir: &std::path::Path,
     db_name: &str,
-    s3_prefix: &str,
+    s3_prefix_base: &str,
     lease_store: Arc<InMemoryLeaseStore>,
     manifest_store: Arc<InMemoryManifestStore>,
     instance_id: &str,
@@ -61,9 +63,11 @@ async fn build_tl_node(
     write_timeout_secs: u64,
 ) -> HaQLite {
     let vfs_name = unique_vfs(&format!("tl_sb_{}", instance_id));
+    // Each node gets its own S3 prefix so page group writes don't collide
+    let node_prefix = format!("{}/{}", s3_prefix_base, instance_id);
     let config = TurboliteConfig {
         bucket: test_bucket(),
-        prefix: s3_prefix.to_string(),
+        prefix: node_prefix,
         cache_dir: cache_dir.to_path_buf(),
         endpoint_url: endpoint_url(),
         region: Some("auto".to_string()),
