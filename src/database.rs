@@ -904,7 +904,7 @@ impl HaQLite {
         let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
         match manifest_store.meta(&manifest_key).await {
             Ok(Some(meta)) if meta.version > cached => {
-                // Turbolite path: apply manifest to VFS + reopen connection via VFS
+                // Turbolite path: apply manifest to VFS + flush SQLite page cache
                 #[cfg(feature = "turbolite")]
                 if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
                     if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
@@ -912,20 +912,12 @@ impl HaQLite {
                             let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
                             vfs.set_manifest(tl_manifest);
                             self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
-                            // Reopen via turbolite VFS so SQLite sees new pages
-                            if let Some(ref vfs_name) = self.inner.shared_turbolite_vfs_name {
-                                let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
-                                let new_conn = rusqlite::Connection::open_with_flags(
-                                    &vfs_uri,
-                                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                                        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                                        | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-                                ).map_err(|e| HaQLiteError::DatabaseError(
-                                    format!("reopen after turbolite ensure_fresh for '{}': {}", self.inner.db_name, e)
-                                ))?;
-                                new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
-                                    .map_err(|e| HaQLiteError::DatabaseError(format!("WAL pragma: {}", e)))?;
-                                self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
+                            // Flush SQLite page cache so it re-reads from VFS
+                            if let Ok(Some(conn_arc)) = self.inner.get_conn() {
+                                let conn = conn_arc.lock()
+                                    .map_err(|_| HaQLiteError::DatabaseError("lock poisoned during ensure_fresh flush".into()))?;
+                                let _ = conn.cache_flush();
+                                let _ = conn.execute_batch("PRAGMA shrink_memory");
                             }
                         }
                     }
@@ -1268,33 +1260,29 @@ impl HaQLite {
         let cached_version = self.inner.cached_manifest_version.load(Ordering::SeqCst);
 
         let result: std::result::Result<u64, HaQLiteError> = async {
-            // 3. Catch up from manifest (apply turbolite manifest to VFS)
-            match manifest_store.meta(&manifest_key).await {
-                Ok(Some(meta)) if meta.version > cached_version => {
-                    if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
-                        if let hadb::StorageManifest::Turbolite { .. } = &ha_manifest.storage {
-                            let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
-                            vfs.set_manifest(tl_manifest);
-                            self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
-                            // Reopen connection via turbolite VFS so SQLite picks up new pages.
-                            let vfs_name = self.inner.shared_turbolite_vfs_name.as_ref()
-                                .ok_or(HaQLiteError::ConfigurationError("turbolite VFS name required for reopen".into()))?;
-                            let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
-                            let new_conn = rusqlite::Connection::open_with_flags(
-                                &vfs_uri,
-                                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-                            ).map_err(|e| HaQLiteError::DatabaseError(
-                                format!("reopen after turbolite catch-up for '{}': {}", self.inner.db_name, e)
-                            ))?;
-                            new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
-                                .map_err(|e| HaQLiteError::DatabaseError(format!("WAL pragma after catch-up: {}", e)))?;
-                            self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
-                        }
+            // 3. Catch up from manifest (apply turbolite manifest to VFS).
+            // ALWAYS catch up after acquiring lease.
+            eprintln!("[tl-shared] {} catch-up: checking manifest '{}'", self.inner.shared_instance_id, manifest_key);
+            if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
+                eprintln!("[tl-shared] {} catch-up: got manifest v{}, writer='{}'",
+                    self.inner.shared_instance_id, ha_manifest.version, ha_manifest.writer_id);
+                if let hadb::StorageManifest::Turbolite { .. } = &ha_manifest.storage {
+                    let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
+                    vfs.set_manifest(tl_manifest);
+                    if let Ok(Some(meta)) = manifest_store.meta(&manifest_key).await {
+                        self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                    }
+                    // Flush SQLite's page cache so it re-reads from VFS (which now
+                    // serves the new manifest's pages from S3). No connection reopen
+                    // needed since the VFS handle shares shared_manifest.
+                    if let Ok(Some(conn_arc)) = self.inner.get_conn() {
+                        let conn = conn_arc.lock()
+                            .map_err(|_| HaQLiteError::DatabaseError("lock poisoned during catch-up flush".into()))?;
+                        // shrink_memory releases SQLite's page cache
+                        let _ = conn.cache_flush();
+                        let _ = conn.execute_batch("PRAGMA shrink_memory");
                     }
                 }
-                _ => {} // already up to date or no manifest
             }
 
             // Re-read cached_version after catch-up
@@ -1319,6 +1307,9 @@ impl HaQLite {
 
             // 5. Publish manifest with turbolite state
             let tl_manifest = vfs.manifest();
+            eprintln!("[tl-shared] {} publish: vfs manifest v{}, page_count={}, {} page_group_keys",
+                self.inner.shared_instance_id, tl_manifest.version, tl_manifest.page_count,
+                tl_manifest.page_group_keys.len());
             let storage = crate::turbolite_replicator::turbolite_to_ha_storage(&tl_manifest);
             let new_manifest = hadb::HaManifest {
                 version: 0, // store assigns version
