@@ -301,9 +301,9 @@ impl HaQLiteBuilder {
         match self.mode {
             HaMode::Dedicated => {
                 let walrust_storage = walrust_storage_opt
-                    .expect("Dedicated mode requires walrust storage");
+                    .ok_or_else(|| anyhow::anyhow!("Dedicated mode requires walrust storage"))?;
                 let replicator = replicator
-                    .expect("Dedicated mode requires walrust replicator");
+                    .ok_or_else(|| anyhow::anyhow!("Dedicated mode requires walrust replicator"))?;
                 let follower_behavior = Arc::new(SqliteFollowerBehavior::new(walrust_storage));
 
                 // Build hadb Coordinator.
@@ -332,7 +332,7 @@ impl HaQLiteBuilder {
             }
             HaMode::Shared => {
                 let manifest_store = self.manifest_store
-                    .expect("Shared mode requires manifest_store");
+                    .ok_or_else(|| anyhow::anyhow!("Shared mode requires manifest_store"))?;
                 let poll_interval = self.manifest_poll_interval
                     .unwrap_or(Duration::from_secs(1));
                 let write_timeout = self.write_timeout
@@ -351,9 +351,9 @@ impl HaQLiteBuilder {
                     ).await;
                 }
                 let replicator = replicator
-                    .expect("Shared mode without turbolite requires walrust replicator");
+                    .ok_or_else(|| anyhow::anyhow!("Shared mode without turbolite requires walrust replicator"))?;
                 let walrust_storage = walrust_storage_opt
-                    .expect("Shared mode without turbolite requires walrust storage");
+                    .ok_or_else(|| anyhow::anyhow!("Shared mode without turbolite requires walrust storage"))?;
                 open_shared(
                     lease_store,
                     manifest_store,
@@ -1892,7 +1892,7 @@ async fn open_shared_turbolite(
     // cache file (data.cache). Both walrust and turbolite see the same page data.
     // The WAL file (tl_seq.db-wal) is created by turbolite's passthrough handle.
     let cache_file = vfs.cache_file_path();
-    if cache_file.exists() && !db_path.exists() || db_path.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+    if cache_file.exists() && (!db_path.exists() || db_path.metadata().map(|m| m.len()).unwrap_or(0) == 0) {
         // Link db_path to data.cache so walrust reads/writes the same data
         let _ = std::fs::remove_file(&db_path); // remove empty placeholder
         std::fs::hard_link(&cache_file, &db_path)
@@ -2023,47 +2023,6 @@ fn read_page_count_from_file(path: &Path) -> std::io::Result<u64> {
     Ok(page_count)
 }
 
-async fn run_manifest_poller_turbolite(
-    inner: Arc<HaQLiteInner>,
-    manifest_key: String,
-    poll_interval: Duration,
-    vfs: turbolite::tiered::SharedTurboliteVfs,
-) {
-    let mut interval = tokio::time::interval(poll_interval);
-    loop {
-        interval.tick().await;
-        if let Some(ref ms) = inner.shared_manifest_store {
-            match ms.meta(&manifest_key).await {
-                Ok(Some(meta)) => {
-                    let cached = inner.cached_manifest_version.load(Ordering::SeqCst);
-                    if meta.version > cached {
-                        match ms.get(&manifest_key).await {
-                            Ok(Some(ha_manifest)) => {
-                                if let hadb::StorageManifest::Turbolite { .. } = &ha_manifest.storage {
-                                    let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
-                                    vfs.set_manifest(tl_manifest);
-                                    inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
-                                    tracing::debug!(
-                                        "turbolite manifest poller: caught up to v{}",
-                                        meta.version,
-                                    );
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::error!("turbolite manifest poller: get failed: {}", e);
-                            }
-                        }
-                    }
-                }
-                Ok(None) => {} // no manifest yet
-                Err(e) => {
-                    tracing::error!("turbolite manifest poller: meta check failed: {}", e);
-                }
-            }
-        }
-    }
-}
 
 // ============================================================================
 // Helpers
