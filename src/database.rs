@@ -1125,7 +1125,23 @@ impl HaQLite {
             // 3. Catch up from manifest
             match manifest_store.meta(&manifest_key).await {
                 Ok(Some(meta)) if meta.version > cached_version => {
-                    // Restore from S3 (full snapshot + incrementals from all writers)
+                    // For TurboliteWalrust (Mode I), apply turbolite base state first
+                    #[cfg(feature = "turbolite")]
+                    if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
+                        if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
+                            let is_tl = matches!(
+                                &ha_manifest.storage,
+                                hadb::StorageManifest::Turbolite { .. }
+                                | hadb::StorageManifest::TurboliteWalrust { .. }
+                            );
+                            if is_tl {
+                                let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
+                                vfs.set_manifest(tl_manifest);
+                            }
+                        }
+                    }
+
+                    // Walrust restore: download WAL frames (deltas since last checkpoint)
                     let wp = self.inner.walrust_path();
                     replicator.restore(&self.inner.db_name, &wp).await
                         .map_err(|e| HaQLiteError::ReplicationError(
@@ -1142,14 +1158,9 @@ impl HaQLite {
                         }
                     }
 
-                    // Re-register with replicator. Use add_without_snapshot to avoid
-                    // uploading a new snapshot that could race with other nodes' changesets.
-                    // walrust's flush() will upload changesets relative to the restored state.
-                    let _ = replicator.inner().remove(&self.inner.db_name).await;
-                    replicator.add(&self.inner.db_name, &wp).await
-                        .map_err(|e| HaQLiteError::ReplicationError(
-                            format!("re-register after restore failed for '{}': {}", self.inner.db_name, e)
-                        ))?;
+                    // Don't remove+add: the existing registration is still valid.
+                    // walrust restore updated the local file. flush() reads the WAL
+                    // file from offset 0 and uploads new frames.
 
                     // Reopen connection after restore (via VFS URI if turbolite, else raw path)
                     #[cfg(feature = "turbolite")]
@@ -1229,20 +1240,40 @@ impl HaQLite {
             // 6. Publish manifest
             let current_seq = replicator.inner().current_seq(&self.inner.db_name).await.unwrap_or(0);
             let changeset_prefix = format!("{}{}/", self.inner.shared_prefix, self.inner.db_name);
-            let new_manifest = hadb::HaManifest {
-                version: 0, // store assigns version
-                writer_id: self.inner.shared_instance_id.clone(),
-                lease_epoch: 0,
-                timestamp_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default().as_millis() as u64,
-                storage: hadb::StorageManifest::Walrust {
+
+            // Build storage manifest: TurboliteWalrust if turbolite VFS present, else Walrust
+            #[cfg(feature = "turbolite")]
+            let storage = if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
+                let tl_manifest = vfs.manifest();
+                crate::turbolite_replicator::turbolite_walrust_to_ha_storage(
+                    &tl_manifest, current_seq, &changeset_prefix,
+                )
+            } else {
+                hadb::StorageManifest::Walrust {
                     txid: current_seq,
                     changeset_prefix: changeset_prefix.clone(),
                     latest_changeset_key: format!("{}0000/{:016x}.hadbp", changeset_prefix, current_seq),
                     snapshot_key: None,
                     snapshot_txid: None,
-                },
+                }
+            };
+            #[cfg(not(feature = "turbolite"))]
+            let storage = hadb::StorageManifest::Walrust {
+                txid: current_seq,
+                changeset_prefix: changeset_prefix.clone(),
+                latest_changeset_key: format!("{}0000/{:016x}.hadbp", changeset_prefix, current_seq),
+                snapshot_key: None,
+                snapshot_txid: None,
+            };
+
+            let new_manifest = hadb::HaManifest {
+                version: 0,
+                writer_id: self.inner.shared_instance_id.clone(),
+                lease_epoch: 0,
+                timestamp_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_millis() as u64,
+                storage,
             };
             let expected_version = if cached_version > 0 { Some(cached_version) } else { None };
             match manifest_store.put(&manifest_key, &new_manifest, expected_version).await {
@@ -1938,14 +1969,24 @@ async fn open_shared_turbolite(
             }
         }
 
-        // Initial walrust restore
-        if let Ok(Some(_txid)) = rep.restore(db_name, &db_path).await {
-            let page_count = read_page_count_from_file(&db_path).unwrap_or(0);
-            if page_count > 0 {
-                vfs.sync_after_external_restore(page_count);
+        // Initial walrust restore. If data exists, use add_without_snapshot
+        // (turbolite page groups are the base state, no walrust snapshot needed).
+        // If no data (first node), use add() to create the initial snapshot.
+        let restored = match rep.restore(db_name, &db_path).await {
+            Ok(Some(_txid)) => {
+                let page_count = read_page_count_from_file(&db_path).unwrap_or(0);
+                if page_count > 0 {
+                    vfs.sync_after_external_restore(page_count);
+                }
+                true
             }
+            _ => false,
+        };
+        if restored {
+            rep.add_without_snapshot(db_name, &db_path).await
+        } else {
+            rep.add(db_name, &db_path).await
         }
-        rep.add(db_name, &db_path).await
             .map_err(|e| anyhow::anyhow!("walrust add failed for '{}': {}", db_name, e))?;
     }
 
