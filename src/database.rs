@@ -84,6 +84,7 @@ pub struct HaQLiteBuilder {
     manifest_poll_interval: Option<Duration>,
     write_timeout: Option<Duration>,
     walrust_storage: Option<Arc<dyn walrust::StorageBackend>>,
+    lease_ttl: Option<u64>,
     #[cfg(feature = "turbolite")]
     turbolite_vfs: Option<(turbolite::tiered::SharedTurboliteVfs, String)>,
 }
@@ -107,6 +108,7 @@ impl HaQLiteBuilder {
             manifest_poll_interval: None,
             write_timeout: None,
             walrust_storage: None,
+            lease_ttl: None,
             #[cfg(feature = "turbolite")]
             turbolite_vfs: None,
         }
@@ -199,6 +201,13 @@ impl HaQLiteBuilder {
     /// Write timeout for lease acquisition in Shared mode. Default: 5s.
     pub fn write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = Some(timeout);
+        self
+    }
+
+    /// Lease TTL in seconds for Shared mode. Default: 5.
+    /// Lower values make lease expiration faster (useful for testing).
+    pub fn lease_ttl(mut self, ttl_secs: u64) -> Self {
+        self.lease_ttl = Some(ttl_secs);
         self
     }
 
@@ -331,6 +340,7 @@ impl HaQLiteBuilder {
                     ).await;
                 }
 
+                let lease_ttl = self.lease_ttl.unwrap_or(5);
                 open_shared(
                     lease_store,
                     manifest_store,
@@ -344,6 +354,7 @@ impl HaQLiteBuilder {
                     poll_interval,
                     write_timeout,
                     self.read_concurrency,
+                    lease_ttl,
                 )
                 .await
             }
@@ -996,12 +1007,50 @@ impl HaQLite {
                 _ => {} // already up to date or no manifest
             }
 
+            // Re-read cached_version after catch-up (catch-up may have updated the atomic)
+            let cached_version = self.inner.cached_manifest_version.load(Ordering::SeqCst);
+
             // 4. Execute SQL locally
             let rows = self.execute_local(sql, params)?;
 
             // 5. Checkpoint: flush WAL to S3
             replicator.sync(&self.inner.db_name).await
                 .map_err(|e| HaQLiteError::ReplicationError(format!("checkpoint failed: {}", e)))?;
+
+            // 5b. Re-validate lease after sync. If the lease expired during
+            // the (potentially slow) sync, another node may have acquired it
+            // and published a new manifest. Proceeding would overwrite their
+            // work or leave our write unreachable.
+            match lease_store.read(&lease_key).await {
+                Ok(Some((data, _etag))) => {
+                    if let Ok(lease_json) = serde_json::from_slice::<serde_json::Value>(&data) {
+                        let holder = lease_json.get("instance_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if holder != self.inner.shared_instance_id {
+                            // Lease was taken by another node during sync
+                            return Err(HaQLiteError::LeaseContention(
+                                format!(
+                                    "lease lost during sync for '{}': held by '{}', we are '{}'",
+                                    self.inner.db_name, holder, self.inner.shared_instance_id,
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Lease deleted (expired and cleaned up)
+                    return Err(HaQLiteError::LeaseContention(
+                        format!("lease disappeared during sync for '{}'", self.inner.db_name),
+                    ));
+                }
+                Err(e) => {
+                    // Can't verify lease; fail safe
+                    return Err(HaQLiteError::LeaseContention(
+                        format!("lease re-validation failed for '{}': {}", self.inner.db_name, e),
+                    ));
+                }
+            }
 
             // 6. Publish manifest
             let current_seq = replicator.inner().current_seq(&self.inner.db_name).await.unwrap_or(0);
@@ -1028,14 +1077,19 @@ impl HaQLite {
                     self.inner.cached_manifest_version.store(new_version, Ordering::SeqCst);
                 }
                 Ok(_) => {
-                    // CAS failed: refresh version for next attempt
+                    // CAS failed: another writer published between our lease check and
+                    // manifest publish. Our write is in S3 but not discoverable.
                     if let Ok(Some(meta)) = manifest_store.meta(&manifest_key).await {
                         self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
                     }
-                    tracing::warn!("manifest publish CAS failed for '{}' (stale writer?)", self.inner.db_name);
+                    return Err(HaQLiteError::ReplicationError(
+                        format!("manifest publish CAS failed for '{}': write committed locally but not published", self.inner.db_name),
+                    ));
                 }
                 Err(e) => {
-                    tracing::error!("manifest publish failed for '{}': {}", self.inner.db_name, e);
+                    return Err(HaQLiteError::ReplicationError(
+                        format!("manifest publish failed for '{}': {}", self.inner.db_name, e),
+                    ));
                 }
             }
 
@@ -1143,6 +1197,9 @@ impl HaQLite {
                 _ => {} // already up to date or no manifest
             }
 
+            // Re-read cached_version after catch-up
+            let cached_version = self.inner.cached_manifest_version.load(Ordering::SeqCst);
+
             // 4. Execute SQL locally
             let rows = self.execute_local(sql, params)?;
 
@@ -1158,6 +1215,35 @@ impl HaQLite {
                     .unwrap_or_default().as_millis() as u64,
                 storage,
             };
+            // 5b. Re-validate lease before publishing (turbolite path).
+            match lease_store.read(&lease_key).await {
+                Ok(Some((data, _etag))) => {
+                    if let Ok(lease_json) = serde_json::from_slice::<serde_json::Value>(&data) {
+                        let holder = lease_json.get("instance_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if holder != self.inner.shared_instance_id {
+                            return Err(HaQLiteError::LeaseContention(
+                                format!(
+                                    "lease lost during write for '{}': held by '{}', we are '{}'",
+                                    self.inner.db_name, holder, self.inner.shared_instance_id,
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    return Err(HaQLiteError::LeaseContention(
+                        format!("lease disappeared during write for '{}'", self.inner.db_name),
+                    ));
+                }
+                Err(e) => {
+                    return Err(HaQLiteError::LeaseContention(
+                        format!("lease re-validation failed for '{}': {}", self.inner.db_name, e),
+                    ));
+                }
+            }
+
             let expected_version = if cached_version > 0 { Some(cached_version) } else { None };
             match manifest_store.put(&manifest_key, &new_manifest, expected_version).await {
                 Ok(cas) if cas.success => {
@@ -1165,14 +1251,17 @@ impl HaQLite {
                     self.inner.cached_manifest_version.store(new_version, Ordering::SeqCst);
                 }
                 Ok(_) => {
-                    // CAS failed: refresh version for next attempt
                     if let Ok(Some(meta)) = manifest_store.meta(&manifest_key).await {
                         self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
                     }
-                    tracing::warn!("manifest publish CAS failed for '{}' (stale writer?)", self.inner.db_name);
+                    return Err(HaQLiteError::ReplicationError(
+                        format!("manifest publish CAS failed for '{}': write committed locally but not published", self.inner.db_name),
+                    ));
                 }
                 Err(e) => {
-                    tracing::error!("manifest publish failed for '{}': {}", self.inner.db_name, e);
+                    return Err(HaQLiteError::ReplicationError(
+                        format!("manifest publish failed for '{}': {}", self.inner.db_name, e),
+                    ));
                 }
             }
 
@@ -1451,6 +1540,7 @@ async fn open_shared(
     manifest_poll_interval: Duration,
     write_timeout: Duration,
     read_concurrency: usize,
+    lease_ttl: u64,
 ) -> Result<HaQLite> {
     ensure_schema(&db_path, schema)?;
 
@@ -1497,7 +1587,7 @@ async fn open_shared(
         write_mutex: tokio::sync::Mutex::new(()),
         cached_manifest_version: AtomicU64::new(cached_version),
         write_timeout,
-        lease_ttl: 5,
+        lease_ttl,
         #[cfg(feature = "turbolite")]
         shared_turbolite_vfs: None,
         #[cfg(feature = "turbolite")]
