@@ -1970,17 +1970,26 @@ async fn open_shared_turbolite(
         }
 
         // Initial walrust restore (downloads WAL frames from storage).
-        if let Ok(Some(_txid)) = rep.restore(db_name, &db_path).await {
-            let page_count = read_page_count_from_file(&db_path).unwrap_or(0);
-            if page_count > 0 {
-                vfs.sync_after_external_restore(page_count);
+        let has_walrust_data = match rep.restore(db_name, &db_path).await {
+            Ok(Some(_txid)) => {
+                let page_count = read_page_count_from_file(&db_path).unwrap_or(0);
+                if page_count > 0 {
+                    vfs.sync_after_external_restore(page_count);
+                }
+                true
             }
-        }
+            _ => false,
+        };
 
-        // Register without snapshot. turbolite page groups are the base state.
-        // add_without_snapshot loads current_seq from storage so flush() starts
-        // at the right seq number.
-        rep.add_without_snapshot(db_name, &db_path).await
+        // Register with walrust. If data already exists in storage (another node
+        // uploaded a snapshot), use add_without_snapshot to avoid overwriting.
+        // If no data (first node ever), use add() to create the initial snapshot
+        // that establishes the changeset chain base.
+        if has_walrust_data {
+            rep.add_without_snapshot(db_name, &db_path).await
+        } else {
+            rep.add(db_name, &db_path).await
+        }
             .map_err(|e| anyhow::anyhow!("walrust add failed for '{}': {}", db_name, e))?;
     }
 
