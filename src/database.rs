@@ -444,20 +444,26 @@ impl HaQLiteInner {
         );
     }
 
-    fn leader_addr(&self) -> String {
-        self.leader_address.read().unwrap().clone()
+    fn leader_addr(&self) -> std::result::Result<String, HaQLiteError> {
+        self.leader_address.read()
+            .map(|g| g.clone())
+            .map_err(|_| HaQLiteError::DatabaseError("leader_address lock poisoned".into()))
     }
 
     fn set_leader_addr(&self, addr: String) {
-        *self.leader_address.write().unwrap() = addr;
+        *self.leader_address.write()
+            .expect("leader_address write lock poisoned") = addr;
     }
 
     fn set_conn(&self, conn: Option<Arc<Mutex<rusqlite::Connection>>>) {
-        *self.conn.write().unwrap() = conn;
+        *self.conn.write()
+            .expect("conn write lock poisoned") = conn;
     }
 
-    pub(crate) fn get_conn(&self) -> Option<Arc<Mutex<rusqlite::Connection>>> {
-        self.conn.read().unwrap().clone()
+    pub(crate) fn get_conn(&self) -> std::result::Result<Option<Arc<Mutex<rusqlite::Connection>>>, HaQLiteError> {
+        self.conn.read()
+            .map(|g| g.clone())
+            .map_err(|_| HaQLiteError::DatabaseError("conn lock poisoned".into()))
     }
 }
 
@@ -604,9 +610,10 @@ impl HaQLite {
             Some(Role::Leader) | None => {
                 let conn_arc = self
                     .inner
-                    .get_conn()
+                    .get_conn()?
                     .ok_or(HaQLiteError::DatabaseError("No connection available".into()))?;
-                let conn = conn_arc.lock().unwrap();
+                let conn = conn_arc.lock()
+                    .map_err(|_| HaQLiteError::DatabaseError("connection lock poisoned".into()))?;
                 conn.query_row(sql, params, f)
                     .map_err(|e| HaQLiteError::DatabaseError(format!("query_row failed: {e}")))
             }
@@ -676,9 +683,10 @@ impl HaQLite {
             Some(Role::Leader) | None => {
                 let conn_arc = self
                     .inner
-                    .get_conn()
+                    .get_conn()?
                     .ok_or(HaQLiteError::DatabaseError("No connection available".into()))?;
-                let conn = conn_arc.lock().unwrap();
+                let conn = conn_arc.lock()
+                    .map_err(|_| HaQLiteError::DatabaseError("connection lock poisoned".into()))?;
                 query_with(&conn)
             }
             Some(Role::Follower) => {
@@ -888,13 +896,13 @@ impl HaQLite {
         }
 
         let lease_store = self.inner.shared_lease_store.as_ref()
-            .expect("shared_lease_store required in Shared mode");
+            .ok_or(HaQLiteError::ConfigurationError("shared_lease_store required in Shared mode".into()))?;
         let manifest_store = self.inner.shared_manifest_store.as_ref()
-            .expect("shared_manifest_store required in Shared mode");
+            .ok_or(HaQLiteError::ConfigurationError("shared_manifest_store required in Shared mode".into()))?;
         let replicator = self.inner.shared_replicator.as_ref()
-            .expect("shared_replicator required in Shared mode");
+            .ok_or(HaQLiteError::ConfigurationError("shared_replicator required in Shared mode".into()))?;
         let walrust_storage = self.inner.shared_walrust_storage.as_ref()
-            .expect("shared_walrust_storage required in Shared mode");
+            .ok_or(HaQLiteError::ConfigurationError("shared_walrust_storage required in Shared mode".into()))?;
 
         // 1. Serialize writes on this node
         let _write_guard = self.inner.write_mutex.lock().await;
@@ -1110,11 +1118,11 @@ impl HaQLite {
     #[cfg(feature = "turbolite")]
     async fn execute_shared_turbolite(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
         let lease_store = self.inner.shared_lease_store.as_ref()
-            .expect("shared_lease_store required in Shared mode");
+            .ok_or(HaQLiteError::ConfigurationError("shared_lease_store required in Shared mode".into()))?;
         let manifest_store = self.inner.shared_manifest_store.as_ref()
-            .expect("shared_manifest_store required in Shared mode");
+            .ok_or(HaQLiteError::ConfigurationError("shared_manifest_store required in Shared mode".into()))?;
         let vfs = self.inner.shared_turbolite_vfs.as_ref()
-            .expect("shared_turbolite_vfs required for turbolite path");
+            .ok_or(HaQLiteError::ConfigurationError("shared_turbolite_vfs required for turbolite path".into()))?;
 
         // 1. Serialize writes on this node
         let _write_guard = self.inner.write_mutex.lock().await;
@@ -1281,9 +1289,10 @@ impl HaQLite {
     fn execute_local(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
         let conn_arc = self
             .inner
-            .get_conn()
+            .get_conn()?
             .ok_or(HaQLiteError::DatabaseError("No write connection available (not leader?)".into()))?;
-        let conn = conn_arc.lock().unwrap();
+        let conn = conn_arc.lock()
+            .map_err(|_| HaQLiteError::DatabaseError("write connection lock poisoned".into()))?;
 
         let values: Vec<rusqlite::types::Value> = params.iter().map(|p| p.to_rusqlite()).collect();
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -1297,7 +1306,7 @@ impl HaQLite {
     }
 
     async fn execute_forwarded(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
-        let leader_addr = self.inner.leader_addr();
+        let leader_addr = self.inner.leader_addr()?;
         if leader_addr.is_empty() {
             return Err(HaQLiteError::NotLeader);
         }
@@ -1338,23 +1347,28 @@ impl HaQLite {
                 let result: forwarding::ExecuteResult = resp
                     .json()
                     .await
-                    .map_err(|e| HaQLiteError::LeaderUnavailable(format!("Failed to parse leader response: {e}")))?;
+                    .map_err(|e| HaQLiteError::LeaderResponseParseError(
+                        format!("failed to parse leader response: {e}")
+                    ))?;
                 return Ok(result.rows_affected);
             }
 
             let body_text = resp.text().await.unwrap_or_default();
 
-            // Don't retry 4xx -- client errors won't succeed on retry.
+            // Don't retry 4xx: client errors (bad SQL, auth) won't succeed on retry.
             if status.is_client_error() {
-                return Err(HaQLiteError::LeaderUnavailable(format!("Leader returned {status}: {body_text}")));
+                return Err(HaQLiteError::LeaderClientError {
+                    status: status.as_u16(),
+                    body: body_text,
+                });
             }
 
-            // 5xx -- retry with backoff.
-            last_err = format!("Leader returned {status}: {body_text}");
+            // 5xx: retry with backoff.
+            last_err = format!("{status}: {body_text}");
         }
 
-        Err(HaQLiteError::LeaderUnavailable(format!(
-            "All forwarding attempts failed: {last_err}"
+        Err(HaQLiteError::LeaderConnectionError(format!(
+            "all {} forwarding attempts failed: {last_err}", backoffs.len() + 1
         )))
     }
 }

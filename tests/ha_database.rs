@@ -634,10 +634,11 @@ async fn error_execute_on_follower_with_dead_leader_returns_leader_unavailable()
         .execute("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
         .await;
 
-    // Must be LeaderUnavailable, not a generic error.
+    // Must be a leader connection/server error, not a generic error.
     match result {
-        Err(HaQLiteError::LeaderUnavailable(_)) => {}
-        other => panic!("Expected LeaderUnavailable, got {:?}", other),
+        Err(HaQLiteError::LeaderConnectionError(_)) => {}
+        Err(HaQLiteError::LeaderServerError { .. }) => {}
+        other => panic!("Expected LeaderConnectionError or LeaderServerError, got {:?}", other),
     }
 
     db.close().await.unwrap();
@@ -738,13 +739,13 @@ async fn retry_forwarding_does_not_retry_4xx() {
         .await;
     let elapsed = start.elapsed();
 
-    // Should fail with LeaderUnavailable (4xx from auth rejection).
+    // Should fail with LeaderClientError (4xx from auth rejection).
     assert!(result.is_err());
     match result {
-        Err(HaQLiteError::LeaderUnavailable(msg)) => {
-            assert!(msg.contains("401"), "got: {msg}");
+        Err(HaQLiteError::LeaderClientError { status, .. }) => {
+            assert_eq!(status, 401, "expected 401, got {status}");
         }
-        other => panic!("Expected LeaderUnavailable with 401, got {:?}", other),
+        other => panic!("Expected LeaderClientError with 401, got {:?}", other),
     }
 
     // Should NOT have retried (4xx) -- well under 100ms backoff.
@@ -844,10 +845,10 @@ async fn retry_forwarding_retries_on_connection_error() {
 
     assert!(result.is_err());
     match result {
-        Err(HaQLiteError::LeaderUnavailable(msg)) => {
-            assert!(msg.contains("All forwarding attempts failed"), "got: {msg}");
+        Err(HaQLiteError::LeaderConnectionError(msg)) => {
+            assert!(msg.contains("forwarding attempts failed"), "got: {msg}");
         }
-        other => panic!("Expected LeaderUnavailable, got {:?}", other),
+        other => panic!("Expected LeaderConnectionError, got {:?}", other),
     }
 
     // Should have retried: 0ms + 100ms + 400ms + 1600ms = ~2100ms minimum.
@@ -1021,7 +1022,7 @@ async fn error_not_leader_when_no_address() {
         .execute("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
         .await;
 
-    // Should be NotLeader (empty address), not LeaderUnavailable (connection failed).
+    // Should be NotLeader (empty address), not LeaderConnectionError (connection failed).
     match result {
         Err(HaQLiteError::NotLeader) => {}
         other => panic!("Expected NotLeader, got {:?}", other),
