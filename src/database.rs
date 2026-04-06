@@ -1369,7 +1369,6 @@ impl HaQLite {
                     // VFS::open uses warm reconnect (no S3 fetch) since
                     // eager_index_load=false avoids group 0 eager fetch.
                     self.inner.set_conn(None);
-                    turbolite::clear_all_caches();
                     let vfs_name = self.inner.shared_turbolite_vfs_name.as_ref()
                         .ok_or(HaQLiteError::ConfigurationError("VFS name required".into()))?;
                     let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
@@ -1941,7 +1940,8 @@ async fn open_shared_turbolite(
     }
 
     // Clear in-process locks from schema connection before opening persistent connection
-    turbolite::clear_all_caches();
+    // Note: turbolite should release in-process locks on connection close.
+    // If "database is locked" occurs here, it's a turbolite VFS bug.
 
     // Open persistent connection via turbolite VFS
     let conn = rusqlite::Connection::open_with_flags(
