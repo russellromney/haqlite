@@ -935,7 +935,27 @@ impl HaQLite {
         let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
         match manifest_store.meta(&manifest_key).await {
             Ok(Some(meta)) if meta.version > cached => {
-                // Unified walrust path: restore from S3 (works with or without turbolite VFS)
+                // Turbolite-only path (Mode F): catch up via set_manifest
+                #[cfg(feature = "turbolite")]
+                if self.inner.shared_replicator.is_none() {
+                    if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
+                        if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
+                            let is_tl = matches!(
+                                &ha_manifest.storage,
+                                hadb::StorageManifest::Turbolite { .. }
+                                | hadb::StorageManifest::TurboliteWalrust { .. }
+                            );
+                            if is_tl {
+                                let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
+                                vfs.set_manifest(tl_manifest);
+                                self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+
+                // Walrust path (Mode C/D/I/J): restore from S3
                 if let Some(ref rep) = self.inner.shared_replicator {
                     let wp = self.inner.walrust_path();
                     rep.restore(&self.inner.db_name, &wp).await
@@ -1338,23 +1358,49 @@ impl HaQLite {
 
         let result: std::result::Result<u64, HaQLiteError> = async {
             // 3. Catch up from manifest (apply turbolite manifest to VFS).
-            // set_manifest updates the VFS to point at the previous writer's S3 page groups.
-            // It writes page 0 (db_header) to local cache and evicts changed groups.
-            // With journal_mode=OFF (S3Primary), SQLite re-reads page 0 on every statement,
-            // so no connection reopen needed.
+            tracing::debug!(" {} catch-up: manifest_key={}, cached_version={}",
+                self.inner.shared_instance_id, manifest_key, cached_version);
             if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
+                tracing::debug!(" {} catch-up: got manifest v{} writer={}, storage={:?}",
+                    self.inner.shared_instance_id, ha_manifest.version, ha_manifest.writer_id,
+                    std::mem::discriminant(&ha_manifest.storage));
                 // Accept both Turbolite and TurboliteWalrust manifest variants
                 let is_turbolite = matches!(
                     &ha_manifest.storage,
                     hadb::StorageManifest::Turbolite { .. }
                     | hadb::StorageManifest::TurboliteWalrust { .. }
                 );
+                tracing::debug!(" {} is_turbolite={}", self.inner.shared_instance_id, is_turbolite);
                 if is_turbolite {
                     let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
+                    tracing::debug!(" {} calling set_manifest: v={}, page_count={}, {} keys, {} override groups",
+                        self.inner.shared_instance_id, tl_manifest.version, tl_manifest.page_count,
+                        tl_manifest.page_group_keys.len(),
+                        tl_manifest.subframe_overrides.iter().filter(|o| !o.is_empty()).count());
                     vfs.set_manifest(tl_manifest);
                     if let Ok(Some(meta)) = manifest_store.meta(&manifest_key).await {
                         self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
                     }
+                    // Reopen connection to drop SQLite pager cache.
+                    // set_manifest evicted changed groups from turbolite cache.
+                    // SQLite's pager still holds stale pages. Must reopen.
+                    // VFS::open uses warm reconnect (no S3 fetch) since
+                    // eager_index_load=false avoids group 0 eager fetch.
+                    self.inner.set_conn(None);
+                    let vfs_name = self.inner.shared_turbolite_vfs_name.as_ref()
+                        .ok_or(HaQLiteError::ConfigurationError("VFS name required".into()))?;
+                    let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
+                    let new_conn = rusqlite::Connection::open_with_flags(
+                        &vfs_uri,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                    ).map_err(|e| HaQLiteError::DatabaseError(
+                        format!("reopen after set_manifest for '{}': {}", self.inner.db_name, e)
+                    ))?;
+                    new_conn.execute_batch("PRAGMA journal_mode=OFF;")
+                        .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma: {}", e)))?;
+                    self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
                 }
             }
 
@@ -1364,7 +1410,9 @@ impl HaQLite {
             // 4. Execute SQL locally.
             // In S3Primary mode, the turbolite VFS uploads dirty subframes to S3
             // during xSync (triggered by SQLite's auto-commit). No separate checkpoint needed.
+            tracing::debug!(" {} executing: {}", self.inner.shared_instance_id, sql);
             let rows = self.execute_local(sql, params)?;
+            tracing::debug!(" {} executed, rows={}", self.inner.shared_instance_id, rows);
 
             // 5. Publish manifest with turbolite state (page groups now include the write)
             let tl_manifest = vfs.manifest();

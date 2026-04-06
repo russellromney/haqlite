@@ -89,6 +89,7 @@ impl Replicator for TurboliteReplicator {
 /// Convert a turbolite Manifest to hadb StorageManifest::Turbolite.
 pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> StorageManifest {
     StorageManifest::Turbolite {
+        turbolite_version: m.version,
         page_count: m.page_count,
         page_size: m.page_size,
         pages_per_group: m.pages_per_group,
@@ -163,6 +164,7 @@ pub fn turbolite_walrust_to_ha_storage(
     walrust_changeset_prefix: &str,
 ) -> StorageManifest {
     StorageManifest::TurboliteWalrust {
+        turbolite_version: m.version,
         page_count: m.page_count,
         page_size: m.page_size,
         pages_per_group: m.pages_per_group,
@@ -197,17 +199,17 @@ pub fn turbolite_walrust_to_ha_storage(
 pub fn ha_storage_to_turbolite(storage: &StorageManifest) -> TurboliteManifest {
     match storage {
         StorageManifest::Turbolite {
-            page_count, page_size, pages_per_group, sub_pages_per_frame,
+            turbolite_version, page_count, page_size, pages_per_group, sub_pages_per_frame,
             strategy: _, page_group_keys, frame_tables, group_pages, btrees,
             interior_chunk_keys, index_chunk_keys, subframe_overrides, db_header,
         }
         | StorageManifest::TurboliteWalrust {
-            page_count, page_size, pages_per_group, sub_pages_per_frame,
+            turbolite_version, page_count, page_size, pages_per_group, sub_pages_per_frame,
             strategy: _, page_group_keys, frame_tables, group_pages, btrees,
             interior_chunk_keys, index_chunk_keys, subframe_overrides, db_header,
             walrust_txid: _, walrust_changeset_prefix: _,
         } => TurboliteManifest {
-            version: 0,
+            version: *turbolite_version,
             change_counter: 0,
             page_count: *page_count,
             page_size: *page_size,
