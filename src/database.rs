@@ -249,11 +249,26 @@ impl HaQLiteBuilder {
         });
 
         // Build walrust storage backend (injected for tests, S3 by default).
-        let walrust_storage: Arc<dyn walrust::StorageBackend> = match self.walrust_storage {
-            Some(storage) => storage,
-            None => Arc::new(
-                walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
-            ),
+        // For Mode F (turbolite without explicit walrust_storage), skip S3 creation.
+        let has_walrust = self.walrust_storage.is_some();
+        let walrust_storage_opt: Option<Arc<dyn walrust::StorageBackend>> = match self.walrust_storage {
+            Some(storage) => Some(storage),
+            None => {
+                #[cfg(feature = "turbolite")]
+                if self.turbolite_vfs.is_some() {
+                    None // Mode F: no walrust needed
+                } else {
+                    Some(Arc::new(
+                        walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
+                    ))
+                }
+                #[cfg(not(feature = "turbolite"))]
+                {
+                    Some(Arc::new(
+                        walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
+                    ))
+                }
+            }
         };
 
         // Use custom lease store if provided, otherwise build S3 lease store.
@@ -283,20 +298,22 @@ impl HaQLiteBuilder {
         let mut config = self.coordinator_config.unwrap_or_default();
         config.lease = Some(LeaseConfig::new(instance_id.clone(), address.clone()));
 
-        // Build SQLite-specific components.
-        let replication_config = walrust::ReplicationConfig {
-            sync_interval: config.sync_interval,
-            snapshot_interval: config.snapshot_interval,
-            ..Default::default()
-        };
-        let replicator = Arc::new(SqliteReplicator::new(
-            walrust_storage.clone(),
-            &self.prefix,
-            replication_config,
-        ));
+        // Build SQLite-specific components (only if walrust storage is available).
+        let replicator = walrust_storage_opt.as_ref().map(|ws| {
+            let replication_config = walrust::ReplicationConfig {
+                sync_interval: config.sync_interval,
+                snapshot_interval: config.snapshot_interval,
+                ..Default::default()
+            };
+            Arc::new(SqliteReplicator::new(ws.clone(), &self.prefix, replication_config))
+        });
 
         match self.mode {
             HaMode::Dedicated => {
+                let walrust_storage = walrust_storage_opt
+                    .expect("Dedicated mode requires walrust storage");
+                let replicator = replicator
+                    .expect("Dedicated mode requires walrust replicator");
                 let follower_behavior = Arc::new(SqliteFollowerBehavior::new(walrust_storage));
 
                 // Build hadb Coordinator.
@@ -337,13 +354,17 @@ impl HaQLiteBuilder {
                 if let Some((vfs, vfs_name)) = self.turbolite_vfs {
                     return open_shared_turbolite(
                         lease_store, manifest_store, vfs, &vfs_name,
-                        replicator,
-                        walrust_storage,
+                        replicator,          // Option: None for Mode F, Some for Mode I
+                        walrust_storage_opt,  // Option: None for Mode F, Some for Mode I
                         db_path, &db_name, schema, &self.prefix, &instance_id,
                         poll_interval, write_timeout, self.read_concurrency,
                         lease_ttl,
                     ).await;
                 }
+                let replicator = replicator
+                    .expect("Shared mode without turbolite requires walrust replicator");
+                let walrust_storage = walrust_storage_opt
+                    .expect("Shared mode without turbolite requires walrust storage");
                 open_shared(
                     lease_store,
                     manifest_store,
@@ -977,8 +998,14 @@ impl HaQLite {
     // ========================================================================
 
     async fn execute_shared(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
-        // Unified path: walrust handles replication for both plain and turbolite-backed databases.
+        // Dispatch to turbolite-only path (Mode F/G: S3Primary, no walrust)
+        // if turbolite VFS is present but walrust replicator is not.
+        #[cfg(feature = "turbolite")]
+        if self.inner.shared_turbolite_vfs.is_some() && self.inner.shared_replicator.is_none() {
+            return self.execute_shared_turbolite(sql, params).await;
+        }
 
+        // Walrust path (Mode C/D/I/J): walrust handles replication.
         let lease_store = self.inner.shared_lease_store.as_ref()
             .ok_or(HaQLiteError::ConfigurationError("shared_lease_store required in Shared mode".into()))?;
         let manifest_store = self.inner.shared_manifest_store.as_ref()
@@ -1311,66 +1338,36 @@ impl HaQLite {
 
         let result: std::result::Result<u64, HaQLiteError> = async {
             // 3. Catch up from manifest (apply turbolite manifest to VFS).
-            // ALWAYS catch up after acquiring lease.
-            eprintln!("[tl-shared] {} catch-up: checking manifest '{}'", self.inner.shared_instance_id, manifest_key);
+            // set_manifest updates the VFS to point at the previous writer's S3 page groups.
+            // It writes page 0 (db_header) to local cache and evicts changed groups.
+            // With journal_mode=OFF (S3Primary), SQLite re-reads page 0 on every statement,
+            // so no connection reopen needed.
             if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
-                eprintln!("[tl-shared] {} catch-up: got manifest v{}, writer='{}'",
-                    self.inner.shared_instance_id, ha_manifest.version, ha_manifest.writer_id);
-                if let hadb::StorageManifest::Turbolite { .. } = &ha_manifest.storage {
+                // Accept both Turbolite and TurboliteWalrust manifest variants
+                let is_turbolite = matches!(
+                    &ha_manifest.storage,
+                    hadb::StorageManifest::Turbolite { .. }
+                    | hadb::StorageManifest::TurboliteWalrust { .. }
+                );
+                if is_turbolite {
                     let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
                     vfs.set_manifest(tl_manifest);
                     if let Ok(Some(meta)) = manifest_store.meta(&manifest_key).await {
                         self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
                     }
-                    // set_manifest writes page 0 (with correct db header) to cache
-                    // and evicts changed groups. Reopen connection so SQLite drops
-                    // its pager cache and re-reads page 0 through the VFS.
-                    // VFS::open uses warm reconnect (in-memory manifest, no S3 fetch).
-                    // eager_index_load should be false for multiwriter configs to
-                    // avoid S3 I/O during reopen.
-                    self.inner.set_conn(None);
-                    let vfs_name = self.inner.shared_turbolite_vfs_name.as_ref()
-                        .ok_or(HaQLiteError::ConfigurationError("turbolite VFS name required".into()))?;
-                    let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
-                    let new_conn = rusqlite::Connection::open_with_flags(
-                        &vfs_uri,
-                        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-                    ).map_err(|e| HaQLiteError::DatabaseError(
-                        format!("reopen after turbolite catch-up for '{}': {}", self.inner.db_name, e)
-                    ))?;
-                    new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
-                        .map_err(|e| HaQLiteError::DatabaseError(format!("WAL pragma: {}", e)))?;
-                    self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
                 }
             }
 
             // Re-read cached_version after catch-up
             let cached_version = self.inner.cached_manifest_version.load(Ordering::SeqCst);
 
-            // 4. Execute SQL locally
+            // 4. Execute SQL locally.
+            // In S3Primary mode, the turbolite VFS uploads dirty subframes to S3
+            // during xSync (triggered by SQLite's auto-commit). No separate checkpoint needed.
             let rows = self.execute_local(sql, params)?;
 
-            // 4b. Force WAL checkpoint so turbolite VFS uploads pages to S3.
-            // Without this, data stays in local WAL and never reaches S3.
-            // The manifest we publish must reflect the S3 state, not local WAL.
-            {
-                let conn_arc = self.inner.get_conn()?
-                    .ok_or(HaQLiteError::DatabaseError("no connection for checkpoint".into()))?;
-                let conn = conn_arc.lock()
-                    .map_err(|_| HaQLiteError::DatabaseError("checkpoint lock poisoned".into()))?;
-                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-                    .map_err(|e| HaQLiteError::ReplicationError(
-                        format!("turbolite checkpoint failed for '{}': {}", self.inner.db_name, e)
-                    ))?;
-            }
-
-            // 5. Publish manifest with turbolite state
+            // 5. Publish manifest with turbolite state (page groups now include the write)
             let tl_manifest = vfs.manifest();
-            eprintln!("[tl-shared] {} publish: vfs manifest v{}, page_count={}, {} page_group_keys",
-                self.inner.shared_instance_id, tl_manifest.version, tl_manifest.page_count,
-                tl_manifest.page_group_keys.len());
             let storage = crate::turbolite_replicator::turbolite_to_ha_storage(&tl_manifest);
             let new_manifest = hadb::HaManifest {
                 version: 0, // store assigns version
@@ -1842,8 +1839,8 @@ async fn open_shared_turbolite(
     manifest_store: Arc<dyn hadb::ManifestStore>,
     vfs: turbolite::tiered::SharedTurboliteVfs,
     vfs_name: &str,
-    replicator: Arc<SqliteReplicator>,
-    walrust_storage: Arc<dyn walrust::StorageBackend>,
+    replicator: Option<Arc<SqliteReplicator>>,
+    walrust_storage: Option<Arc<dyn walrust::StorageBackend>>,
     db_path: PathBuf,
     db_name: &str,
     schema: &str,
@@ -1878,35 +1875,31 @@ async fn open_shared_turbolite(
             .map_err(|e| anyhow::anyhow!("failed to link db_path to cache file: {}", e))?;
     }
 
-    // walrust needs the db_path to have actual SQLite data AND a -wal file.
-    // turbolite stores pages in data.cache, WAL at tl_seq.db-wal.
-    // Hardlink db_path -> data.cache so walrust reads page data from the same file.
-    // walrust finds the WAL at db_path-wal (tl_seq.db-wal) which turbolite creates.
-    let cache_file = vfs.cache_file_path();
-    if cache_file.exists() {
-        let db_size = db_path.metadata().map(|m| m.len()).unwrap_or(0);
-        if db_size == 0 {
-            let _ = std::fs::remove_file(&db_path);
-            std::fs::hard_link(&cache_file, &db_path)
-                .or_else(|_| std::fs::copy(&cache_file, &db_path).map(|_| ()))
-                .map_err(|e| anyhow::anyhow!("link db_path to cache file: {}", e))?;
+    // If walrust replicator is provided (Mode I/C/D), set up walrust.
+    // Otherwise (Mode F/G: S3Primary), no walrust needed.
+    if let Some(ref rep) = replicator {
+        // Hardlink db_path -> data.cache for walrust file access
+        let cache_file = vfs.cache_file_path();
+        if cache_file.exists() {
+            let db_size = db_path.metadata().map(|m| m.len()).unwrap_or(0);
+            if db_size == 0 {
+                let _ = std::fs::remove_file(&db_path);
+                std::fs::hard_link(&cache_file, &db_path)
+                    .or_else(|_| std::fs::copy(&cache_file, &db_path).map(|_| ()))
+                    .map_err(|e| anyhow::anyhow!("link db_path to cache file: {}", e))?;
+            }
         }
-    }
 
-    // Initial catch-up: restore from walrust if data exists.
-    // Must happen BEFORE add() because add() takes a snapshot that would
-    // overwrite existing data with this node's (possibly empty) DB.
-    if let Ok(Some(_txid)) = replicator.restore(db_name, &db_path).await {
-        let page_count = read_page_count_from_file(&db_path).unwrap_or(0);
-        if page_count > 0 {
-            vfs.sync_after_external_restore(page_count);
+        // Initial walrust restore
+        if let Ok(Some(_txid)) = rep.restore(db_name, &db_path).await {
+            let page_count = read_page_count_from_file(&db_path).unwrap_or(0);
+            if page_count > 0 {
+                vfs.sync_after_external_restore(page_count);
+            }
         }
+        rep.add(db_name, &db_path).await
+            .map_err(|e| anyhow::anyhow!("walrust add failed for '{}': {}", db_name, e))?;
     }
-
-    // Register walrust with db_path (not data.cache) so it finds the WAL
-    // at db_path-wal (tl_seq.db-wal) which turbolite's passthrough creates.
-    replicator.add(db_name, &db_path).await
-        .map_err(|e| anyhow::anyhow!("walrust add failed for '{}': {}", db_name, e))?;
 
     // Open persistent connection via turbolite VFS
     let conn = rusqlite::Connection::open_with_flags(
@@ -1914,7 +1907,14 @@ async fn open_shared_turbolite(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
             | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+    // journal_mode depends on whether walrust is used:
+    // - With walrust (Mode I): WAL mode (walrust ships WAL frames)
+    // - Without walrust (Mode F): OFF mode (S3Primary, no WAL needed)
+    if replicator.is_some() {
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+    } else {
+        conn.execute_batch("PRAGMA journal_mode=OFF;")?;
+    }
 
     let manifest_key = format!("{}{}/_manifest", prefix, db_name);
     let cached_version = match manifest_store.meta(&manifest_key).await? {
@@ -1935,12 +1935,12 @@ async fn open_shared_turbolite(
         read_semaphore: tokio::sync::Semaphore::new(read_concurrency),
         follower_caught_up: Arc::new(AtomicBool::new(true)),
         follower_replay_position: Arc::new(AtomicU64::new(0)),
-        // Shared mode fields -- both walrust AND turbolite
+        // Shared mode fields -- walrust optional (Mode F: no walrust)
         mode: HaMode::Shared,
         shared_lease_store: Some(lease_store),
         shared_manifest_store: Some(manifest_store.clone()),
-        shared_replicator: Some(replicator),
-        shared_walrust_storage: Some(walrust_storage),
+        shared_replicator: replicator,
+        shared_walrust_storage: walrust_storage,
         shared_prefix: prefix.to_string(),
         shared_instance_id: instance_id.to_string(),
         write_mutex: tokio::sync::Mutex::new(()),

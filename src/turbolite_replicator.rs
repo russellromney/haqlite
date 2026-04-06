@@ -156,6 +156,39 @@ pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> StorageManifest {
     }
 }
 
+/// Convert a turbolite Manifest + walrust position to hybrid StorageManifest::TurboliteWalrust.
+pub fn turbolite_walrust_to_ha_storage(
+    m: &TurboliteManifest,
+    walrust_txid: u64,
+    walrust_changeset_prefix: &str,
+) -> StorageManifest {
+    StorageManifest::TurboliteWalrust {
+        page_count: m.page_count,
+        page_size: m.page_size,
+        pages_per_group: m.pages_per_group,
+        sub_pages_per_frame: m.sub_pages_per_frame,
+        strategy: format!("{:?}", m.strategy),
+        page_group_keys: m.page_group_keys.clone(),
+        frame_tables: m.frame_tables.iter().map(|ft| {
+            ft.iter().map(|e| HaFrameEntry { offset: e.offset, len: e.len }).collect()
+        }).collect(),
+        group_pages: m.group_pages.clone(),
+        btrees: m.btrees.iter().map(|(k, v)| {
+            (*k, HaBTreeEntry { name: v.name.clone(), obj_type: v.obj_type.clone(), group_ids: v.group_ids.clone() })
+        }).collect(),
+        interior_chunk_keys: m.interior_chunk_keys.iter().map(|(k, v)| (*k, v.clone())).collect(),
+        index_chunk_keys: m.index_chunk_keys.iter().map(|(k, v)| (*k, v.clone())).collect(),
+        subframe_overrides: m.subframe_overrides.iter().map(|ovs| {
+            ovs.iter().map(|(k, v)| {
+                (*k, HaSubframeOverride { key: v.key.clone(), entry: HaFrameEntry { offset: v.entry.offset, len: v.entry.len } })
+            }).collect()
+        }).collect(),
+        db_header: m.db_header.clone(),
+        walrust_txid,
+        walrust_changeset_prefix: walrust_changeset_prefix.to_string(),
+    }
+}
+
 /// Convert hadb StorageManifest::Turbolite back to a turbolite Manifest.
 ///
 /// The returned manifest will have `detect_and_normalize_strategy()` called
@@ -164,19 +197,15 @@ pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> StorageManifest {
 pub fn ha_storage_to_turbolite(storage: &StorageManifest) -> TurboliteManifest {
     match storage {
         StorageManifest::Turbolite {
-            page_count,
-            page_size,
-            pages_per_group,
-            sub_pages_per_frame,
-            strategy: _,
-            page_group_keys,
-            frame_tables,
-            group_pages,
-            btrees,
-            interior_chunk_keys,
-            index_chunk_keys,
-            subframe_overrides,
-            db_header,
+            page_count, page_size, pages_per_group, sub_pages_per_frame,
+            strategy: _, page_group_keys, frame_tables, group_pages, btrees,
+            interior_chunk_keys, index_chunk_keys, subframe_overrides, db_header,
+        }
+        | StorageManifest::TurboliteWalrust {
+            page_count, page_size, pages_per_group, sub_pages_per_frame,
+            strategy: _, page_group_keys, frame_tables, group_pages, btrees,
+            interior_chunk_keys, index_chunk_keys, subframe_overrides, db_header,
+            walrust_txid: _, walrust_changeset_prefix: _,
         } => TurboliteManifest {
             version: 0,
             change_counter: 0,
@@ -273,6 +302,17 @@ pub fn ha_storage_to_turbolite(storage: &StorageManifest) -> TurboliteManifest {
                 db_header: None,
             }
         }
+    }
+}
+
+/// Extract walrust fields from a TurboliteWalrust manifest.
+/// Returns (walrust_txid, walrust_changeset_prefix) or None if not a hybrid manifest.
+pub fn extract_walrust_fields(storage: &StorageManifest) -> Option<(u64, &str)> {
+    match storage {
+        StorageManifest::TurboliteWalrust { walrust_txid, walrust_changeset_prefix, .. } => {
+            Some((*walrust_txid, walrust_changeset_prefix))
+        }
+        _ => None,
     }
 }
 
