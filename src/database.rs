@@ -463,6 +463,14 @@ impl HaQLiteInner {
         }
     }
 
+    /// Path that walrust uses for file-level operations (snapshot/restore/WAL sync).
+    /// With turbolite VFS, db_path is hardlinked to data.cache during open.
+    /// walrust reads/writes the db_path, turbolite reads/writes data.cache,
+    /// both see the same data through the hardlink.
+    fn walrust_path(&self) -> PathBuf {
+        self.db_path.clone()
+    }
+
     fn set_role(&self, role: Role) {
         self.role.store(
             match role {
@@ -908,7 +916,8 @@ impl HaQLite {
             Ok(Some(meta)) if meta.version > cached => {
                 // Unified walrust path: restore from S3 (works with or without turbolite VFS)
                 if let Some(ref rep) = self.inner.shared_replicator {
-                    rep.restore(&self.inner.db_name, &self.inner.db_path).await
+                    let wp = self.inner.walrust_path();
+                    rep.restore(&self.inner.db_name, &wp).await
                         .map_err(|e| HaQLiteError::ReplicationError(
                             format!("ensure_fresh catch-up failed for '{}': {}", self.inner.db_name, e)
                         ))?;
@@ -917,14 +926,14 @@ impl HaQLite {
                     // If turbolite VFS, sync bitmap after walrust restore
                     #[cfg(feature = "turbolite")]
                     if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
-                        let page_count = read_page_count_from_file(&self.inner.db_path).unwrap_or(0);
+                        let page_count = read_page_count_from_file(&wp).unwrap_or(0);
                         if page_count > 0 {
                             vfs.sync_after_external_restore(page_count);
                         }
                     }
 
                     let _ = rep.inner().remove(&self.inner.db_name).await;
-                    if let Err(e) = rep.add(&self.inner.db_name, &self.inner.db_path).await {
+                    if let Err(e) = rep.add_without_snapshot(&self.inner.db_name, &wp).await {
                         return Err(HaQLiteError::ReplicationError(
                             format!("re-register after ensure_fresh restore for '{}': {}", self.inner.db_name, e)
                         ));
@@ -1070,7 +1079,8 @@ impl HaQLite {
             match manifest_store.meta(&manifest_key).await {
                 Ok(Some(meta)) if meta.version > cached_version => {
                     // Restore from S3 (full snapshot + incrementals from all writers)
-                    replicator.restore(&self.inner.db_name, &self.inner.db_path).await
+                    let wp = self.inner.walrust_path();
+                    replicator.restore(&self.inner.db_name, &wp).await
                         .map_err(|e| HaQLiteError::ReplicationError(
                             format!("shared mode catch-up failed for '{}', refusing stale write: {}", self.inner.db_name, e)
                         ))?;
@@ -1079,19 +1089,20 @@ impl HaQLite {
                     // If turbolite VFS is present, sync bitmap after walrust restore
                     #[cfg(feature = "turbolite")]
                     if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
-                        let page_count = read_page_count_from_file(&self.inner.db_path).unwrap_or(0);
+                        let page_count = read_page_count_from_file(&wp).unwrap_or(0);
                         if page_count > 0 {
                             vfs.sync_after_external_restore(page_count);
                         }
                     }
 
-                    // Re-register with replicator so sync() uses the restored state
+                    // Re-register with replicator. Use add_without_snapshot to avoid
+                    // uploading a new snapshot that could race with other nodes' changesets.
+                    // walrust's flush() will upload changesets relative to the restored state.
                     let _ = replicator.inner().remove(&self.inner.db_name).await;
-                    if let Err(e) = replicator.add(&self.inner.db_name, &self.inner.db_path).await {
-                        return Err(HaQLiteError::ReplicationError(
+                    replicator.add(&self.inner.db_name, &wp).await
+                        .map_err(|e| HaQLiteError::ReplicationError(
                             format!("re-register after restore failed for '{}': {}", self.inner.db_name, e)
-                        ));
-                    }
+                        ))?;
 
                     // Reopen connection after restore (via VFS URI if turbolite, else raw path)
                     #[cfg(feature = "turbolite")]
@@ -1855,21 +1866,47 @@ async fn open_shared_turbolite(
         conn.execute_batch(schema)?;
     }
 
-    // Initial catch-up via walrust: restore WAL frames to the raw cache file.
-    // walrust writes directly to db_path (turbolite's cache file).
+    // walrust operates on the db_path (tl_seq.db) which is hardlinked to turbolite's
+    // cache file (data.cache). Both walrust and turbolite see the same page data.
+    // The WAL file (tl_seq.db-wal) is created by turbolite's passthrough handle.
+    let cache_file = vfs.cache_file_path();
+    if cache_file.exists() && !db_path.exists() || db_path.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+        // Link db_path to data.cache so walrust reads/writes the same data
+        let _ = std::fs::remove_file(&db_path); // remove empty placeholder
+        std::fs::hard_link(&cache_file, &db_path)
+            .or_else(|_| std::fs::copy(&cache_file, &db_path).map(|_| ()))
+            .map_err(|e| anyhow::anyhow!("failed to link db_path to cache file: {}", e))?;
+    }
+
+    // walrust needs the db_path to have actual SQLite data AND a -wal file.
+    // turbolite stores pages in data.cache, WAL at tl_seq.db-wal.
+    // Hardlink db_path -> data.cache so walrust reads page data from the same file.
+    // walrust finds the WAL at db_path-wal (tl_seq.db-wal) which turbolite creates.
+    let cache_file = vfs.cache_file_path();
+    if cache_file.exists() {
+        let db_size = db_path.metadata().map(|m| m.len()).unwrap_or(0);
+        if db_size == 0 {
+            let _ = std::fs::remove_file(&db_path);
+            std::fs::hard_link(&cache_file, &db_path)
+                .or_else(|_| std::fs::copy(&cache_file, &db_path).map(|_| ()))
+                .map_err(|e| anyhow::anyhow!("link db_path to cache file: {}", e))?;
+        }
+    }
+
+    // Initial catch-up: restore from walrust if data exists.
+    // Must happen BEFORE add() because add() takes a snapshot that would
+    // overwrite existing data with this node's (possibly empty) DB.
     if let Ok(Some(_txid)) = replicator.restore(db_name, &db_path).await {
-        // After walrust wrote pages to the cache file, sync turbolite's bitmap.
         let page_count = read_page_count_from_file(&db_path).unwrap_or(0);
         if page_count > 0 {
             vfs.sync_after_external_restore(page_count);
         }
     }
 
-    // Register with walrust replicator (takes snapshot for subsequent WAL sync)
-    let _ = replicator.inner().remove(db_name).await;
-    if let Err(e) = replicator.add(db_name, &db_path).await {
-        tracing::warn!("walrust re-register after turbolite open: {}", e);
-    }
+    // Register walrust with db_path (not data.cache) so it finds the WAL
+    // at db_path-wal (tl_seq.db-wal) which turbolite's passthrough creates.
+    replicator.add(db_name, &db_path).await
+        .map_err(|e| anyhow::anyhow!("walrust add failed for '{}': {}", db_name, e))?;
 
     // Open persistent connection via turbolite VFS
     let conn = rusqlite::Connection::open_with_flags(

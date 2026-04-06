@@ -47,6 +47,12 @@ impl SqliteReplicator {
     pub async fn restore(&self, name: &str, output_path: &Path) -> Result<Option<u64>> {
         self.inner.restore(name, output_path).await
     }
+
+    /// Register a database without taking a snapshot.
+    /// Use after restore() to avoid uploading a redundant snapshot.
+    pub async fn add_without_snapshot(&self, name: &str, path: &Path) -> Result<()> {
+        self.inner.add_without_snapshot(name, path).await
+    }
 }
 
 #[async_trait]
