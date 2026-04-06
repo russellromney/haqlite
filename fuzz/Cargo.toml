@@ -1,0 +1,34 @@
+[package]
+name = "haqlite-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.haqlite]
+path = ".."
+
+[dependencies.hrana-server]
+path = "../../hrana-server"
+
+[dependencies.serde_json]
+version = "1"
+
+[[bin]]
+name = "sql_forwarding"
+path = "fuzz_targets/sql_forwarding.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hrana_protocol"
+path = "fuzz_targets/hrana_protocol.rs"
+test = false
+doc = false
+bench = false
