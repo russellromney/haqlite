@@ -331,16 +331,17 @@ impl HaQLiteBuilder {
                 let write_timeout = self.write_timeout
                     .unwrap_or(Duration::from_secs(5));
 
+                let lease_ttl = self.lease_ttl.unwrap_or(5);
+
                 #[cfg(feature = "turbolite")]
                 if let Some((vfs, vfs_name)) = self.turbolite_vfs {
                     return open_shared_turbolite(
                         lease_store, manifest_store, vfs, &vfs_name,
                         db_path, &db_name, schema, &self.prefix, &instance_id,
                         poll_interval, write_timeout, self.read_concurrency,
+                        lease_ttl,
                     ).await;
                 }
-
-                let lease_ttl = self.lease_ttl.unwrap_or(5);
                 open_shared(
                     lease_store,
                     manifest_store,
@@ -903,7 +904,7 @@ impl HaQLite {
         let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
         match manifest_store.meta(&manifest_key).await {
             Ok(Some(meta)) if meta.version > cached => {
-                // Turbolite path: apply manifest to VFS
+                // Turbolite path: apply manifest to VFS + reopen connection via VFS
                 #[cfg(feature = "turbolite")]
                 if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
                     if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
@@ -911,6 +912,21 @@ impl HaQLite {
                             let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
                             vfs.set_manifest(tl_manifest);
                             self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                            // Reopen via turbolite VFS so SQLite sees new pages
+                            if let Some(ref vfs_name) = self.inner.shared_turbolite_vfs_name {
+                                let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
+                                let new_conn = rusqlite::Connection::open_with_flags(
+                                    &vfs_uri,
+                                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                                        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                                        | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                                ).map_err(|e| HaQLiteError::DatabaseError(
+                                    format!("reopen after turbolite ensure_fresh for '{}': {}", self.inner.db_name, e)
+                                ))?;
+                                new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                                    .map_err(|e| HaQLiteError::DatabaseError(format!("WAL pragma: {}", e)))?;
+                                self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
+                            }
                         }
                     }
                     return Ok(());
@@ -1260,6 +1276,21 @@ impl HaQLite {
                             let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
                             vfs.set_manifest(tl_manifest);
                             self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
+                            // Reopen connection via turbolite VFS so SQLite picks up new pages.
+                            let vfs_name = self.inner.shared_turbolite_vfs_name.as_ref()
+                                .ok_or(HaQLiteError::ConfigurationError("turbolite VFS name required for reopen".into()))?;
+                            let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
+                            let new_conn = rusqlite::Connection::open_with_flags(
+                                &vfs_uri,
+                                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                            ).map_err(|e| HaQLiteError::DatabaseError(
+                                format!("reopen after turbolite catch-up for '{}': {}", self.inner.db_name, e)
+                            ))?;
+                            new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                                .map_err(|e| HaQLiteError::DatabaseError(format!("WAL pragma after catch-up: {}", e)))?;
+                            self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
                         }
                     }
                 }
@@ -1271,6 +1302,20 @@ impl HaQLite {
 
             // 4. Execute SQL locally
             let rows = self.execute_local(sql, params)?;
+
+            // 4b. Force WAL checkpoint so turbolite VFS uploads pages to S3.
+            // Without this, data stays in local WAL and never reaches S3.
+            // The manifest we publish must reflect the S3 state, not local WAL.
+            {
+                let conn_arc = self.inner.get_conn()?
+                    .ok_or(HaQLiteError::DatabaseError("no connection for checkpoint".into()))?;
+                let conn = conn_arc.lock()
+                    .map_err(|_| HaQLiteError::DatabaseError("checkpoint lock poisoned".into()))?;
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .map_err(|e| HaQLiteError::ReplicationError(
+                        format!("turbolite checkpoint failed for '{}': {}", self.inner.db_name, e)
+                    ))?;
+            }
 
             // 5. Publish manifest with turbolite state
             let tl_manifest = vfs.manifest();
@@ -1753,6 +1798,7 @@ async fn open_shared_turbolite(
     manifest_poll_interval: Duration,
     write_timeout: Duration,
     read_concurrency: usize,
+    lease_ttl: u64,
 ) -> Result<HaQLite> {
     // Initial catch-up from manifest
     let replicator = Arc::new(crate::turbolite_replicator::TurboliteReplicator::new(
@@ -1809,7 +1855,7 @@ async fn open_shared_turbolite(
         write_mutex: tokio::sync::Mutex::new(()),
         cached_manifest_version: AtomicU64::new(cached_version),
         write_timeout,
-        lease_ttl: 5,
+        lease_ttl,
         shared_turbolite_vfs: Some(vfs.clone()),
         shared_turbolite_vfs_name: Some(vfs_name.to_string()),
     });
