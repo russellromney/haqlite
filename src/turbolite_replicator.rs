@@ -152,6 +152,7 @@ pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> StorageManifest {
                     .collect()
             })
             .collect(),
+        db_header: m.db_header.clone(),
     }
 }
 
@@ -175,6 +176,7 @@ pub fn ha_storage_to_turbolite(storage: &StorageManifest) -> TurboliteManifest {
             interior_chunk_keys,
             index_chunk_keys,
             subframe_overrides,
+            db_header,
         } => TurboliteManifest {
             version: 0,
             change_counter: 0,
@@ -243,6 +245,7 @@ pub fn ha_storage_to_turbolite(storage: &StorageManifest) -> TurboliteManifest {
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
+            db_header: db_header.clone(),
         },
         _ => {
             // Should never be called with non-Turbolite variant.
@@ -267,6 +270,7 @@ pub fn ha_storage_to_turbolite(storage: &StorageManifest) -> TurboliteManifest {
                 page_to_tree_name: HashMap::new(),
                 tree_name_to_groups: HashMap::new(),
                 group_to_tree_name: HashMap::new(),
+                db_header: None,
             }
         }
     }

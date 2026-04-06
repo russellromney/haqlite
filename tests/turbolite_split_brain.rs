@@ -75,6 +75,7 @@ async fn build_tl_node(
         pages_per_group: 4,
         sub_pages_per_frame: 2,
         runtime_handle: Some(tokio::runtime::Handle::current()),
+        eager_index_load: false, // avoid S3 I/O during connection reopen in shared mode
         ..Default::default()
     };
     let vfs = TurboliteVfs::new(config).expect("create VFS");

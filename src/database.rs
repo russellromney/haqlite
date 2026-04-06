@@ -904,7 +904,7 @@ impl HaQLite {
         let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
         match manifest_store.meta(&manifest_key).await {
             Ok(Some(meta)) if meta.version > cached => {
-                // Turbolite path: apply manifest to VFS + flush SQLite page cache
+                // Turbolite path: apply manifest to VFS + reopen connection
                 #[cfg(feature = "turbolite")]
                 if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
                     if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
@@ -912,13 +912,8 @@ impl HaQLite {
                             let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
                             vfs.set_manifest(tl_manifest);
                             self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
-                            // Flush SQLite page cache so it re-reads from VFS
-                            if let Ok(Some(conn_arc)) = self.inner.get_conn() {
-                                let conn = conn_arc.lock()
-                                    .map_err(|_| HaQLiteError::DatabaseError("lock poisoned during ensure_fresh flush".into()))?;
-                                let _ = conn.cache_flush();
-                                let _ = conn.execute_batch("PRAGMA shrink_memory");
-                            }
+                            // No reopen needed. set_manifest evicts changed groups,
+                            // VFS will fetch from S3 on next read.
                         }
                     }
                     return Ok(());
@@ -1272,16 +1267,27 @@ impl HaQLite {
                     if let Ok(Some(meta)) = manifest_store.meta(&manifest_key).await {
                         self.inner.cached_manifest_version.store(meta.version, Ordering::SeqCst);
                     }
-                    // Flush SQLite's page cache so it re-reads from VFS (which now
-                    // serves the new manifest's pages from S3). No connection reopen
-                    // needed since the VFS handle shares shared_manifest.
-                    if let Ok(Some(conn_arc)) = self.inner.get_conn() {
-                        let conn = conn_arc.lock()
-                            .map_err(|_| HaQLiteError::DatabaseError("lock poisoned during catch-up flush".into()))?;
-                        // shrink_memory releases SQLite's page cache
-                        let _ = conn.cache_flush();
-                        let _ = conn.execute_batch("PRAGMA shrink_memory");
-                    }
+                    // set_manifest writes page 0 (with correct db header) to cache
+                    // and evicts changed groups. Reopen connection so SQLite drops
+                    // its pager cache and re-reads page 0 through the VFS.
+                    // VFS::open uses warm reconnect (in-memory manifest, no S3 fetch).
+                    // eager_index_load should be false for multiwriter configs to
+                    // avoid S3 I/O during reopen.
+                    self.inner.set_conn(None);
+                    let vfs_name = self.inner.shared_turbolite_vfs_name.as_ref()
+                        .ok_or(HaQLiteError::ConfigurationError("turbolite VFS name required".into()))?;
+                    let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
+                    let new_conn = rusqlite::Connection::open_with_flags(
+                        &vfs_uri,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                    ).map_err(|e| HaQLiteError::DatabaseError(
+                        format!("reopen after turbolite catch-up for '{}': {}", self.inner.db_name, e)
+                    ))?;
+                    new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                        .map_err(|e| HaQLiteError::DatabaseError(format!("WAL pragma: {}", e)))?;
+                    self.inner.set_conn(Some(Arc::new(Mutex::new(new_conn))));
                 }
             }
 
