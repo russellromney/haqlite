@@ -1876,9 +1876,24 @@ async fn open_shared_turbolite(
     read_concurrency: usize,
     lease_ttl: u64,
 ) -> Result<HaQLite> {
-    // Ensure schema via turbolite VFS connection first (creates the file)
     let vfs_uri = format!("file:{}?vfs={}", db_path.display(), vfs_name);
+
+    // Open a read-only probe connection to trigger manifest load from S3.
+    // This lets us check if data already exists before creating schema.
     {
+        let _probe = rusqlite::Connection::open_with_flags(
+            &vfs_uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        );
+    }
+    let m = vfs.manifest();
+    let vfs_has_data = m.page_count > 0;
+    eprintln!("[open] {} vfs_has_data={} page_count={} version={}", instance_id, vfs_has_data, m.page_count, m.version);
+
+    if !vfs_has_data {
+        // First node: create schema via turbolite VFS connection.
+        // Subsequent nodes skip this -- schema is in the S3 state.
         let conn = rusqlite::Connection::open_with_flags(
             &vfs_uri,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -1949,10 +1964,16 @@ async fn open_shared_turbolite(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
             | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
-    // WAL mode is the safe default for all turbolite configurations.
-    // Mode F (S3Primary) overrides this via turbolite_migrate_to_s3_primary
-    // before the builder opens, which sets journal_mode=OFF.
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+    // Set journal mode based on what's already configured.
+    // Mode F (S3Primary): journal_mode=OFF (set by turbolite_migrate_to_s3_primary before open)
+    // Mode I/C (WAL + walrust): journal_mode=WAL
+    // Don't override if already in OFF mode (would revert S3Primary migration).
+    let current_mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap_or_else(|_| "wal".to_string());
+    if current_mode != "off" && current_mode != "memory" {
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+    }
 
     let manifest_key = format!("{}{}/_manifest", prefix, db_name);
     let cached_version = match manifest_store.meta(&manifest_key).await? {

@@ -83,21 +83,11 @@ async fn build_mode_f_node(
         .expect("register VFS");
 
     let db_path = cache_dir.join(format!("{}.db", db_name));
-
-    // Open initial connection, create schema, migrate to journal_mode=OFF
-    {
-        let conn = rusqlite::Connection::open_with_flags_and_vfs(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-            &vfs_name,
-        ).expect("initial open");
-        conn.execute_batch(SCHEMA).expect("schema");
-        turbolite::tiered::turbolite_migrate_to_s3_primary(&conn).expect("migrate");
-    }
-
-    // Reopen with journal_mode=OFF for S3Primary
     let db_path_str = db_path.to_str().expect("path");
+
+    // Let the builder handle everything (schema creation, connection management).
+    // Don't do external schema creation -- it triggers S3Primary uploads that
+    // interfere with multiwriter catch-up.
     HaQLite::builder("unused-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
