@@ -83,6 +83,18 @@ path = "src/bin/ha_experiment.rs"
 name = "haqlite-ha-writer"
 path = "src/bin/ha_writer.rs"
 
+[[bin]]
+name = "haqlite-e2e"
+path = "src/bin/e2e.rs"
+
+[[bin]]
+name = "haqlite-shared-experiment"
+path = "src/bin/shared_experiment.rs"
+
+[[bin]]
+name = "haqlite-experiment"
+path = "src/bin/experiment.rs"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
