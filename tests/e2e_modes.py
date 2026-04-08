@@ -1047,6 +1047,9 @@ def test_durability_across_restarts(mode_test, result):
 
     result.check(len(writes) == 10, f"Wrote {len(writes)} rows")
 
+    # Wait for S3 writes to settle before killing
+    time.sleep(2)
+
     # Kill all nodes
     for s in mode_test.servers:
         s.kill()
@@ -1092,6 +1095,25 @@ def test_durability_across_restarts(mode_test, result):
         resp = get_json(f"{fresh_url}/read?id={row_id}")
         if not resp.get("found"):
             missing += 1
+
+    if missing > 0:
+        # Dump fresh node log
+        import re as _re
+        log = fresh.read_output()
+        print(f"    --- fresh-node log (last 15 relevant) ---")
+        for line in log.split("\n"):
+            line = _re.sub(chr(27) + r'\[[0-9;]*m', '', line).strip()
+            if any(k in line for k in ['manifest', 'S3 fetch', 'CACHE', 'ensure_fresh',
+                                       'set_manifest', 'catchup', 'page_count', 'building']):
+                print(f"      {line[:200]}")
+
+        # Also try a count query directly
+        count_resp = get_json(f"{fresh_url}/count")
+        print(f"    Fresh node /count: {count_resp}")
+
+        # Check /status
+        status_resp = get_json(f"{fresh_url}/status")
+        print(f"    Fresh node /status: {status_resp}")
 
     result.check(missing == 0, f"Fresh node sees all {len(writes)} rows from S3 (missing={missing})")
 
