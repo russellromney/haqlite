@@ -1036,6 +1036,7 @@ def test_durability_across_restarts(mode_test, result):
     if not write_url:
         result.fail("No live node to write durability test data")
         return
+    print(f"    Durability write_url: {write_url}")
 
     # Write data
     writes = []

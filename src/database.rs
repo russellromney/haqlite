@@ -1229,7 +1229,14 @@ impl HaQLite {
                     self.inner.schema_applied.store(true, Ordering::SeqCst);
                 }
             }
+            // Check VFS manifest version before write
+            let vfs_v_before = vfs.manifest().version;
             let rows = self.execute_local(sql, params)?;
+            let vfs_v_after = vfs.manifest().version;
+            tracing::info!(
+                "[execute_shared] wrote {} rows, vfs_v: {} -> {}",
+                rows, vfs_v_before, vfs_v_after,
+            );
 
             // 4. Sync: flush turbolite + walrust to S3 (Eventual durability only)
             if let Some(ref rep) = self.inner.shared_replicator {
