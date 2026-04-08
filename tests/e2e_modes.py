@@ -1481,16 +1481,558 @@ def run_dedicated_eventual(args):
 
 
 # ---------------------------------------------------------------------------
+# Chaos / resilience tests (Dedicated+Eventual)
+# ---------------------------------------------------------------------------
+
+def test_sigkill_during_sync(result):
+    """Write continuously, SIGKILL at random moment, verify no corruption."""
+    prefix = f"chaos-sync-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
+    tmp = tempfile.mkdtemp(prefix="haqlite_chaos_sync_")
+    extra = ["--sync-interval-ms", "500", "--follower-pull-ms", "500",
+             "--follower-poll-ms", "500", "--renew-interval-ms", "1000"]
+
+    iterations = 5
+    corruption_count = 0
+    data_loss_stats = []
+
+    for iteration in range(iterations):
+        iter_prefix = f"{prefix}iter{iteration}/"
+        s = ServerProcess("dedicated", "eventual", BASE_PORT + 70, f"chaos-{iteration}",
+                          iter_prefix, tmp, lease_ttl=5, extra_args=extra)
+        s.start()
+        if not s.wait_healthy(timeout=30):
+            result.fail(f"Iteration {iteration}: server didn't start")
+            s.stop()
+            continue
+
+        # Wait for leader election (single node, always leader)
+        time.sleep(3)
+
+        # Write rows continuously
+        ok_writes = []
+        for i in range(20):
+            row_id = f"chaos-{iteration}-{i}"
+            resp = post_json(f"{s.url}/write", {"id": row_id, "value": f"v-{i}"}, timeout=10)
+            if resp.get("ok"):
+                ok_writes.append(row_id)
+
+        # Random delay 0-200ms, then SIGKILL
+        kill_delay = random.uniform(0, 0.2)
+        time.sleep(kill_delay)
+        s.kill()
+        time.sleep(2)
+
+        # Start fresh node with same prefix, check for corruption
+        fresh = ServerProcess("dedicated", "eventual", BASE_PORT + 71, f"fresh-{iteration}",
+                              iter_prefix, tmp, lease_ttl=5, extra_args=extra)
+        fresh.start()
+        if not fresh.wait_healthy(timeout=30):
+            result.fail(f"Iteration {iteration}: fresh node didn't start after SIGKILL")
+            fresh.stop()
+            continue
+
+        time.sleep(3)
+
+        # Run integrity check via SQL
+        ic_resp = get_json(f"{fresh.url}/query?sql=PRAGMA%20integrity_check")
+        ic_ok = False
+        if ic_resp.get("rows"):
+            first_row = ic_resp["rows"][0] if ic_resp["rows"] else []
+            ic_ok = (first_row == ["ok"] if first_row else False)
+        if not ic_ok:
+            corruption_count += 1
+            result.fail(f"Iteration {iteration}: integrity_check FAILED: {ic_resp}")
+
+        # Count surviving rows
+        count_resp = get_json(f"{fresh.url}/count")
+        survived = count_resp.get("count", 0)
+        lost = len(ok_writes) - survived
+        data_loss_stats.append({"iteration": iteration, "wrote": len(ok_writes),
+                                "survived": survived, "lost": max(0, lost),
+                                "kill_delay_ms": int(kill_delay * 1000)})
+        fresh.stop()
+
+    # Clean up
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    result.check(corruption_count == 0,
+                 f"No corruption across {iterations} SIGKILL iterations (corruption={corruption_count})")
+
+    if data_loss_stats:
+        total_wrote = sum(s["wrote"] for s in data_loss_stats)
+        total_survived = sum(s["survived"] for s in data_loss_stats)
+        total_lost = sum(s["lost"] for s in data_loss_stats)
+        max_lost = max(s["lost"] for s in data_loss_stats)
+        print(f"    Stats: {total_survived}/{total_wrote} survived, {total_lost} lost, max_lost_per_kill={max_lost}")
+        for s in data_loss_stats:
+            print(f"      iter {s['iteration']}: wrote={s['wrote']} survived={s['survived']} lost={s['lost']} delay={s['kill_delay_ms']}ms")
+
+    result.ok(f"SIGKILL-during-sync: {iterations} iterations complete")
+
+
+def test_rpo_measurement(result):
+    """Measure recovery point objective: write, kill after N ms, check survival."""
+    prefix = f"chaos-rpo-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
+    tmp = tempfile.mkdtemp(prefix="haqlite_chaos_rpo_")
+    extra = ["--sync-interval-ms", "500", "--follower-pull-ms", "500",
+             "--follower-poll-ms", "500", "--renew-interval-ms", "1000"]
+
+    delays_ms = [0, 100, 250, 500, 750, 1000, 1500, 2000]
+    rpo_results = []
+
+    for delay_ms in delays_ms:
+        iter_prefix = f"{prefix}rpo{delay_ms}/"
+        s = ServerProcess("dedicated", "eventual", BASE_PORT + 72, f"rpo-{delay_ms}",
+                          iter_prefix, tmp, lease_ttl=5, extra_args=extra)
+        s.start()
+        if not s.wait_healthy(timeout=30):
+            result.fail(f"RPO {delay_ms}ms: server didn't start")
+            s.stop()
+            continue
+
+        time.sleep(3)
+
+        # Write 10 rows, wait for sync, then write the probe row
+        for i in range(10):
+            post_json(f"{s.url}/write", {"id": f"base-{i}", "value": f"v-{i}"}, timeout=10)
+        # Wait for base rows to sync
+        time.sleep(3)
+
+        # Write probe row, then kill after delay
+        probe_id = f"probe-{delay_ms}"
+        resp = post_json(f"{s.url}/write", {"id": probe_id, "value": "probe"}, timeout=10)
+        probe_ok = resp.get("ok", False)
+
+        time.sleep(delay_ms / 1000.0)
+        s.kill()
+        time.sleep(2)
+
+        # Fresh node
+        fresh = ServerProcess("dedicated", "eventual", BASE_PORT + 73, f"rpo-fresh-{delay_ms}",
+                              iter_prefix, tmp, lease_ttl=5, extra_args=extra)
+        fresh.start()
+        if not fresh.wait_healthy(timeout=30):
+            result.fail(f"RPO {delay_ms}ms: fresh node didn't start")
+            fresh.stop()
+            continue
+
+        time.sleep(3)
+
+        # Check if probe survived
+        probe_resp = get_json(f"{fresh.url}/read?id={probe_id}")
+        probe_survived = probe_resp.get("found", False)
+        base_count = get_json(f"{fresh.url}/count").get("count", 0)
+
+        rpo_results.append({
+            "delay_ms": delay_ms,
+            "probe_ok": probe_ok,
+            "probe_survived": probe_survived,
+            "base_rows": base_count,
+        })
+        fresh.stop()
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    # Report
+    print(f"    RPO sweep (sync_interval=500ms):")
+    threshold_ms = None
+    for r in rpo_results:
+        status = "SURVIVED" if r["probe_survived"] else "LOST"
+        print(f"      {r['delay_ms']:5d}ms: probe={status}, base_rows={r['base_rows']}")
+        if r["probe_survived"] and threshold_ms is None:
+            threshold_ms = r["delay_ms"]
+
+    if threshold_ms is not None:
+        result.ok(f"RPO threshold: writes survive after ~{threshold_ms}ms (sync_interval=500ms)")
+    else:
+        result.ok(f"RPO: no probe survived (all killed before sync)")
+
+    # Base rows should always survive (they were synced before the probe)
+    base_ok = all(r["base_rows"] >= 10 for r in rpo_results)
+    result.check(base_ok, f"Pre-synced rows survive all kills (base_rows >= 10 for all delays)")
+
+
+def test_changeset_chain_integrity(result):
+    """After double failover, verify a cold walrust restore produces valid data."""
+    prefix = f"chaos-chain-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
+    tmp = tempfile.mkdtemp(prefix="haqlite_chaos_chain_")
+    extra = ["--sync-interval-ms", "500", "--follower-pull-ms", "500",
+             "--follower-poll-ms", "500", "--renew-interval-ms", "1000"]
+
+    # 3 nodes
+    servers = []
+    for i in range(3):
+        s = ServerProcess("dedicated", "eventual", BASE_PORT + 74 + i, f"chain-{i}",
+                          prefix, tmp, lease_ttl=5, extra_args=extra)
+        s.start()
+        servers.append(s)
+
+    for s in servers:
+        if not s.wait_healthy(timeout=30):
+            result.fail("Chain test: servers didn't start")
+            for s2 in servers: s2.stop()
+            shutil.rmtree(tmp, ignore_errors=True)
+            return
+
+    time.sleep(3)
+
+    # Find leader
+    leader_idx = None
+    for i, s in enumerate(servers):
+        if get_json(f"{s.url}/status").get("role") == "Leader":
+            leader_idx = i
+            break
+
+    if leader_idx is None:
+        result.fail("No leader elected")
+        for s in servers: s.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    # Phase 1: write to leader-1
+    phase1_ids = []
+    for i in range(5):
+        rid = f"chain-p1-{i}"
+        resp = post_json(f"{servers[leader_idx].url}/write", {"id": rid, "value": f"p1-{i}"}, timeout=60)
+        if resp.get("ok"):
+            phase1_ids.append(rid)
+    time.sleep(5)
+
+    # Kill leader-1
+    servers[leader_idx].kill()
+    time.sleep(10)
+
+    # Find leader-2
+    leader2_idx = None
+    for i, s in enumerate(servers):
+        if i != leader_idx and s.is_alive():
+            if get_json(f"{s.url}/status").get("role") == "Leader":
+                leader2_idx = i
+                break
+
+    if leader2_idx is None:
+        # Wait longer
+        time.sleep(10)
+        for i, s in enumerate(servers):
+            if i != leader_idx and s.is_alive():
+                if get_json(f"{s.url}/status").get("role") == "Leader":
+                    leader2_idx = i
+                    break
+
+    if leader2_idx is None:
+        result.fail("No leader-2 after killing leader-1")
+        for s in servers: s.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    # Phase 2: write to leader-2
+    phase2_ids = []
+    for i in range(5):
+        rid = f"chain-p2-{i}"
+        resp = post_json(f"{servers[leader2_idx].url}/write", {"id": rid, "value": f"p2-{i}"}, timeout=60)
+        if resp.get("ok"):
+            phase2_ids.append(rid)
+    time.sleep(20)
+
+    # Kill all
+    for s in servers:
+        if s.is_alive():
+            s.kill()
+    time.sleep(3)
+
+    # Cold restore: fresh node with same prefix
+    fresh = ServerProcess("dedicated", "eventual", BASE_PORT + 77, "chain-fresh",
+                          prefix, tmp, lease_ttl=5, extra_args=extra)
+    fresh.start()
+    if not fresh.wait_healthy(timeout=30):
+        result.fail("Chain test: fresh node didn't start")
+        fresh.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    time.sleep(5)
+
+    # Integrity check
+    ic_resp = get_json(f"{fresh.url}/query?sql=PRAGMA%20integrity_check")
+    ic_ok = False
+    if ic_resp.get("rows"):
+        first_row = ic_resp["rows"][0] if ic_resp["rows"] else []
+        ic_ok = (first_row == ["ok"] if first_row else False)
+    result.check(ic_ok, f"Cold restore integrity_check: {'ok' if ic_ok else ic_resp}")
+
+    # Check data
+    p1_missing = sum(1 for rid in phase1_ids if not get_json(f"{fresh.url}/read?id={rid}").get("found"))
+    p2_missing = sum(1 for rid in phase2_ids if not get_json(f"{fresh.url}/read?id={rid}").get("found"))
+
+    result.check(p1_missing == 0, f"Cold restore has phase-1 rows (missing={p1_missing}/{len(phase1_ids)})")
+    result.check(p2_missing == 0, f"Cold restore has phase-2 rows (missing={p2_missing}/{len(phase2_ids)})")
+
+    fresh.stop()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_concurrent_readers_during_failover(result):
+    """Readers on follower must not crash or return corrupt data during leader kill."""
+    prefix = f"chaos-readers-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
+    tmp = tempfile.mkdtemp(prefix="haqlite_chaos_readers_")
+    extra = ["--sync-interval-ms", "500", "--follower-pull-ms", "500",
+             "--follower-poll-ms", "500", "--renew-interval-ms", "1000"]
+
+    s0 = ServerProcess("dedicated", "eventual", BASE_PORT + 80, "read-0",
+                       prefix, tmp, lease_ttl=5, extra_args=extra)
+    s1 = ServerProcess("dedicated", "eventual", BASE_PORT + 81, "read-1",
+                       prefix, tmp, lease_ttl=5, extra_args=extra)
+    s0.start(); s1.start()
+    if not s0.wait_healthy(timeout=30) or not s1.wait_healthy(timeout=30):
+        result.fail("Reader test: servers didn't start")
+        s0.stop(); s1.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    time.sleep(3)
+
+    leader_s = None; follower_s = None
+    for s in [s0, s1]:
+        if get_json(f"{s.url}/status").get("role") == "Leader":
+            leader_s = s
+        else:
+            follower_s = s
+
+    if not leader_s or not follower_s:
+        result.fail("Need leader + follower")
+        s0.stop(); s1.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    # Seed data
+    for i in range(20):
+        post_json(f"{leader_s.url}/write", {"id": f"seed-{i}", "value": f"v-{i}"}, timeout=10)
+    time.sleep(3)
+
+    # Spawn reader threads that hammer the follower
+    read_errors = []
+    read_count = [0]
+    stop_reading = [False]
+
+    def reader_loop():
+        while not stop_reading[0]:
+            try:
+                resp = get_json(f"{follower_s.url}/count")
+                count = resp.get("count")
+                if count is not None and count < 0:
+                    read_errors.append(f"negative count: {count}")
+                read_count[0] += 1
+            except Exception as e:
+                # Connection errors during failover are expected
+                pass
+            time.sleep(0.05)
+
+    threads = []
+    for _ in range(4):
+        import threading
+        t = threading.Thread(target=reader_loop, daemon=True)
+        t.start()
+        threads.append(t)
+
+    # Let readers warm up
+    time.sleep(1)
+
+    # Kill leader while readers are active
+    leader_s.kill()
+    time.sleep(5)
+
+    # Stop readers
+    stop_reading[0] = True
+    for t in threads:
+        t.join(timeout=5)
+
+    result.check(len(read_errors) == 0,
+                 f"No corrupt reads during failover ({read_count[0]} reads, {len(read_errors)} errors)")
+    result.ok(f"Concurrent readers: {read_count[0]} reads completed during failover")
+
+    follower_s.stop()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_rapid_kill_restart(result):
+    """Kill and promote 5 times with minimal settle, verify data integrity."""
+    prefix = f"chaos-rapid-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
+    tmp = tempfile.mkdtemp(prefix="haqlite_chaos_rapid_")
+    extra = ["--sync-interval-ms", "500", "--follower-pull-ms", "500",
+             "--follower-poll-ms", "500", "--renew-interval-ms", "1000"]
+
+    all_ok_writes = []  # (row_id, which_leader)
+    num_cycles = 5
+
+    # Start first leader
+    current = ServerProcess("dedicated", "eventual", BASE_PORT + 85, "rapid-0",
+                            prefix, tmp, lease_ttl=5, extra_args=extra)
+    current.start()
+    if not current.wait_healthy(timeout=30):
+        result.fail("Rapid kill: first server didn't start")
+        current.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+    time.sleep(3)
+
+    for cycle in range(num_cycles):
+        # Write one row
+        rid = f"rapid-{cycle}"
+        resp = post_json(f"{current.url}/write", {"id": rid, "value": f"c-{cycle}"}, timeout=60)
+        if resp.get("ok"):
+            all_ok_writes.append(rid)
+            print(f"      cycle {cycle}: wrote {rid}")
+        else:
+            print(f"      cycle {cycle}: write FAILED: {resp.get('error', '?')[:80]}")
+
+        # Wait for walrust to sync before kill
+        time.sleep(3)
+
+        # Kill immediately
+        current.kill()
+        time.sleep(2)
+
+        # Start next leader
+        next_s = ServerProcess("dedicated", "eventual", BASE_PORT + 86 + cycle,
+                               f"rapid-{cycle+1}", prefix, tmp, lease_ttl=5, extra_args=extra)
+        next_s.start()
+        if not next_s.wait_healthy(timeout=30):
+            result.fail(f"Rapid kill cycle {cycle}: next server didn't start")
+            next_s.stop()
+            break
+        time.sleep(5)  # wait for leader election
+        current = next_s
+
+    # Verify all Ok'd writes survived
+    time.sleep(3)
+    missing = 0
+    for rid in all_ok_writes:
+        resp = get_json(f"{current.url}/read?id={rid}")
+        if not resp.get("found"):
+            missing += 1
+            print(f"      MISSING: {rid}")
+
+    result.check(missing == 0,
+                 f"All {len(all_ok_writes)} Ok'd writes survived {num_cycles} rapid kills (missing={missing})")
+
+    # Integrity check
+    ic_resp = get_json(f"{current.url}/query?sql=PRAGMA%20integrity_check")
+    ic_ok = False
+    if ic_resp.get("rows"):
+        first_row = ic_resp["rows"][0] if ic_resp["rows"] else []
+        ic_ok = (first_row == ["ok"] if first_row else False)
+    result.check(ic_ok, f"Integrity check after rapid kills: {'ok' if ic_ok else ic_resp}")
+
+    current.stop()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_chaos_dedicated_eventual(args):
+    """Chaos and resilience tests for Dedicated + Eventual."""
+    print("\n" + "=" * 70)
+    print("CHAOS: Dedicated + Eventual resilience tests")
+    print("=" * 70)
+
+    result = TestResult("chaos-dedicated-eventual")
+
+    try:
+        print("\n  --- SIGKILL during sync ---")
+        test_sigkill_during_sync(result)
+
+        print("\n  --- RPO measurement ---")
+        test_rpo_measurement(result)
+
+        print("\n  --- Changeset chain integrity ---")
+        test_changeset_chain_integrity(result)
+
+        print("\n  --- Concurrent readers during failover ---")
+        test_concurrent_readers_during_failover(result)
+
+        print("\n  --- Rapid kill/restart cycle ---")
+        test_rapid_kill_restart(result)
+
+    except Exception as e:
+        result.fail(f"Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-ALL_MODES = {
-    "shared-synchronous": run_shared_synchronous,
-    "shared-eventual": run_shared_eventual,
-    "dedicated-replicated": run_dedicated_replicated,
-    "dedicated-synchronous": run_dedicated_synchronous,
-    "dedicated-eventual": run_dedicated_eventual,
+# Mode matrix: topology x durability x test-level
+# Usage: --mode dedicated-eventual         (basic tests)
+#        --mode dedicated-eventual-chaos   (chaos/resilience tests)
+#        --mode dedicated                  (all dedicated durabilities, basic)
+#        --mode chaos                      (all chaos tests)
+
+BASIC_MODES = {
+    ("shared", "synchronous"): run_shared_synchronous,
+    ("shared", "eventual"): run_shared_eventual,
+    ("dedicated", "replicated"): run_dedicated_replicated,
+    ("dedicated", "synchronous"): run_dedicated_synchronous,
+    ("dedicated", "eventual"): run_dedicated_eventual,
 }
+
+CHAOS_MODES = {
+    ("dedicated", "eventual"): run_chaos_dedicated_eventual,
+}
+
+def resolve_modes(mode_str):
+    """Resolve a mode string to a list of (name, runner) pairs.
+
+    Supports:
+      dedicated-eventual       -> basic tests for that combo
+      dedicated-eventual-chaos -> chaos tests for that combo
+      dedicated                -> all basic dedicated modes
+      shared                   -> all basic shared modes
+      chaos                    -> all chaos modes
+      all                      -> all basic modes
+    """
+    if not mode_str or mode_str == "all":
+        return [(f"{t}-{d}", fn) for (t, d), fn in BASIC_MODES.items()]
+
+    # "chaos" alone = all chaos modes
+    if mode_str == "chaos":
+        return [(f"{t}-{d}-chaos", fn) for (t, d), fn in CHAOS_MODES.items()]
+
+    parts = mode_str.split("-")
+
+    # Check for chaos suffix: "dedicated-eventual-chaos"
+    if len(parts) >= 3 and parts[-1] == "chaos":
+        topology = parts[0]
+        durability = parts[1]
+        key = (topology, durability)
+        if key in CHAOS_MODES:
+            return [(mode_str, CHAOS_MODES[key])]
+        return []
+
+    # Topology-chaos: "dedicated-chaos" = all chaos modes for that topology
+    if len(parts) == 2 and parts[1] == "chaos":
+        topology = parts[0]
+        return [(f"{t}-{d}-chaos", fn) for (t, d), fn in CHAOS_MODES.items()
+                if t == topology]
+
+    # Topology only: all durabilities for that topology
+    if mode_str in ("shared", "dedicated"):
+        return [(f"{t}-{d}", fn) for (t, d), fn in BASIC_MODES.items()
+                if t == mode_str]
+
+    # Full topology-durability
+    if len(parts) == 2:
+        key = (parts[0], parts[1])
+        if key in BASIC_MODES:
+            return [(mode_str, BASIC_MODES[key])]
+
+    return []
+
+
+# Legacy flat lookup for backward compat
+ALL_MODES = {f"{t}-{d}": fn for (t, d), fn in BASIC_MODES.items()}
+ALL_MODES.update({f"{t}-{d}-chaos": fn for (t, d), fn in CHAOS_MODES.items()})
 
 
 def main():
@@ -1533,14 +2075,20 @@ def main():
         print("  soup run --project ladybug --env development -- python tests/e2e_modes.py")
         sys.exit(1)
 
-    # Select modes to run
+    # Select modes to run via matrix resolver
     if args.mode:
-        if args.mode not in ALL_MODES:
-            print(f"ERROR: Unknown mode '{args.mode}'. Available: {', '.join(ALL_MODES.keys())}")
+        resolved = resolve_modes(args.mode)
+        if not resolved:
+            available = sorted(ALL_MODES.keys())
+            extras = ["shared", "dedicated", "chaos", "all"]
+            print(f"ERROR: Unknown mode '{args.mode}'.")
+            print(f"  Modes: {', '.join(available)}")
+            print(f"  Shortcuts: {', '.join(extras)}")
             sys.exit(1)
-        modes_to_run = {args.mode: ALL_MODES[args.mode]}
+        modes_to_run = dict(resolved)
     else:
-        modes_to_run = ALL_MODES
+        # Default: basic modes only (not chaos -- chaos takes too long)
+        modes_to_run = {f"{t}-{d}": fn for (t, d), fn in BASIC_MODES.items()}
 
     # Run tests
     results = {}
