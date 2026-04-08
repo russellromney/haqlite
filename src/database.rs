@@ -1138,46 +1138,43 @@ impl HaQLite {
     }
 
     /// Check manifest freshness and catch up if stale.
-    ///
-    /// Uses meta() as a cheap version check (HeadObject), then get() for the
-    /// full manifest body. The cached version is taken from the manifest body's
-    /// version field to avoid races between meta() and get().
     async fn ensure_fresh(&self) -> std::result::Result<(), HaQLiteError> {
         if self.inner.mode != HaMode::Shared {
             return Ok(());
         }
-        let manifest_store = match &self.inner.shared_manifest_store {
-            Some(ms) => ms,
-            None => return Ok(()),
-        };
         let vfs = match &self.inner.shared_turbolite_vfs {
             Some(vfs) => vfs,
             None => return Ok(()),
         };
-        let manifest_key = format!("{}_manifest", self.inner.shared_prefix);
-        let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
-        match manifest_store.meta(&manifest_key).await {
-            Ok(Some(meta)) if meta.version > cached => {
-                // Catch up via turbolite set_manifest (all modes).
-                // Evicts changed groups from cache; next read fetches from S3.
-                if let Ok(Some(ha_manifest)) = manifest_store.get(&manifest_key).await {
-                    let is_tl = matches!(
-                        &ha_manifest.storage,
-                        hadb::StorageManifest::Turbolite { .. }
-                        | hadb::StorageManifest::TurboliteWalrust { .. }
-                    );
-                    if is_tl {
-                        let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
-                        vfs.set_manifest(tl_manifest);
-                        // Use version from the manifest body, not the meta() call,
-                        // to avoid races with concurrent writers.
-                        self.inner.cached_manifest_version.store(ha_manifest.version, Ordering::SeqCst);
-                        // Drop connection to invalidate SQLite pager cache.
-                        self.inner.set_conn(None);
-                    }
+
+        if self.inner.shared_replicator.is_none() {
+            // Synchronous: fetch turbolite S3 manifest directly (single source of truth)
+            let vfs_clone = vfs.clone();
+            let current_version = vfs.manifest().version;
+            let fetch_result = tokio::task::spawn_blocking(move || {
+                vfs_clone.fetch_and_apply_s3_manifest()
+            }).await.map_err(|e| HaQLiteError::DatabaseError(
+                format!("manifest fetch panicked: {}", e)))?;
+            match fetch_result {
+                Ok(Some(version)) if version > current_version => {
+                    self.inner.set_conn(None);
                 }
+                _ => {}
             }
-            _ => {}
+        } else {
+            // Eventual: use HA manifest store (wraps turbolite + walrust)
+            let manifest_store = match &self.inner.shared_manifest_store {
+                Some(ms) => ms,
+                None => return Ok(()),
+            };
+            let manifest_key = format!("{}_manifest", self.inner.shared_prefix);
+            let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
+            match manifest_store.meta(&manifest_key).await {
+                Ok(Some(meta)) if meta.version > cached => {
+                    self.catch_up_from_manifest(manifest_store.as_ref(), &manifest_key, vfs).await?;
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -1203,10 +1200,31 @@ impl HaQLite {
 
         // 2-5. Critical section (lease always released, even on error)
         let result: std::result::Result<u64, HaQLiteError> = async {
-            // 2. Catch up: apply latest manifest to turbolite VFS
-            self.catch_up_from_manifest(manifest_store.as_ref(), &manifest_key, vfs).await?;
-
-            let cached_version = self.inner.cached_manifest_version.load(Ordering::SeqCst);
+            // 2. Catch up from the authoritative manifest.
+            // Synchronous (S3Primary): turbolite's S3 manifest is the source of
+            // truth -- xSync publishes it atomically on every commit. Reading it
+            // directly avoids the HA manifest indirection (which can be stale).
+            // Eventual (walrust): uses the HA manifest which wraps turbolite state
+            // + walrust seq, published as a separate step after flush.
+            if self.inner.shared_replicator.is_none() {
+                // Synchronous: catch up directly from turbolite S3 manifest
+                let vfs_clone = vfs.clone();
+                let fetch_result = tokio::task::spawn_blocking(move || {
+                    vfs_clone.fetch_and_apply_s3_manifest()
+                }).await.map_err(|e| HaQLiteError::DatabaseError(
+                    format!("manifest fetch task panicked: {}", e)))?;
+                match fetch_result {
+                    Ok(Some(_version)) => {
+                        self.inner.set_conn(None);
+                    }
+                    Ok(None) => {} // no manifest yet (first write)
+                    Err(e) => return Err(HaQLiteError::ReplicationError(
+                        format!("turbolite manifest fetch: {}", e))),
+                }
+            } else {
+                // Eventual: catch up from HA manifest (wraps turbolite + walrust)
+                self.catch_up_from_manifest(manifest_store.as_ref(), &manifest_key, vfs).await?;
+            }
 
             // 3. Write: ensure schema + execute SQL (all synchronous, no .await)
             {
@@ -1222,9 +1240,10 @@ impl HaQLite {
             }
             let rows = self.execute_local(sql, params)?;
 
-            // 4. Sync: flush turbolite + walrust to S3 (Eventual durability only)
+            // 4. Sync: flush turbolite + walrust to S3 (Eventual durability only).
+            // For Synchronous: xSync already published the turbolite manifest
+            // during execute_local, so no separate sync or manifest publish needed.
             if let Some(ref rep) = self.inner.shared_replicator {
-                // Checkpoint + flush are synchronous (no MutexGuard across await)
                 {
                     let conn = self.inner.ensure_turbolite_conn()?;
                     let c = conn.lock().map_err(|_| HaQLiteError::DatabaseError("lock".into()))?;
@@ -1236,10 +1255,11 @@ impl HaQLite {
                 }
                 rep.sync(&self.inner.db_name).await.map_err(|e|
                     HaQLiteError::ReplicationError(format!("walrust sync: {}", e)))?;
-            }
 
-            // 5. Publish manifest (CAS ensures no other writer published between us)
-            self.publish_manifest(manifest_store.as_ref(), &manifest_key, vfs, cached_version).await?;
+                // 5. Publish HA manifest (Eventual only -- wraps turbolite + walrust state)
+                let cached_version = self.inner.cached_manifest_version.load(Ordering::SeqCst);
+                self.publish_manifest(manifest_store.as_ref(), &manifest_key, vfs, cached_version).await?;
+            }
 
             Ok(rows)
         }.await;
