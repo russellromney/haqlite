@@ -1316,9 +1316,8 @@ def run_dedicated_replicated(args):
         print("  --- Double failover ---")
         test_double_failover(mt, result)
 
-        # Durability-across-restarts not applicable for Dedicated+Replicated:
-        # walrust data is in S3 but the Coordinator join path doesn't pull
-        # when the node becomes leader immediately (no follower phase).
+        print("  --- Durability across restarts ---")
+        test_durability_across_restarts(mt, result)
 
     except Exception as e:
         result.fail(f"Unexpected error: {e}")
@@ -1484,7 +1483,7 @@ def run_dedicated_eventual(args):
 # Chaos / resilience tests (Dedicated+Eventual)
 # ---------------------------------------------------------------------------
 
-def test_sigkill_during_sync(result):
+def test_sigkill_during_sync(result, topology="dedicated", durability="eventual"):
     """Write continuously, SIGKILL at random moment, verify no corruption."""
     prefix = f"chaos-sync-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
     tmp = tempfile.mkdtemp(prefix="haqlite_chaos_sync_")
@@ -1497,7 +1496,7 @@ def test_sigkill_during_sync(result):
 
     for iteration in range(iterations):
         iter_prefix = f"{prefix}iter{iteration}/"
-        s = ServerProcess("dedicated", "eventual", BASE_PORT + 70, f"chaos-{iteration}",
+        s = ServerProcess(topology, durability, BASE_PORT + 70, f"chaos-{iteration}",
                           iter_prefix, tmp, lease_ttl=5, extra_args=extra)
         s.start()
         if not s.wait_healthy(timeout=30):
@@ -1523,7 +1522,7 @@ def test_sigkill_during_sync(result):
         time.sleep(2)
 
         # Start fresh node with same prefix, check for corruption
-        fresh = ServerProcess("dedicated", "eventual", BASE_PORT + 71, f"fresh-{iteration}",
+        fresh = ServerProcess(topology, durability, BASE_PORT + 71, f"fresh-{iteration}",
                               iter_prefix, tmp, lease_ttl=5, extra_args=extra)
         fresh.start()
         if not fresh.wait_healthy(timeout=30):
@@ -1570,7 +1569,7 @@ def test_sigkill_during_sync(result):
     result.ok(f"SIGKILL-during-sync: {iterations} iterations complete")
 
 
-def test_rpo_measurement(result):
+def test_rpo_measurement(result, topology="dedicated", durability="eventual"):
     """Measure recovery point objective: write, kill after N ms, check survival."""
     prefix = f"chaos-rpo-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
     tmp = tempfile.mkdtemp(prefix="haqlite_chaos_rpo_")
@@ -1582,7 +1581,7 @@ def test_rpo_measurement(result):
 
     for delay_ms in delays_ms:
         iter_prefix = f"{prefix}rpo{delay_ms}/"
-        s = ServerProcess("dedicated", "eventual", BASE_PORT + 72, f"rpo-{delay_ms}",
+        s = ServerProcess(topology, durability, BASE_PORT + 72, f"rpo-{delay_ms}",
                           iter_prefix, tmp, lease_ttl=5, extra_args=extra)
         s.start()
         if not s.wait_healthy(timeout=30):
@@ -1608,7 +1607,7 @@ def test_rpo_measurement(result):
         time.sleep(2)
 
         # Fresh node
-        fresh = ServerProcess("dedicated", "eventual", BASE_PORT + 73, f"rpo-fresh-{delay_ms}",
+        fresh = ServerProcess(topology, durability, BASE_PORT + 73, f"rpo-fresh-{delay_ms}",
                               iter_prefix, tmp, lease_ttl=5, extra_args=extra)
         fresh.start()
         if not fresh.wait_healthy(timeout=30):
@@ -1652,7 +1651,7 @@ def test_rpo_measurement(result):
     result.check(base_ok, f"Pre-synced rows survive all kills (base_rows >= 10 for all delays)")
 
 
-def test_changeset_chain_integrity(result):
+def test_changeset_chain_integrity(result, topology="dedicated", durability="eventual"):
     """After double failover, verify a cold walrust restore produces valid data."""
     prefix = f"chaos-chain-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
     tmp = tempfile.mkdtemp(prefix="haqlite_chaos_chain_")
@@ -1662,7 +1661,7 @@ def test_changeset_chain_integrity(result):
     # 3 nodes
     servers = []
     for i in range(3):
-        s = ServerProcess("dedicated", "eventual", BASE_PORT + 74 + i, f"chain-{i}",
+        s = ServerProcess(topology, durability, BASE_PORT + 74 + i, f"chain-{i}",
                           prefix, tmp, lease_ttl=5, extra_args=extra)
         s.start()
         servers.append(s)
@@ -1741,7 +1740,7 @@ def test_changeset_chain_integrity(result):
     time.sleep(3)
 
     # Cold restore: fresh node with same prefix
-    fresh = ServerProcess("dedicated", "eventual", BASE_PORT + 77, "chain-fresh",
+    fresh = ServerProcess(topology, durability, BASE_PORT + 77, "chain-fresh",
                           prefix, tmp, lease_ttl=5, extra_args=extra)
     fresh.start()
     if not fresh.wait_healthy(timeout=30):
@@ -1771,16 +1770,16 @@ def test_changeset_chain_integrity(result):
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_concurrent_readers_during_failover(result):
+def test_concurrent_readers_during_failover(result, topology="dedicated", durability="eventual"):
     """Readers on follower must not crash or return corrupt data during leader kill."""
     prefix = f"chaos-readers-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
     tmp = tempfile.mkdtemp(prefix="haqlite_chaos_readers_")
     extra = ["--sync-interval-ms", "500", "--follower-pull-ms", "500",
              "--follower-poll-ms", "500", "--renew-interval-ms", "1000"]
 
-    s0 = ServerProcess("dedicated", "eventual", BASE_PORT + 80, "read-0",
+    s0 = ServerProcess(topology, durability, BASE_PORT + 80, "read-0",
                        prefix, tmp, lease_ttl=5, extra_args=extra)
-    s1 = ServerProcess("dedicated", "eventual", BASE_PORT + 81, "read-1",
+    s1 = ServerProcess(topology, durability, BASE_PORT + 81, "read-1",
                        prefix, tmp, lease_ttl=5, extra_args=extra)
     s0.start(); s1.start()
     if not s0.wait_healthy(timeout=30) or not s1.wait_healthy(timeout=30):
@@ -1854,7 +1853,7 @@ def test_concurrent_readers_during_failover(result):
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_rapid_kill_restart(result):
+def test_rapid_kill_restart(result, topology="dedicated", durability="eventual"):
     """Kill and promote 5 times with minimal settle, verify data integrity."""
     prefix = f"chaos-rapid-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
     tmp = tempfile.mkdtemp(prefix="haqlite_chaos_rapid_")
@@ -1865,7 +1864,7 @@ def test_rapid_kill_restart(result):
     num_cycles = 5
 
     # Start first leader
-    current = ServerProcess("dedicated", "eventual", BASE_PORT + 85, "rapid-0",
+    current = ServerProcess(topology, durability, BASE_PORT + 85, "rapid-0",
                             prefix, tmp, lease_ttl=5, extra_args=extra)
     current.start()
     if not current.wait_healthy(timeout=30):
@@ -1893,7 +1892,7 @@ def test_rapid_kill_restart(result):
         time.sleep(2)
 
         # Start next leader
-        next_s = ServerProcess("dedicated", "eventual", BASE_PORT + 86 + cycle,
+        next_s = ServerProcess(topology, durability, BASE_PORT + 86 + cycle,
                                f"rapid-{cycle+1}", prefix, tmp, lease_ttl=5, extra_args=extra)
         next_s.start()
         if not next_s.wait_healthy(timeout=30):
@@ -1927,29 +1926,30 @@ def test_rapid_kill_restart(result):
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-def run_chaos_dedicated_eventual(args):
-    """Chaos and resilience tests for Dedicated + Eventual."""
+def run_chaos(args, topology, durability):
+    """Generic chaos runner for any dedicated mode."""
+    mode_label = f"{topology}-{durability}"
     print("\n" + "=" * 70)
-    print("CHAOS: Dedicated + Eventual resilience tests")
+    print(f"CHAOS: {topology.title()} + {durability.title()} resilience tests")
     print("=" * 70)
 
-    result = TestResult("chaos-dedicated-eventual")
+    result = TestResult(f"chaos-{mode_label}")
 
     try:
         print("\n  --- SIGKILL during sync ---")
-        test_sigkill_during_sync(result)
+        test_sigkill_during_sync(result, topology, durability)
 
         print("\n  --- RPO measurement ---")
-        test_rpo_measurement(result)
+        test_rpo_measurement(result, topology, durability)
 
         print("\n  --- Changeset chain integrity ---")
-        test_changeset_chain_integrity(result)
+        test_changeset_chain_integrity(result, topology, durability)
 
         print("\n  --- Concurrent readers during failover ---")
-        test_concurrent_readers_during_failover(result)
+        test_concurrent_readers_during_failover(result, topology, durability)
 
         print("\n  --- Rapid kill/restart cycle ---")
-        test_rapid_kill_restart(result)
+        test_rapid_kill_restart(result, topology, durability)
 
     except Exception as e:
         result.fail(f"Unexpected error: {e}")
@@ -1957,6 +1957,14 @@ def run_chaos_dedicated_eventual(args):
         traceback.print_exc()
 
     return result
+
+
+def run_chaos_dedicated_eventual(args):
+    return run_chaos(args, "dedicated", "eventual")
+
+
+def run_chaos_dedicated_replicated(args):
+    return run_chaos(args, "dedicated", "replicated")
 
 
 # ---------------------------------------------------------------------------
@@ -1979,6 +1987,7 @@ BASIC_MODES = {
 
 CHAOS_MODES = {
     ("dedicated", "eventual"): run_chaos_dedicated_eventual,
+    ("dedicated", "replicated"): run_chaos_dedicated_replicated,
 }
 
 def resolve_modes(mode_str):
