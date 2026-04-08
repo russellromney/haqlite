@@ -78,9 +78,15 @@ impl FollowerBehavior for SqliteFollowerBehavior {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        // Check cancel before doing S3 work. The cancel_rx is set
+                        // during promotion, and we must not call set_manifest after
+                        // the leader starts writing (it would evict dirty pages).
+                        if *cancel_rx.borrow() {
+                            let v = position.load(Ordering::SeqCst);
+                            tracing::info!("Follower '{}': cancelled before poll at turbolite manifest v{}", db_name, v);
+                            return Ok(());
+                        }
                         let current_version = position.load(Ordering::SeqCst);
-                        // fetch_and_apply_s3_manifest is blocking (S3 I/O).
-                        // Run in spawn_blocking to avoid blocking the tokio runtime.
                         let vfs_clone = vfs.clone();
                         let fetch_result = tokio::task::spawn_blocking(move || {
                             vfs_clone.fetch_and_apply_s3_manifest()

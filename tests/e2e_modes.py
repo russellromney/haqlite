@@ -917,11 +917,23 @@ def test_double_failover(mode_test, result):
     promoted_idx = None
     remaining_url = None
     remaining_idx = None
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        for idx, url in followers:
+            try:
+                s = get_json(f"{url}/status")
+                if s.get("role") == "Leader":
+                    promoted_url = url
+                    promoted_idx = idx
+            except Exception:
+                pass
+        if promoted_url:
+            break
+        time.sleep(0.5)
+
+    # Set remaining as whichever follower did NOT promote
     for idx, url in followers:
-        if wait_role(url, "Leader", timeout=30):
-            promoted_url = url
-            promoted_idx = idx
-        else:
+        if idx != promoted_idx:
             remaining_url = url
             remaining_idx = idx
 
@@ -1002,7 +1014,8 @@ def test_double_failover(mode_test, result):
                 line = _re.sub(chr(27) + r'\[[0-9;]*m', '', line).strip()
                 if any(k in line for k in ['S3 fetch', 'CACHE MISS', 'CACHE HIT',
                                            'evict', 'set_manifest', 'catchup',
-                                           'promotion', 'test_data', 'promoted']):
+                                           'promotion', 'test_data', 'promoted',
+                                           'building v', 'REJECTED']):
                     if 'page 0' not in line:
                         relevant.append(line[:200])
             if relevant:
