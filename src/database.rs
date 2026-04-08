@@ -667,14 +667,10 @@ impl HaQLiteInner {
     /// we can't open the connection during open_shared_turbolite because
     /// it would trigger unwanted S3Primary xSync uploads.
     fn ensure_turbolite_conn(&self) -> std::result::Result<Arc<Mutex<rusqlite::Connection>>, HaQLiteError> {
-        // Fast path: connection already exists
         if let Some(conn) = self.get_conn()? {
-            tracing::info!("[ensure_turbolite_conn] fast path: reusing existing connection");
             return Ok(conn);
         }
-        tracing::info!("[ensure_turbolite_conn] slow path: creating new connection");
 
-        // Slow path: open a new connection via VFS URI
         let vfs_name = self.shared_turbolite_vfs_name.as_ref()
             .ok_or(HaQLiteError::ConfigurationError("VFS name required for turbolite conn".into()))?;
         let vfs_uri = format!("file:{}?vfs={}", self.db_path.display(), vfs_name);
@@ -687,17 +683,13 @@ impl HaQLiteInner {
             format!("lazy turbolite conn open for '{}': {}", self.db_name, e)
         ))?;
 
-        // Set journal mode. S3Primary VFS defaults to journal_mode=OFF which
-        // prevents SQLite from calling xSync on commit (data never reaches S3).
-        // Switch to DELETE mode and force-sync the mode change to persist it
-        // in the turbolite db_header for future connection opens.
+        // S3Primary VFS defaults to journal_mode=OFF which prevents SQLite from
+        // calling xSync on commit (data never reaches S3). Switch to DELETE so
+        // xSync fires every commit.
         let current_mode: String = new_conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap_or_else(|_| "unknown".to_string());
-        tracing::info!("[ensure_turbolite_conn] journal_mode={}", current_mode);
         if current_mode == "off" {
-            // S3Primary VFS defaults to journal_mode=OFF which prevents SQLite
-            // from calling xSync. Switch to DELETE so xSync fires every commit.
             new_conn.execute_batch("PRAGMA journal_mode=DELETE;")
                 .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma DELETE: {}", e)))?;
         } else if current_mode != "wal" && current_mode != "delete" && current_mode != "memory" {
@@ -1218,10 +1210,9 @@ impl HaQLite {
 
             // 3. Write: ensure schema + execute SQL (all synchronous, no .await)
             {
-                self.inner.ensure_turbolite_conn()?;
+                let conn = self.inner.ensure_turbolite_conn()?;
                 if !self.inner.schema_applied.load(Ordering::SeqCst) {
                     if let Some(ref schema) = self.inner.schema_sql {
-                        let conn = self.inner.ensure_turbolite_conn()?;
                         let c = conn.lock().map_err(|_| HaQLiteError::DatabaseError("lock".into()))?;
                         c.execute_batch(schema)
                             .map_err(|e| HaQLiteError::DatabaseError(format!("schema: {}", e)))?;
@@ -1229,14 +1220,7 @@ impl HaQLite {
                     self.inner.schema_applied.store(true, Ordering::SeqCst);
                 }
             }
-            // Check VFS manifest version before write
-            let vfs_v_before = vfs.manifest().version;
             let rows = self.execute_local(sql, params)?;
-            let vfs_v_after = vfs.manifest().version;
-            tracing::info!(
-                "[execute_shared] wrote {} rows, vfs_v: {} -> {}",
-                rows, vfs_v_before, vfs_v_after,
-            );
 
             // 4. Sync: flush turbolite + walrust to S3 (Eventual durability only)
             if let Some(ref rep) = self.inner.shared_replicator {
@@ -1793,7 +1777,8 @@ async fn open_shared_turbolite(
 ) -> Result<HaQLite> {
     let vfs_uri = format!("file:{}?vfs={}", db_path.display(), vfs_name);
 
-    // Probe the VFS to check for existing S3 data.
+    // Initialize the VFS manifest from S3/local. READ_ONLY so no pages are
+    // written to the cache. Schema is deferred to first execute_shared().
     {
         let _ = rusqlite::Connection::open_with_flags(
             &vfs_uri,
@@ -1801,22 +1786,6 @@ async fn open_shared_turbolite(
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         ).ok(); // may fail on fresh DB, that's fine
     }
-    let s3_has_data = vfs.manifest().page_count > 0;
-
-    if !s3_has_data {
-        // First node ever: create schema. No other nodes exist yet, so no
-        // lease contention. The schema creation writes to S3 (S3Primary) or
-        // local cache (Durable), establishing the initial database state.
-        let conn = rusqlite::Connection::open_with_flags(
-            &vfs_uri,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )?;
-        conn.execute_batch(schema)?;
-    }
-    // If S3 data exists: another node already created the schema.
-    // Schema is applied idempotently on first write via deferred path.
 
     // walrust operates on the db_path (tl_seq.db) which is hardlinked to turbolite's
     // cache file (data.cache). Both walrust and turbolite see the same page data.
@@ -1834,25 +1803,9 @@ async fn open_shared_turbolite(
     // No restore, no snapshots. Catch-up is via turbolite set_manifest.
     // walrust only ships WAL frames for durability between checkpoints.
     if let Some(ref rep) = replicator {
-        // Hardlink db_path -> data.cache for walrust file access
-        let cache_file = vfs.cache_file_path();
-        if cache_file.exists() {
-            let db_size = db_path.metadata().map(|m| m.len()).unwrap_or(0);
-            if db_size == 0 {
-                let _ = std::fs::remove_file(&db_path);
-                std::fs::hard_link(&cache_file, &db_path)
-                    .or_else(|_| std::fs::copy(&cache_file, &db_path).map(|_| ()))
-                    .map_err(|e| anyhow::anyhow!("link db_path to cache file: {}", e))?;
-            }
-        }
-
         rep.add_without_snapshot(db_name, &db_path).await
             .map_err(|e| anyhow::anyhow!("walrust registration failed for '{}': {}", db_name, e))?;
     }
-
-    // Clear in-process locks from schema connection before opening persistent connection
-    // Note: turbolite should release in-process locks on connection close.
-    // If "database is locked" occurs here, it's a turbolite VFS bug.
 
     // For Synchronous durability (S3Primary, no walrust): defer connection open to first use.
     // Opening a read-write connection via turbolite VFS in S3Primary mode triggers

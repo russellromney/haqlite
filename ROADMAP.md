@@ -5,6 +5,23 @@
 
 Close the remaining safety gaps in haqlite's 5 mode combinations (Shared x Synchronous/Eventual, Dedicated x Replicated/Synchronous/Eventual). All steps require real Tigris S3 (hadb-test-bucket, single-region iad). Run via `soup run --project hadb --env development`.
 
+### 0. Code cleanup (post-debugging cruft)
+
+Phases Cannae through Thermopylae involved a lot of churn: multiple "fixes" tried before root causes were found, debug logging added and never removed, defensive code that's no longer needed. Clean it all up before adding more features.
+
+**database.rs:**
+- [ ] Remove debug tracing in ensure_turbolite_conn (lines 672, 675, 697: "fast path", "slow path", journal_mode)
+- [ ] Remove or demote VFS version delta logging in execute_shared (lines 1236-1239)
+- [ ] Remove redundant ensure_turbolite_conn call in execute_shared (line 1221, result thrown away; line 1224 is sufficient)
+- [ ] Consolidate duplicate hardlink blocks in open_shared_turbolite (lines 1813-1819 vs 1825-1835)
+- [ ] Remove deprecated query_row and query_values wrappers (lines 914-926, 1013-1017), no external callers
+- [ ] Rewrite comment at lines 1796-1800 to explain design rationale, not bug-fix context
+
+**follower_behavior.rs:**
+- [ ] Remove redundant caught_up stores (lines 106-107, 156-157: set false then immediately true with no work between)
+- [ ] Downgrade cancellation logs to debug! (lines 86, 127, 172: normal shutdown, not errors)
+- [ ] Fix "Data may be lost" warnings in catchup_on_promotion (lines 205-214): either propagate the error or remove the alarming text
+
 ### a. Dedicated+Synchronous follower reads
 Follower is currently warm standby only (no reads). Wire follower reads through turbolite VFS so followers can serve stale-ok reads like the other Dedicated modes.
 - [ ] Follower opens turbolite VFS connection on join (not plain SQLite)
@@ -14,7 +31,41 @@ Follower is currently warm standby only (no reads). Wire follower reads through 
 - [ ] Test: leader writes continuously, follower eventually sees all rows
 - [ ] Remove "follower read check skipped" workaround from e2e_modes.py
 
-### b. 3-node double failover
+### b. Test coverage for missing modes
+
+Current coverage is heavily skewed toward Mode 4 (Shared+Synchronous). The modes people will actually use most (Dedicated+Replicated, Dedicated+Eventual) have the worst coverage. Prioritized by expected usage.
+
+**Mode 3 (Dedicated+Eventual): zero tests exist, most popular mode**
+- [ ] Happy path: leader writes, follower catches up via turbolite + walrust
+- [ ] Crash recovery: kill leader mid-write, verify walrust WAL frames are replayed correctly on follower
+- [ ] Durability: kill all nodes, restart fresh node, verify data from S3
+- [ ] Follower reads: follower serves stale-ok reads during leader writes
+- [ ] Sustained writes: leader writes for 60s, follower stays caught up
+
+**Mode 1 (Dedicated+Replicated): existing tests use old Coordinator API**
+- [ ] Rewrite ha_database.rs tests to use HaQLite::builder() instead of raw Coordinator API
+- [ ] Add crash recovery test: kill leader, follower promotes, data intact
+- [ ] Add concurrent read test: follower serves stale reads during leader writes
+
+**Mode 5 (Shared+Eventual): only 2 test functions exist**
+- [ ] Crash recovery: node dies mid-write, other node takes over
+- [ ] Split brain prevention: slow storage causes lease expiration
+- [ ] Concurrent writes: 4-node stress test with short lease TTL
+- [ ] Durability across restarts: kill all, fresh node recovers from S3 + walrust
+
+**Mode 2 (Dedicated+Synchronous): zero tests exist**
+- [ ] Happy path: leader writes, follower catches up via turbolite manifest
+- [ ] Crash recovery: kill leader, follower promotes, reads all data from S3
+- [ ] Sequential writes after failover: new leader writes, old follower restarts as follower
+
+### c. Fix broken and misleading tests
+
+- [ ] Un-ignore shared_mode_failure_then_recovery_one_writer in shared_mode.rs (fix or delete)
+- [ ] Fix SlowStorage in lease_split_brain.rs: delay is set to Duration::ZERO, defeating the test's purpose
+- [ ] Rename mode_matrix.rs (only tests Mode 4 encoding combos, not a mode matrix) or expand it to actually test all 5 modes
+- [ ] Fix weak assertions in lease tests: "at least one succeeded" should be "exactly N succeeded" where deterministic
+
+### d. 3-node double failover
 Prove the system survives cascading leader failures.
 - [ ] Start 3 nodes (1 leader, 2 followers)
 - [ ] Write data to leader
@@ -25,7 +76,7 @@ Prove the system survives cascading leader failures.
 - [ ] Write more data to final leader
 - [ ] Test for Dedicated+Replicated, Dedicated+Synchronous, Dedicated+Eventual
 
-### c. Network partition simulation
+### e. Network partition simulation
 Test leader self-demotion when lease renewal fails.
 - [ ] Start 2 nodes, leader + follower
 - [ ] Write data to leader
@@ -35,14 +86,15 @@ Test leader self-demotion when lease renewal fails.
 - [ ] Verify no split-brain: old leader rejects writes after self-demotion
 - [ ] Test for Dedicated+Replicated (simplest to reason about)
 
-### d. Long soak test
+### f. Long soak test
 Sustained writes for 5+ minutes, checking for resource leaks, error accumulation, and performance degradation.
 - [ ] Shared+Synchronous: 2 nodes, alternating writes for 5 minutes, verify 0 data loss
+- [ ] Shared+Eventual: same parameters
 - [ ] Dedicated+Replicated: leader writes for 5 minutes, verify follower caught up
-- [ ] Monitor: memory usage stable, no goroutine/task leaks, error rate stays low
+- [ ] Monitor: memory usage stable, no task leaks, error rate stays low
 - [ ] Final verification: all Ok writes readable from all nodes
 
-### e. Concurrent shared writes with NATS lease store
+### g. Concurrent shared writes with NATS lease store
 True concurrent multi-node writes require atomic CAS (S3 doesn't provide it). Wire up hadb-lease-nats and prove concurrent writes are safe.
 - [ ] Start local NATS server (or use Fly NATS)
 - [ ] Configure haqlite experiment binary to use --lease-store nats

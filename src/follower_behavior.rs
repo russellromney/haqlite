@@ -82,8 +82,6 @@ impl FollowerBehavior for SqliteFollowerBehavior {
                         // during promotion, and we must not call set_manifest after
                         // the leader starts writing (it would evict dirty pages).
                         if *cancel_rx.borrow() {
-                            let v = position.load(Ordering::SeqCst);
-                            tracing::info!("Follower '{}': cancelled before poll at turbolite manifest v{}", db_name, v);
                             return Ok(());
                         }
                         let current_version = position.load(Ordering::SeqCst);
@@ -94,8 +92,6 @@ impl FollowerBehavior for SqliteFollowerBehavior {
 
                         match fetch_result {
                             Ok(Ok(Some(new_version))) if new_version > current_version => {
-                                caught_up.store(false, Ordering::SeqCst);
-                                metrics.follower_caught_up.store(0, Ordering::Relaxed);
                                 tracing::debug!(
                                     "Follower '{}': turbolite manifest v{} -> v{}",
                                     db_name, current_version, new_version,
@@ -123,8 +119,6 @@ impl FollowerBehavior for SqliteFollowerBehavior {
                         }
                     }
                     _ = cancel_rx.changed() => {
-                        let v = position.load(Ordering::SeqCst);
-                        tracing::info!("Follower '{}': cancelled at turbolite manifest v{}", db_name, v);
                         return Ok(());
                     }
                 }
@@ -144,8 +138,6 @@ impl FollowerBehavior for SqliteFollowerBehavior {
                         ).await {
                             Ok(new_seq) => {
                                 if new_seq > current_seq {
-                                    caught_up.store(false, Ordering::SeqCst);
-                                    metrics.follower_caught_up.store(0, Ordering::Relaxed);
                                     tracing::debug!(
                                         "Follower '{}': pulled seq {} -> {}",
                                         db_name, current_seq, new_seq
@@ -168,8 +160,6 @@ impl FollowerBehavior for SqliteFollowerBehavior {
                         }
                     }
                     _ = cancel_rx.changed() => {
-                        let current_seq = position.load(Ordering::SeqCst);
-                        tracing::info!("Follower '{}': cancelled at seq {}", db_name, current_seq);
                         return Ok(());
                     }
                 }
@@ -194,27 +184,18 @@ impl FollowerBehavior for SqliteFollowerBehavior {
             }).await.map_err(|e| anyhow::anyhow!("manifest fetch task panicked: {}", e))?;
 
             match result {
-                Ok(Some(version)) => {
-                    let vfs_version = vfs.manifest().version;
-                    tracing::info!(
-                        "SqliteFollowerBehavior '{}': turbolite catchup to v{} on promotion (VFS manifest now v{}, page_count={})",
-                        db_name, version, vfs_version, vfs.manifest().page_count,
-                    );
-                }
+                Ok(Some(_version)) => Ok(()),
                 Ok(None) => {
-                    tracing::error!(
-                        "SqliteFollowerBehavior '{}': no turbolite manifest in S3 on promotion! Data may be lost.",
-                        db_name,
-                    );
+                    // No manifest in S3 is normal for a fresh cluster.
+                    Ok(())
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "SqliteFollowerBehavior '{}': turbolite manifest fetch on promotion FAILED: {}. Data may be lost.",
+                    Err(anyhow::anyhow!(
+                        "turbolite manifest fetch failed on promotion for '{}': {}",
                         db_name, e,
-                    );
+                    ))
                 }
             }
-            Ok(())
         } else {
             // WAL-based catch-up on promotion.
             let new_seq = walrust::sync::pull_incremental(

@@ -951,7 +951,11 @@ def test_double_failover(mode_test, result):
             phase2_writes.append(row_id)
     result.check(len(phase2_writes) >= 3, f"Phase 2: wrote {len(phase2_writes)} rows to leader-2")
 
-    time.sleep(8)  # replication lag (walrust snapshot upload + sync + follower pull)
+    # Replication lag: promoted leader needs time for snapshot upload + walrust
+    # sync + follower pull. Eventual/Replicated modes need longer because walrust
+    # sync is async and the follower also needs time to pull incremental updates.
+    phase2_settle = 10 if mode_test.durability == "synchronous" else 20
+    time.sleep(phase2_settle)
 
     # Kill leader-2
     mode_test.servers[promoted_idx].kill()
@@ -993,10 +997,9 @@ def test_double_failover(mode_test, result):
         p1_ok,
         f"Leader-3 has {len(phase1_writes) - phase1_missing}/{len(phase1_writes)} phase-1 rows (missing={phase1_missing})"
     )
-    # Phase-2 rows may be lost for walrust-based modes because the promoted
-    # leader's initial snapshot upload can take longer than the kill window.
-    # Turbolite modes (Synchronous) should have 0 missing.
-    p2_ok = phase2_missing == 0 or mode_test.durability != "synchronous"
+    # Phase-2 rows should survive: the settle time (15s for walrust modes)
+    # gives the promoted leader time to sync writes to S3.
+    p2_ok = phase2_missing == 0
     result.check(
         p2_ok,
         f"Leader-3 has {len(phase2_writes) - phase2_missing}/{len(phase2_writes)} phase-2 rows (missing={phase2_missing})"
@@ -1048,8 +1051,11 @@ def test_durability_across_restarts(mode_test, result):
 
     result.check(len(writes) == 10, f"Wrote {len(writes)} rows")
 
-    # Wait for S3 writes to settle before killing
-    time.sleep(2)
+    # Wait for S3 writes to settle before killing.
+    # Synchronous durability (S3Primary) writes on every commit, 2s is enough.
+    # Eventual/Replicated durability uses async walrust sync, needs longer.
+    settle_time = 2 if mode_test.durability == "synchronous" else 8
+    time.sleep(settle_time)
 
     # Kill all nodes
     for s in mode_test.servers:
@@ -1304,11 +1310,11 @@ def run_dedicated_replicated(args):
         print("  --- Write forwarding ---")
         test_dedicated_write_forwarding(mt, result)
 
-        print("  --- Double failover ---")
-        test_double_failover(mt, result)
-
         print("  --- Sustained writes ---")
         test_dedicated_sustained_writes(mt, result)
+
+        print("  --- Double failover ---")
+        test_double_failover(mt, result)
 
         # Durability-across-restarts not applicable for Dedicated+Replicated:
         # walrust data is in S3 but the Coordinator join path doesn't pull
@@ -1452,11 +1458,17 @@ def run_dedicated_eventual(args):
         print("  --- Write forwarding ---")
         test_dedicated_write_forwarding(mt, result)
 
+        print("  --- Sustained writes ---")
+        test_dedicated_sustained_writes(mt, result)
+
+        # Destructive tests (kill nodes). Double failover includes leader
+        # failover as phase 1, so no separate leader failover test needed.
+        # Durability kills all nodes and starts a fresh one.
         print("  --- Double failover ---")
         test_double_failover(mt, result)
 
-        print("  --- Sustained writes ---")
-        test_dedicated_sustained_writes(mt, result)
+        print("  --- Durability across restarts ---")
+        test_durability_across_restarts(mt, result)
 
     except Exception as e:
         result.fail(f"Unexpected error: {e}")
