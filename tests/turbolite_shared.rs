@@ -45,6 +45,7 @@ async fn build_turbolite_shared(
     HaQLite::builder("unused-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
+        .durability(haqlite::Durability::Synchronous)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, vfs_name)
@@ -120,7 +121,7 @@ async fn turbolite_shared_manifest_published_after_write() {
 
     // Manifest should exist
     let meta = manifest_store
-        .meta("test/test/_manifest")
+        .meta("test/_manifest")
         .await
         .expect("meta call")
         .expect("manifest should exist");
@@ -128,7 +129,7 @@ async fn turbolite_shared_manifest_published_after_write() {
 
     // Manifest should be Turbolite variant
     let manifest = manifest_store
-        .get("test/test/_manifest")
+        .get("test/_manifest")
         .await
         .expect("get call")
         .expect("manifest should exist");
@@ -166,7 +167,7 @@ async fn turbolite_shared_sequential_writes_increment_manifest() {
     }
 
     let meta = manifest_store
-        .meta("test/test/_manifest")
+        .meta("test/_manifest")
         .await
         .expect("meta call")
         .expect("manifest should exist");
@@ -207,7 +208,7 @@ async fn turbolite_shared_manifest_has_turbolite_fields() {
     .expect("insert");
 
     let manifest = manifest_store
-        .get("test/test/_manifest")
+        .get("test/_manifest")
         .await
         .expect("get")
         .expect("manifest");
@@ -319,7 +320,11 @@ async fn turbolite_shared_empty_table_read() {
     )
     .await;
 
-    // Read from empty table (no writes)
+    // Schema is deferred to first write. Do a no-op write to create the table.
+    db.execute("INSERT INTO t VALUES (1, 'init')", &[]).await.expect("init write");
+    db.execute("DELETE FROM t WHERE id = 1", &[]).await.expect("cleanup");
+
+    // Read from empty table
     let count: i64 = db
         .query_row("SELECT COUNT(*) FROM t", &[], |r| r.get(0))
         .expect("count");
@@ -351,7 +356,7 @@ async fn turbolite_shared_manifest_writer_id_set() {
     .expect("insert");
 
     let manifest = manifest_store
-        .get("test/test/_manifest")
+        .get("test/_manifest")
         .await
         .expect("get")
         .expect("manifest");

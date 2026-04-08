@@ -2,20 +2,44 @@
 //!
 //! Prove: at most one writer succeeds at any time in Shared mode,
 //! even when leases expire due to slow S3 operations.
+//!
+//! Requires turbolite-cloud feature (multi-node catch-up needs S3 turbolite).
+
+#![cfg(feature = "turbolite-cloud")]
 
 mod common;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use common::InMemoryStorage;
-use haqlite::{HaMode, HaQLite, InMemoryLeaseStore, InMemoryManifestStore, SqlValue};
+use haqlite::{Durability, HaMode, HaQLite, InMemoryLeaseStore, InMemoryManifestStore, SqlValue};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
+use turbolite::tiered::{SharedTurboliteVfs, SyncMode, TurboliteConfig, TurboliteVfs};
+
+static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
+fn unique_vfs(prefix: &str) -> String {
+    let n = VFS_COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("{}_{}", prefix, n)
+}
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)";
+
+fn test_bucket() -> String {
+    std::env::var("TIERED_TEST_BUCKET").expect("TIERED_TEST_BUCKET required")
+}
+
+fn endpoint_url() -> Option<String> {
+    std::env::var("AWS_ENDPOINT_URL").ok()
+}
+
+fn unique_prefix(name: &str) -> String {
+    format!("test/lsb/{}/{}", name, std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).expect("time").as_nanos())
+}
 
 /// Storage backend that wraps InMemoryStorage with configurable latency
 /// on upload operations. This simulates slow S3 causing lease expiration.
@@ -106,24 +130,46 @@ impl walrust::StorageBackend for SlowStorage {
     }
 }
 
-/// Helper: build a shared-mode HaQLite node.
+/// Helper: build a shared-mode HaQLite node with S3-backed turbolite VFS.
+/// Uses Synchronous durability (S3Primary, no walrust).
 async fn build_node(
     tmp: &TempDir,
     name: &str,
-    storage: Arc<SlowStorage>,
+    s3_prefix: &str,
     lease_store: Arc<InMemoryLeaseStore>,
     manifest_store: Arc<InMemoryManifestStore>,
     instance_id: &str,
     lease_ttl: u64,
     write_timeout_secs: u64,
 ) -> HaQLite {
+    let vfs_name = unique_vfs(&format!("lsb_{}", instance_id));
+    let config = TurboliteConfig {
+        bucket: test_bucket(),
+        prefix: s3_prefix.to_string(),
+        cache_dir: tmp.path().to_path_buf(),
+        endpoint_url: endpoint_url(),
+        region: Some("auto".to_string()),
+        compression_level: 0,
+        pages_per_group: 4,
+        sub_pages_per_frame: 2,
+        sync_mode: SyncMode::S3Primary,
+        eager_index_load: false,
+        runtime_handle: Some(tokio::runtime::Handle::current()),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("create VFS");
+    let shared_vfs = SharedTurboliteVfs::new(vfs);
+    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone())
+        .expect("register VFS");
+
     let db_path = tmp.path().join(format!("{}.db", name));
     HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
+        .durability(Durability::Synchronous)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
-        .walrust_storage(storage)
+        .turbolite_vfs(shared_vfs, &vfs_name)
         .instance_id(instance_id)
         .manifest_poll_interval(Duration::from_millis(50))
         .write_timeout(Duration::from_secs(write_timeout_secs))
@@ -147,21 +193,22 @@ fn has_key(rows: &[Vec<SqlValue>], key: &str) -> bool {
 }
 
 /// Two nodes write sequentially. With fast storage, both should succeed.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn baseline_two_nodes_sequential_writes() {
     let tmp_a = TempDir::new().expect("tmp");
     let tmp_b = TempDir::new().expect("tmp");
 
+    let prefix = unique_prefix("baseline");
     let storage = Arc::new(SlowStorage::new(Duration::ZERO));
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
     let db_a = build_node(
-        &tmp_a, "split", storage.clone(), lease_store.clone(),
+        &tmp_a, "split", &prefix, lease_store.clone(),
         manifest_store.clone(), "node-a", 5, 10,
     ).await;
     let db_b = build_node(
-        &tmp_b, "split", storage.clone(), lease_store.clone(),
+        &tmp_b, "split", &prefix, lease_store.clone(),
         manifest_store.clone(), "node-b", 5, 10,
     ).await;
 
@@ -182,21 +229,22 @@ async fn baseline_two_nodes_sequential_writes() {
 
 /// Concurrent writes from two nodes. The lease serializes them.
 /// All successful writes must be visible in final state.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_writes_no_data_loss() {
     let tmp_a = TempDir::new().expect("tmp");
     let tmp_b = TempDir::new().expect("tmp");
 
+    let prefix = unique_prefix("conc");
     let storage = Arc::new(SlowStorage::new(Duration::ZERO));
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
     let db_a = build_node(
-        &tmp_a, "conc", storage.clone(), lease_store.clone(),
+        &tmp_a, "conc", &prefix, lease_store.clone(),
         manifest_store.clone(), "node-a", 5, 10,
     ).await;
     let db_b = build_node(
-        &tmp_b, "conc", storage.clone(), lease_store.clone(),
+        &tmp_b, "conc", &prefix, lease_store.clone(),
         manifest_store.clone(), "node-b", 5, 10,
     ).await;
 
@@ -266,7 +314,7 @@ async fn concurrent_writes_no_data_loss() {
 
 /// Slow storage causes lease expiration. Both nodes' successful writes
 /// must be visible in the final state.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn slow_storage_lease_expiration() {
     let tmp_a = TempDir::new().expect("tmp");
     let tmp_b = TempDir::new().expect("tmp");
@@ -274,16 +322,17 @@ async fn slow_storage_lease_expiration() {
     // Upload delay of 500ms with 1-second lease TTL for node A.
     // Node A: sync takes 500ms * N uploads, lease is 1s, so it expires mid-sync.
     // Node B: gets a 10s TTL so it can finish even with the same slow storage.
+    let prefix = unique_prefix("slow");
     let storage = Arc::new(SlowStorage::new(Duration::from_millis(500)));
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
     let db_a = build_node(
-        &tmp_a, "slow", storage.clone(), lease_store.clone(),
+        &tmp_a, "slow", &prefix, lease_store.clone(),
         manifest_store.clone(), "node-a", 1, 30, // 1s TTL, short lease
     ).await;
     let db_b = build_node(
-        &tmp_b, "slow", storage.clone(), lease_store.clone(),
+        &tmp_b, "slow", &prefix, lease_store.clone(),
         manifest_store.clone(), "node-b", 30, 30, // 30s TTL, won't expire
     ).await;
 
@@ -328,7 +377,7 @@ async fn slow_storage_lease_expiration() {
     let tmp_c = TempDir::new().expect("tmp");
     storage.set_delay(Duration::ZERO).await;
     let db_c = build_node(
-        &tmp_c, "slow", storage.clone(), lease_store.clone(),
+        &tmp_c, "slow", &prefix, lease_store.clone(),
         manifest_store.clone(), "reader", 5, 10,
     ).await;
 
@@ -351,8 +400,9 @@ async fn slow_storage_lease_expiration() {
 }
 
 /// Stress test: 4 concurrent writers with short lease TTL.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn many_writers_short_lease_no_corruption() {
+    let prefix = unique_prefix("stress");
     let storage = Arc::new(SlowStorage::new(Duration::from_millis(50)));
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
@@ -361,6 +411,7 @@ async fn many_writers_short_lease_no_corruption() {
     let mut handles = Vec::new();
 
     for node_id in 0..4 {
+        let prefix = prefix.clone();
         let storage = storage.clone();
         let lease_store = lease_store.clone();
         let manifest_store = manifest_store.clone();
@@ -369,7 +420,7 @@ async fn many_writers_short_lease_no_corruption() {
         handles.push(tokio::spawn(async move {
             let tmp = TempDir::new().expect("tmp");
             let mut db = build_node(
-                &tmp, "stress", storage, lease_store, manifest_store,
+                &tmp, "stress", &prefix, lease_store, manifest_store,
                 &format!("node-{}", node_id), 2, 10,
             ).await;
 
@@ -400,7 +451,7 @@ async fn many_writers_short_lease_no_corruption() {
     storage.set_delay(Duration::ZERO).await;
     let tmp_reader = TempDir::new().expect("tmp");
     let reader = build_node(
-        &tmp_reader, "stress", storage.clone(), lease_store.clone(),
+        &tmp_reader, "stress", &prefix, lease_store.clone(),
         manifest_store.clone(), "reader", 5, 10,
     ).await;
 

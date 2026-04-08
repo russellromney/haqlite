@@ -35,7 +35,7 @@ pub mod serve;
 pub mod turbolite_replicator;
 
 // Re-export HaQLite as the primary API.
-pub use database::{HaQLite, HaQLiteBuilder, HaMode};
+pub use database::{HaQLite, HaQLiteBuilder, HaMode, Durability};
 pub use error::HaQLiteError;
 pub use client::{HaQLiteClient, HaQLiteClientBuilder};
 pub use forwarding::SqlValue;

@@ -1,23 +1,19 @@
 //! Full test matrix for haqlite multiwriter modes.
 //!
 //! Tests encoding combos (plain, zstd, encrypted, zstd+encrypted) across:
-//! - Mode C: Local turbolite + walrust shared
-//! - Mode F: S3 turbolite S3Primary shared (requires turbolite-cloud + RustFS)
-//! - Mode I: S3 turbolite + walrust shared (requires turbolite-cloud + RustFS)
+//! - Mode Sync: S3 turbolite S3Primary + Synchronous durability (requires turbolite-cloud)
 //!
 //! Mode A (single node, no HA) is tested by turbolite's own tests.
-//! Mode D (dedicated + turbolite) is not yet implemented.
 
-mod common;
+#![cfg(feature = "turbolite-cloud")]
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::InMemoryStorage;
 use hadb::InMemoryLeaseStore;
-use haqlite::{HaMode, HaQLite, InMemoryManifestStore, SqlValue};
+use haqlite::{Durability, HaMode, HaQLite, InMemoryManifestStore, SqlValue};
 use tempfile::TempDir;
-use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{SharedTurboliteVfs, SyncMode, TurboliteConfig, TurboliteVfs};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT)";
 
@@ -56,26 +52,57 @@ fn encodings() -> Vec<Encoding> {
 }
 
 // ============================================================================
-// Mode C: Local turbolite + walrust shared (multiwriter)
+// S3 helpers
 // ============================================================================
 
-async fn run_mode_c(enc: &Encoding) {
+fn test_bucket() -> String {
+    std::env::var("TIERED_TEST_BUCKET")
+        .expect("TIERED_TEST_BUCKET required")
+}
+
+fn endpoint_url() -> Option<String> {
+    std::env::var("AWS_ENDPOINT_URL").ok()
+}
+
+fn unique_prefix(name: &str) -> String {
+    format!(
+        "test/mode_matrix/{}/{}",
+        name,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    )
+}
+
+// ============================================================================
+// Mode Sync: S3Primary + Synchronous durability (multiwriter)
+// ============================================================================
+
+async fn run_mode_sync(enc: &Encoding) {
     let tmp_a = TempDir::new().expect("tmp");
     let tmp_b = TempDir::new().expect("tmp");
 
-    let walrust_storage = Arc::new(InMemoryStorage::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
+    let shared_prefix = unique_prefix(enc.name);
+
     let build_node = |cache_dir: &std::path::Path, instance_id: &str| {
-        let vfs_name = unique_vfs(&format!("mc_{}", enc.name));
+        let vfs_name = unique_vfs(&format!("ms_{}", enc.name));
         let config = TurboliteConfig {
+            bucket: test_bucket(),
+            prefix: shared_prefix.clone(),
             cache_dir: cache_dir.to_path_buf(),
+            endpoint_url: endpoint_url(),
+            region: Some("auto".to_string()),
             compression_level: enc.compression_level,
             encryption_key: enc.encryption_key,
             pages_per_group: 4,
             sub_pages_per_frame: 2,
+            sync_mode: SyncMode::S3Primary,
             eager_index_load: false,
+            runtime_handle: Some(tokio::runtime::Handle::current()),
             ..Default::default()
         };
         let vfs = TurboliteVfs::new(config).expect("vfs");
@@ -84,27 +111,29 @@ async fn run_mode_c(enc: &Encoding) {
         (shared_vfs, vfs_name)
     };
 
+    // Create and open nodes sequentially so each VFS sees the latest S3 state.
+    // VFS fetches the S3 manifest at creation time; creating both upfront means
+    // the second VFS would have a stale view of S3.
     let (vfs_a, vfs_name_a) = build_node(tmp_a.path(), "a");
-    let (vfs_b, vfs_name_b) = build_node(tmp_b.path(), "b");
-
-    let mut db_a = HaQLite::builder("test-bucket")
+    let mut db_a = HaQLite::builder("unused-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
+        .durability(Durability::Synchronous)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone())
-        .walrust_storage(walrust_storage.clone())
         .turbolite_vfs(vfs_a, &vfs_name_a)
         .instance_id("node-a")
         .write_timeout(Duration::from_secs(10))
         .open(tmp_a.path().join("t.db").to_str().expect("p"), SCHEMA)
         .await.expect("open a");
 
-    let mut db_b = HaQLite::builder("test-bucket")
+    let (vfs_b, vfs_name_b) = build_node(tmp_b.path(), "b");
+    let mut db_b = HaQLite::builder("unused-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
+        .durability(Durability::Synchronous)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone())
-        .walrust_storage(walrust_storage.clone())
         .turbolite_vfs(vfs_b, &vfs_name_b)
         .instance_id("node-b")
         .write_timeout(Duration::from_secs(10))
@@ -119,7 +148,7 @@ async fn run_mode_c(enc: &Encoding) {
         ).await.expect("insert a");
     }
 
-    // Node B writes 5 rows (catches up from walrust)
+    // Node B writes 5 rows (catches up via S3 manifest)
     for i in 5..10 {
         db_b.execute(
             "INSERT INTO t VALUES (?1, ?2)",
@@ -130,16 +159,16 @@ async fn run_mode_c(enc: &Encoding) {
     // Verify all 10 visible
     let rows = db_b.query_values_fresh("SELECT id FROM t ORDER BY id", &[])
         .await.expect("query");
-    assert_eq!(rows.len(), 10, "[Mode C/{}] expected 10 rows, got {}", enc.name, rows.len());
+    assert_eq!(rows.len(), 10, "[Mode Sync/{}] expected 10 rows, got {}", enc.name, rows.len());
 
     db_a.close().await.expect("close a");
     db_b.close().await.expect("close b");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mode_c_all_encodings() {
+async fn mode_sync_all_encodings() {
     for enc in &encodings() {
-        eprintln!("--- Mode C: {} ---", enc.name);
-        run_mode_c(enc).await;
+        eprintln!("--- Mode Sync: {} ---", enc.name);
+        run_mode_sync(enc).await;
     }
 }

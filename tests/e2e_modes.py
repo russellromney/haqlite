@@ -173,10 +173,12 @@ class ServerProcess:
             "--lease-ttl", str(self.lease_ttl),
         ] + self.extra_args
 
+        self.log_path = os.path.join(self.db_dir, f"{self.instance_id}.log")
+        self._log_file = open(self.log_path, "w")
         self.proc = subprocess.Popen(
             cmd,
             env=env,
-            stdout=subprocess.PIPE,
+            stdout=self._log_file,
             stderr=subprocess.STDOUT,
             preexec_fn=os.setsid,
         )
@@ -184,6 +186,13 @@ class ServerProcess:
 
     def wait_healthy(self, timeout=HEALTH_TIMEOUT):
         return wait_healthy(self.url, timeout)
+
+    def _close_log(self):
+        if hasattr(self, '_log_file') and self._log_file:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -196,14 +205,16 @@ class ServerProcess:
                     self.proc.wait(timeout=5)
                 except Exception:
                     pass
+        self._close_log()
 
     def read_output(self):
-        if self.proc and self.proc.stdout:
-            try:
-                return self.proc.stdout.read().decode(errors="replace")
-            except Exception:
-                pass
-        return ""
+        try:
+            if hasattr(self, '_log_file') and self._log_file and not self._log_file.closed:
+                self._log_file.flush()
+            with open(self.log_path, "r") as f:
+                return f.read()
+        except Exception:
+            return ""
 
     def kill(self):
         """SIGKILL - simulate crash, no graceful shutdown."""
@@ -213,6 +224,7 @@ class ServerProcess:
                 self.proc.wait(timeout=5)
             except Exception:
                 pass
+        self._close_log()
 
     def is_alive(self):
         return self.proc and self.proc.poll() is None
@@ -964,17 +976,38 @@ def test_double_failover(mode_test, result):
     # Phase-1 rows should survive through two failovers. For turbolite modes,
     # this depends on manifest-based catch-up preserving all page groups across
     # promotions. Intermittent failures indicate a manifest merge issue.
+    p1_ok = phase1_missing <= 1
     result.check(
-        phase1_missing <= 1,
+        p1_ok,
         f"Leader-3 has {len(phase1_writes) - phase1_missing}/{len(phase1_writes)} phase-1 rows (missing={phase1_missing})"
     )
     # Phase-2 rows may be lost for walrust-based modes because the promoted
     # leader's initial snapshot upload can take longer than the kill window.
     # Turbolite modes (Synchronous) should have 0 missing.
+    p2_ok = phase2_missing == 0 or mode_test.durability != "synchronous"
     result.check(
-        phase2_missing == 0 or mode_test.durability != "synchronous",
+        p2_ok,
         f"Leader-3 has {len(phase2_writes) - phase2_missing}/{len(phase2_writes)} phase-2 rows (missing={phase2_missing})"
     )
+
+    # Dump logs from leader-3 if data was lost
+    if not p1_ok or not p2_ok:
+        remaining_server = None
+        for s in mode_test.servers:
+            if s.url == remaining_url:
+                remaining_server = s
+                break
+        if remaining_server:
+            import re as _re
+            log = remaining_server.read_output()
+            print("    --- Leader-3 log (relevant lines) ---")
+            for line in log.split("\n"):
+                line = _re.sub(chr(27) + r'\[[0-9;]*m', '', line).strip()
+                if any(k in line for k in ['S3 fetch', 'prefetch', 'CACHE MISS', 'CACHE HIT',
+                                           'override', 'not found', 'evict', 'set_manifest',
+                                           'catchup', 'promotion', 'test_data']):
+                    if 'page 0' not in line:  # skip noisy page 0 reads
+                        print(f"      {line[:200]}")
 
 
 def test_durability_across_restarts(mode_test, result):

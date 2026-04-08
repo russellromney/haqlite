@@ -84,6 +84,7 @@ async fn build_mode_i_node(
     HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
+        .durability(haqlite::Durability::Eventual)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .walrust_storage(walrust_storage)

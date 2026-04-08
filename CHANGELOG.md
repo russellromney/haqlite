@@ -1,5 +1,31 @@
 # haqlite Changelog
 
+## Phase Cannae-b: Durability Modes + Multiwriter Bug Fixes
+
+- **Durability enum**: `Replicated` (plain SQLite + walrust WAL shipping, Dedicated only), `Synchronous` (turbolite S3Primary, every write to S3), `Eventual` (turbolite S3 + walrust WAL shipping between checkpoints). Shared mode requires durable sync VFS (turbolite with S3).
+- **Simplified shared mode**: Deleted `open_shared()` (walrust-only path), merged `execute_shared` + `execute_shared_turbolite` into one unified function. Catch-up via turbolite `set_manifest` (metadata-only, no walrust restore). Manifest poller reduced to no-op.
+- **Eventual durability**: WAL checkpoint + `flush_to_s3()` in execute_shared for Eventual mode. walrust `autonomous_snapshots: false` prevents background snapshot loop in shared mode.
+- **Validation**: `Shared + Replicated` returns error. Eliminated Mode C (local turbolite + walrust shared, no product use case).
+- **Bug fixes**: Snapshot clobbering eliminated (no walrust snapshots in haqlite). Manifest poller race eliminated. WAL checkpoint on connection close fixed. S3Primary persistent connection xSync fixed via `ensure_turbolite_conn`. Connection reopen now stored properly.
+- Tests: multi-node shared mode tests gated behind `turbolite-cloud` (require S3). All pass on Tigris.
+
+## Phase Rampart: Production Hardening
+
+- **HaQLiteError enum**: 6 variants for structured error handling.
+- **Forwarding retry**: Exponential backoff (100ms/400ms/1600ms), no retry on 4xx client errors.
+- **Read semaphore**: Default 32 concurrent reads, distinguishes NoPermits from EngineClosed.
+- **Graceful shutdown**: Close semaphore, await handles, leave cluster cleanly.
+- **Follower readiness**: `caught_up` + `replay_position` from JoinResult, Prometheus gauges for observability.
+- **sync() flush**: Now calls walrust `flush()` instead of being a no-op.
+- Atomic with hadb Phase Beacon and hakuzu Phase Parity. 157 tests total.
+
+## Phase Drain: Synchronous WAL Flush
+
+- `SqliteReplicator::sync()` now calls walrust `Replicator::flush()` for synchronous WAL shipping.
+- `handoff()` now calls `sync()` explicitly before releasing the lease.
+- `close()` path was already flushed via `replicator.remove()` internally.
+- 6 walrust flush tests + regression tests.
+
 ## Phase Crest: HaMode::Shared (Lease-on-Write)
 
 - **HaMode::Shared**: Ephemeral compute coordination. Lease per write, no persistent leader, no forwarding. Builder: `.mode(HaMode::Shared)`, `.manifest_store()`, `.manifest_poll_interval()`, `.write_timeout()`.
@@ -26,7 +52,7 @@
 - **Snapshot test fixes**: SQLite file change counter is 2 after `CREATE TABLE + INSERT` (two transactions), not 1. Fixed 5 assertion values and added writes between sequential snapshots.
 - 7 new tests: custom lease store used, builder method compiles, lease renewal, two-node custom store, default fallback, NATS integration (env-gated), NATS connection failure. 164 tests total.
 
-## hadb Core Framework Extraction (Foundation — 83 tests)
+## hadb Core Framework Extraction (Foundation, 83 tests)
 
 - **hadb workspace created**: Database-agnostic HA framework at `~/Documents/Github/hadb/` with core (`hadb/`) and S3 implementation (`hadb-s3/`) crates. Zero cloud dependencies in core.
 - **Core traits extracted** (12 tests): `Replicator`, `Executor`, `LeaseStore`, `StorageBackend` — fully abstract, works with any database or storage backend.
@@ -81,7 +107,7 @@
 
 - **Structured metrics**: `HaMetrics` with atomic counters for lease claims/renewals, promotions, demotions, follower pulls, timing. `MetricsSnapshot` serializable for JSON export. Accessible via `coordinator.metrics()`. (`metrics.rs`)
 - **Metrics bug fix**: `catchup_start` was set after catchup completed (recording ~0us). Fixed. Initial `lease.try_claim()` in `join()` was not recording metrics. Fixed.
-- **Chaos ha_experiment**: Added `/metrics`, `/verify` (data integrity — gap/duplicate detection), `/status` endpoints. (`ha_experiment.rs`)
+- **Chaos ha_experiment**: Added `/metrics`, `/verify` (data integrity, gap/duplicate detection), `/status` endpoints. (`ha_experiment.rs`)
 - **Sync interval benchmarking**: ha_writer supports `--total-writes`, `--verify-nodes`, `--bench` flags. Bench mode prints TSV summary with writes/s, promotion_us, catchup_us. (`ha_writer.rs`)
 - Regression tests: `metrics_recorded_on_promotion`, `metrics_renewal_counters`
 - Flaky test fix: `regression_failed_promotion_releases_lease` TTL race (1s → 3s)

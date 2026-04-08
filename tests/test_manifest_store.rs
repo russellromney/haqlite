@@ -9,6 +9,7 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,24 @@ use tempfile::TempDir;
 use common::InMemoryStorage;
 use hadb::{InMemoryLeaseStore, LeaseStore};
 use haqlite::{HaMode, HaQLite, InMemoryManifestStore, ManifestStore, SqlValue};
+use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
+
+static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
+fn make_local_vfs(cache_dir: &std::path::Path) -> (SharedTurboliteVfs, String) {
+    let n = VFS_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let vfs_name = format!("tms_{}", n);
+    let config = TurboliteConfig {
+        cache_dir: cache_dir.to_path_buf(),
+        pages_per_group: 4,
+        sub_pages_per_frame: 2,
+        eager_index_load: false,
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("create VFS");
+    let shared_vfs = SharedTurboliteVfs::new(vfs);
+    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
+    (shared_vfs, vfs_name)
+}
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS manifest_test (
     id INTEGER PRIMARY KEY,
@@ -105,12 +124,15 @@ async fn shared_mode_manifest_published_on_write() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
+    let (vfs, vfs_name) = make_local_vfs(tmp.path());
     let mut db = HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
+                .durability(haqlite::Durability::Synchronous)
         .lease_store(lease_store)
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
         .walrust_storage(storage)
+        .turbolite_vfs(vfs, &vfs_name)
         .instance_id("writer-1")
         .write_timeout(Duration::from_secs(5))
         .open(db_path.to_str().expect("path"), SCHEMA)
@@ -119,7 +141,7 @@ async fn shared_mode_manifest_published_on_write() {
 
     // Before write: no manifest
     let meta = manifest_store
-        .meta("test/shared_manifest/_manifest")
+        .meta("test/_manifest")
         .await
         .expect("meta");
     assert!(meta.is_none(), "no manifest before first write");
@@ -134,7 +156,7 @@ async fn shared_mode_manifest_published_on_write() {
 
     // After write: manifest exists with correct writer_id
     let meta = manifest_store
-        .meta("test/shared_manifest/_manifest")
+        .meta("test/_manifest")
         .await
         .expect("meta")
         .expect("manifest should exist after write");
@@ -150,12 +172,15 @@ async fn shared_mode_sequential_writes_increment_manifest_version() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
+    let (vfs, vfs_name) = make_local_vfs(tmp.path());
     let mut db = HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
+                .durability(haqlite::Durability::Synchronous)
         .lease_store(lease_store)
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
         .walrust_storage(storage)
+        .turbolite_vfs(vfs, &vfs_name)
         .instance_id("writer-1")
         .write_timeout(Duration::from_secs(5))
         .open(db_path.to_str().expect("path"), SCHEMA)
@@ -172,7 +197,7 @@ async fn shared_mode_sequential_writes_increment_manifest_version() {
     }
 
     let meta = manifest_store
-        .meta("test/shared_seq/_manifest")
+        .meta("test/_manifest")
         .await
         .expect("meta")
         .expect("manifest should exist");
@@ -184,6 +209,7 @@ async fn shared_mode_sequential_writes_increment_manifest_version() {
 // ============================================================================
 
 #[tokio::test]
+#[cfg(feature = "turbolite-cloud")]
 async fn shared_mode_two_writers_see_each_others_data() {
     let tmp1 = TempDir::new().expect("temp dir 1");
     let tmp2 = TempDir::new().expect("temp dir 2");
@@ -191,12 +217,15 @@ async fn shared_mode_two_writers_see_each_others_data() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
+    let (vfs1, vfs_name1) = make_local_vfs(tmp1.path());
     let db1 = HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
+                .durability(haqlite::Durability::Synchronous)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
         .walrust_storage(storage.clone())
+        .turbolite_vfs(vfs1, &vfs_name1)
         .instance_id("writer-1")
         .write_timeout(Duration::from_secs(5))
         .open(
@@ -215,12 +244,15 @@ async fn shared_mode_two_writers_see_each_others_data() {
     .expect("insert from writer 1");
 
     // Writer 2 opens and writes (should catch up from manifest first)
+    let (vfs2, vfs_name2) = make_local_vfs(tmp2.path());
     let mut db2 = HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
+                .durability(haqlite::Durability::Synchronous)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
         .walrust_storage(storage.clone())
+        .turbolite_vfs(vfs2, &vfs_name2)
         .instance_id("writer-2")
         .write_timeout(Duration::from_secs(5))
         .open(
@@ -245,7 +277,7 @@ async fn shared_mode_two_writers_see_each_others_data() {
 
     // Manifest should be at version 2
     let meta = manifest_store
-        .meta("test/two_writers/_manifest")
+        .meta("test/_manifest")
         .await
         .expect("meta")
         .expect("manifest");
