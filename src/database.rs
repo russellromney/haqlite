@@ -669,8 +669,10 @@ impl HaQLiteInner {
     fn ensure_turbolite_conn(&self) -> std::result::Result<Arc<Mutex<rusqlite::Connection>>, HaQLiteError> {
         // Fast path: connection already exists
         if let Some(conn) = self.get_conn()? {
+            tracing::info!("[ensure_turbolite_conn] fast path: reusing existing connection");
             return Ok(conn);
         }
+        tracing::info!("[ensure_turbolite_conn] slow path: creating new connection");
 
         // Slow path: open a new connection via VFS URI
         let vfs_name = self.shared_turbolite_vfs_name.as_ref()
@@ -685,13 +687,24 @@ impl HaQLiteInner {
             format!("lazy turbolite conn open for '{}': {}", self.db_name, e)
         ))?;
 
-        // Respect journal mode: S3Primary uses OFF, walrust uses WAL
+        // Set journal mode. S3Primary VFS defaults to journal_mode=OFF which
+        // prevents SQLite from calling xSync on commit (data never reaches S3).
+        // Switch to DELETE mode and force-sync the mode change to persist it
+        // in the turbolite db_header for future connection opens.
         let current_mode: String = new_conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-            .unwrap_or_else(|_| "wal".to_string());
-        if current_mode != "off" && current_mode != "memory" {
+            .unwrap_or_else(|_| "unknown".to_string());
+        tracing::info!("[ensure_turbolite_conn] journal_mode={}", current_mode);
+        if current_mode == "off" {
+            new_conn.execute_batch("PRAGMA journal_mode=DELETE;")
+                .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma DELETE: {}", e)))?;
+            // Force xSync by updating the user_version (harmless metadata write).
+            // This ensures the journal_mode change in page 0 is uploaded to S3.
+            new_conn.execute_batch("PRAGMA user_version = 1;")
+                .map_err(|e| HaQLiteError::DatabaseError(format!("force sync: {}", e)))?;
+        } else if current_mode != "wal" && current_mode != "delete" && current_mode != "memory" {
             new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
-                .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma: {}", e)))?;
+                .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma WAL: {}", e)))?;
         }
 
         let arc = Arc::new(Mutex::new(new_conn));
