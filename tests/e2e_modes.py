@@ -1054,7 +1054,7 @@ def test_durability_across_restarts(mode_test, result):
     # Wait for S3 writes to settle before killing.
     # Synchronous durability (S3Primary) writes on every commit, 2s is enough.
     # Eventual/Replicated durability uses async walrust sync, needs longer.
-    settle_time = 2 if mode_test.durability == "synchronous" else 8
+    settle_time = 2 if mode_test.durability == "synchronous" else 15
     time.sleep(settle_time)
 
     # Kill all nodes

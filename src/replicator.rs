@@ -77,9 +77,33 @@ impl Replicator for SqliteReplicator {
         }
     }
 
+    async fn add_continuing(&self, name: &str, path: &Path) -> Result<()> {
+        self.inner.add_without_snapshot(name, path).await
+    }
+
     async fn pull(&self, name: &str, path: &Path) -> Result<()> {
-        // For SQLite, pull is the same as restore (get initial snapshot)
-        self.inner.restore(name, path).await?;
+        // Restore from latest snapshot + chained incrementals.
+        let restored_seq = self.inner.restore(name, path).await?;
+        let seq = restored_seq.unwrap_or(0);
+
+        // Apply any remaining incrementals that restore() skipped due to
+        // checksum chain breaks (e.g., changesets from a promoted leader
+        // whose chain diverged). pull_incremental applies by page content,
+        // not checksum chain, so it can bridge the gap.
+        let final_seq = walrust::sync::pull_incremental(
+            self.inner.storage().as_ref(),
+            self.inner.prefix(),
+            name,
+            path,
+            seq,
+        ).await?;
+
+        if final_seq > seq {
+            tracing::info!(
+                "SqliteReplicator::pull('{}') bridged chain gap: restore seq {} -> pull seq {}",
+                name, seq, final_seq,
+            );
+        }
         Ok(())
     }
 
