@@ -894,7 +894,7 @@ def test_double_failover(mode_test, result):
             phase1_writes.append(row_id)
     result.check(len(phase1_writes) == 5, f"Phase 1: wrote {len(phase1_writes)} rows to leader-1")
 
-    time.sleep(3)  # replication lag
+    time.sleep(5)  # replication lag (turbolite manifest publish + follower poll)
 
     # Kill leader-1
     mode_test.servers[leader_idx].kill()

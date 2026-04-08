@@ -189,20 +189,21 @@ impl FollowerBehavior for SqliteFollowerBehavior {
 
             match result {
                 Ok(Some(version)) => {
+                    let vfs_version = vfs.manifest().version;
                     tracing::info!(
-                        "SqliteFollowerBehavior '{}': turbolite catchup to v{} on promotion",
-                        db_name, version,
+                        "SqliteFollowerBehavior '{}': turbolite catchup to v{} on promotion (VFS manifest now v{}, page_count={})",
+                        db_name, version, vfs_version, vfs.manifest().page_count,
                     );
                 }
                 Ok(None) => {
-                    tracing::info!(
-                        "SqliteFollowerBehavior '{}': no turbolite manifest in S3 (empty DB)",
+                    tracing::error!(
+                        "SqliteFollowerBehavior '{}': no turbolite manifest in S3 on promotion! Data may be lost.",
                         db_name,
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "SqliteFollowerBehavior '{}': turbolite manifest fetch on promotion failed: {}",
+                    tracing::error!(
+                        "SqliteFollowerBehavior '{}': turbolite manifest fetch on promotion FAILED: {}. Data may be lost.",
                         db_name, e,
                     );
                 }

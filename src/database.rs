@@ -1670,8 +1670,39 @@ async fn run_role_listener(
                 if inner.shared_turbolite_vfs.is_some() {
                     // Dedicated+Synchronous: open through turbolite VFS.
                     match inner.ensure_turbolite_conn() {
-                        Ok(_) => {
-                            tracing::info!("HaQLite: opened turbolite connection on promotion");
+                        Ok(conn_arc) => {
+                            let c = conn_arc.lock().expect("conn lock");
+                            let data_count: i64 = c.query_row(
+                                "SELECT COUNT(*) FROM test_data", [], |r| r.get(0),
+                            ).unwrap_or(-1);
+                            if data_count == 0 {
+                                // Data not visible. Drop connection, force VFS to refetch.
+                                drop(c);
+                                inner.set_conn(None);
+                                tracing::warn!(
+                                    "HaQLite: turbolite conn on promotion has 0 rows, reopening...",
+                                );
+                                // Reopen
+                                match inner.ensure_turbolite_conn() {
+                                    Ok(c2) => {
+                                        let c = c2.lock().expect("conn lock");
+                                        let count2: i64 = c.query_row(
+                                            "SELECT COUNT(*) FROM test_data", [], |r| r.get(0),
+                                        ).unwrap_or(-1);
+                                        tracing::info!(
+                                            "HaQLite: turbolite conn after reopen: {} rows",
+                                            count2,
+                                        );
+                                    }
+                                    Err(e) => tracing::error!("reopen failed: {}", e),
+                                }
+                            } else {
+                                tracing::info!(
+                                    "HaQLite: turbolite conn on promotion: {} rows",
+                                    data_count,
+                                );
+                                drop(c);
+                            }
                         }
                         Err(e) => {
                             tracing::error!(
