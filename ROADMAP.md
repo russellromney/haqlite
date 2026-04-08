@@ -103,6 +103,57 @@ True concurrent multi-node writes require atomic CAS (S3 doesn't provide it). Wi
 - [ ] Run Shared+Eventual with same parameters
 - [ ] Compare with S3 lease store results (document S3 race rate vs NATS 0%)
 
+### h. Chaos and resilience tests
+
+Current tests prove the happy path and clean failovers work. These tests prove resilience to messy, real-world failures: mid-operation kills, corruption, slow storage, and adversarial timing.
+
+**SIGKILL during sync (most likely real-world failure)**
+- [ ] Write continuously to Ded+Eventual leader, SIGKILL after random 0-100ms delay
+- [ ] Restart cluster, verify no corruption (integrity_check passes)
+- [ ] Verify all Ok'd writes from before the last successful sync are present
+- [ ] Run 10 iterations, track how many recent writes are lost per kill
+- [ ] Test for both Ded+Eventual and Ded+Replicated
+
+**Minimum durability window (RPO measurement)**
+- [ ] Write a row, SIGKILL leader after N ms, check if row survived on fresh node
+- [ ] Sweep N from 0ms to 2000ms in 100ms steps
+- [ ] Record the threshold: below N ms, writes are lost; above N ms, writes survive
+- [ ] Document this as the RPO for each durability mode
+- [ ] Compare Synchronous (should be 0ms RPO) vs Eventual (expected: ~sync_interval)
+
+**Changeset chain integrity after promotion**
+- [ ] After double failover, do a full walrust restore from scratch (not incremental pull)
+- [ ] Verify restore succeeds (no gaps, no duplicate seqs, valid checksums)
+- [ ] Verify restored data matches the surviving leader's local data exactly
+- [ ] This tests that add_continuing produces a valid chain, not just that local data survives
+
+**Slow S3 / lease expiry during sync**
+- [ ] Wrap StorageBackend with configurable latency injection
+- [ ] Set S3 upload latency to 3s, lease TTL to 5s
+- [ ] Write to leader, verify leader self-demotes when sync exceeds lease window
+- [ ] Verify no split-brain: demoted leader rejects writes immediately
+- [ ] Verify follower promotes and has all previously-synced data
+
+**Concurrent readers during failover**
+- [ ] Spawn 4 reader threads on a follower doing SELECT COUNT(*) in a loop
+- [ ] SIGKILL the leader while readers are active
+- [ ] Verify: readers get either valid data or clean errors, never corruption or panic
+- [ ] Verify: readers resume normal operation after new leader is elected
+- [ ] Test with both plain SQLite reads (Ded+Eventual) and turbolite VFS reads (Ded+Synchronous)
+
+**Rapid kill/restart cycle**
+- [ ] Kill leader, wait minimum time for promotion (~6s), write 1 row, kill immediately
+- [ ] Repeat 5 times (5 leaders, 5 kills, ~30s total)
+- [ ] Verify: final surviving node has all rows that got Ok responses
+- [ ] Verify: changeset chain is valid (full restore works)
+- [ ] This stress-tests the add_continuing path with minimal settle time
+
+**Corrupted S3 objects**
+- [ ] Upload garbage bytes to a changeset key, then restore. Should fail cleanly, not panic
+- [ ] Upload truncated changeset (first 50% of bytes). Should fail cleanly
+- [ ] Delete state.json, then start fresh node. Should fall back to snapshot discovery
+- [ ] Upload changeset with wrong seq (e.g., seq 999 when chain expects seq 3). Should skip or error, not corrupt DB
+
 ## SQLite Extensions Support
 
 haqlite should support SQLite extensions (sqlite-vec, FTS5, sqlean, etc.) across the cluster. Extensions must be loaded on ALL connections, including leader rw, follower reads, and walrust LTX apply. Otherwise WAL replay fails or silently corrupts data.

@@ -1437,13 +1437,19 @@ impl HaQLite {
         Ok(rows as u64)
     }
 
-    async fn execute_forwarded(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
-        let leader_addr = self.inner.leader_addr()?;
-        if leader_addr.is_empty() {
-            return Err(HaQLiteError::NotLeader);
+    /// Refresh leader address from the Coordinator (which tracks lease changes).
+    async fn refresh_leader_addr(&self) -> std::result::Result<String, HaQLiteError> {
+        if let Some(ref coord) = self.inner.coordinator {
+            if let Some(addr) = coord.leader_address(&self.inner.db_name).await {
+                if !addr.is_empty() {
+                    self.inner.set_leader_addr(addr);
+                }
+            }
         }
+        self.inner.leader_addr()
+    }
 
-        let url = format!("{}/haqlite/execute", leader_addr);
+    async fn execute_forwarded(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
         let body = forwarding::ForwardedExecute {
             sql: sql.to_string(),
             params: params.to_vec(),
@@ -1461,6 +1467,15 @@ impl HaQLite {
                 tokio::time::sleep(*backoff).await;
             }
 
+            // Re-read leader address each attempt: the Coordinator updates it
+            // when a new leader is elected, but our cached copy may be stale.
+            let leader_addr = self.refresh_leader_addr().await?;
+            if leader_addr.is_empty() {
+                last_err = "no leader address available".to_string();
+                continue;
+            }
+            let url = format!("{}/haqlite/execute", leader_addr);
+
             let mut req = self.inner.http_client.post(&url).json(&body);
             if let Some(ref secret) = self.inner.secret {
                 req = req.bearer_auth(secret);
@@ -1470,7 +1485,7 @@ impl HaQLite {
                 Ok(r) => r,
                 Err(e) => {
                     last_err = format!("connection error: {e}");
-                    continue; // retry on connection failure
+                    continue;
                 }
             };
 
@@ -1487,7 +1502,14 @@ impl HaQLite {
 
             let body_text = resp.text().await.unwrap_or_default();
 
-            // Don't retry 4xx: client errors (bad SQL, auth) won't succeed on retry.
+            // 421 Misdirected Request: stale leader address or mid-promotion.
+            // Refresh leader address and retry.
+            if status.as_u16() == 421 {
+                last_err = format!("421 misdirected (stale leader addr): {body_text}");
+                continue;
+            }
+
+            // Don't retry other 4xx: client errors (bad SQL, auth) won't succeed on retry.
             if status.is_client_error() {
                 return Err(HaQLiteError::LeaderClientError {
                     status: status.as_u16(),
