@@ -346,7 +346,10 @@ impl HaQLiteBuilder {
                 autonomous_snapshots: self.mode != HaMode::Shared,
                 ..Default::default()
             };
-            Arc::new(SqliteReplicator::new(ws.clone(), &self.prefix, replication_config))
+            Arc::new(
+                SqliteReplicator::new(ws.clone(), &self.prefix, replication_config)
+                    .with_skip_snapshot(self.durability == Durability::Synchronous)
+            )
         });
 
         match self.mode {
@@ -818,20 +821,10 @@ impl HaQLite {
                 match role {
                     Some(Role::Leader) | None => {
                         let rows = self.execute_local(sql, params)?;
-                        // For Synchronous durability (turbolite S3Primary), publish
-                        // the turbolite manifest after each write so followers can
-                        // catch up via manifest polling. The turbolite xSync already
-                        // uploaded page data to S3; this publishes the index.
-                        // This must succeed for durability: without it, a failover
-                        // would lose this write's data.
-                        if let (Some(ms), Some(vfs)) = (
-                            &self.inner.shared_manifest_store,
-                            &self.inner.shared_turbolite_vfs,
-                        ) {
-                            let manifest_key = format!("{}_manifest", self.inner.shared_prefix);
-                            let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
-                            self.publish_manifest(ms.as_ref(), &manifest_key, vfs, cached).await?;
-                        }
+                        // For Synchronous durability (turbolite S3Primary), followers
+                        // catch up directly from turbolite's S3 manifest (published
+                        // by xSync during execute_local). No separate haqlite manifest
+                        // publish needed.
                         Ok(rows)
                     }
                     Some(Role::Follower) => self.execute_forwarded(sql, params).await,
@@ -1667,8 +1660,15 @@ async fn run_role_listener(
                 inner.set_leader_addr(self_address.clone());
                 inner.set_role(Role::Leader);
 
-                if inner.shared_turbolite_vfs.is_some() {
-                    // Dedicated+Synchronous: open through turbolite VFS.
+                if let Some(ref vfs) = inner.shared_turbolite_vfs {
+                    // Dedicated+Synchronous: refresh manifest from S3 and open
+                    // through turbolite VFS. The follower's catch-up should have
+                    // already applied the latest manifest, but re-fetch to be safe.
+                    inner.set_conn(None);
+                    let vfs_clone = vfs.clone();
+                    let _ = tokio::task::block_in_place(|| {
+                        vfs_clone.fetch_and_apply_s3_manifest()
+                    });
                     match inner.ensure_turbolite_conn() {
                         Ok(conn_arc) => {
                             let c = conn_arc.lock().expect("conn lock");

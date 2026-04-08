@@ -16,6 +16,10 @@ use hadb::Replicator;
 /// Handles WAL replication via HADBP changesets (SQLite-specific format).
 pub struct SqliteReplicator {
     inner: Arc<walrust::Replicator>,
+    /// When true, `add()` skips the initial snapshot upload.
+    /// Used for Dedicated+Synchronous where turbolite handles durability
+    /// and the local SQLite file may be empty (data is in S3 page groups).
+    skip_snapshot_on_add: bool,
 }
 
 impl SqliteReplicator {
@@ -31,7 +35,15 @@ impl SqliteReplicator {
     ) -> Self {
         Self {
             inner: walrust::Replicator::new(storage, prefix, config),
+            skip_snapshot_on_add: false,
         }
+    }
+
+    /// Skip snapshot upload on `add()`. For Dedicated+Synchronous where
+    /// turbolite handles durability and the local SQLite file has no data.
+    pub fn with_skip_snapshot(mut self, skip: bool) -> Self {
+        self.skip_snapshot_on_add = skip;
+        self
     }
 
     /// Get a reference to the inner walrust Replicator.
@@ -58,7 +70,11 @@ impl SqliteReplicator {
 #[async_trait]
 impl Replicator for SqliteReplicator {
     async fn add(&self, name: &str, path: &Path) -> Result<()> {
-        self.inner.add(name, path).await
+        if self.skip_snapshot_on_add {
+            self.inner.add_without_snapshot(name, path).await
+        } else {
+            self.inner.add(name, path).await
+        }
     }
 
     async fn pull(&self, name: &str, path: &Path) -> Result<()> {
