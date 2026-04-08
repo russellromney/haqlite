@@ -1122,6 +1122,14 @@ def test_durability_across_restarts(mode_test, result):
         status_resp = get_json(f"{fresh_url}/status")
         print(f"    Fresh node /status: {status_resp}")
 
+        # Dump actual rows vs expected
+        dump = get_json(f"{fresh_url}/dump")
+        actual_ids = sorted([r.get("id", "?") for r in dump.get("rows", [])])
+        expected_ids = sorted(writes)
+        print(f"    Expected IDs: {expected_ids[:5]}...")
+        dur_in_actual = [x for x in actual_ids if x.startswith("durable-")]
+        print(f"    'durable-*' rows in fresh node: {len(dur_in_actual)} {dur_in_actual[:5]}")
+
     result.check(missing == 0, f"Fresh node sees all {len(writes)} rows from S3 (missing={missing})")
 
 
