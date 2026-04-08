@@ -696,12 +696,10 @@ impl HaQLiteInner {
             .unwrap_or_else(|_| "unknown".to_string());
         tracing::info!("[ensure_turbolite_conn] journal_mode={}", current_mode);
         if current_mode == "off" {
+            // S3Primary VFS defaults to journal_mode=OFF which prevents SQLite
+            // from calling xSync. Switch to DELETE so xSync fires every commit.
             new_conn.execute_batch("PRAGMA journal_mode=DELETE;")
                 .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma DELETE: {}", e)))?;
-            // Force xSync by updating the user_version (harmless metadata write).
-            // This ensures the journal_mode change in page 0 is uploaded to S3.
-            new_conn.execute_batch("PRAGMA user_version = 1;")
-                .map_err(|e| HaQLiteError::DatabaseError(format!("force sync: {}", e)))?;
         } else if current_mode != "wal" && current_mode != "delete" && current_mode != "memory" {
             new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
                 .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma WAL: {}", e)))?;
@@ -1673,49 +1671,13 @@ async fn run_role_listener(
                 inner.set_leader_addr(self_address.clone());
                 inner.set_role(Role::Leader);
 
-                if let Some(ref vfs) = inner.shared_turbolite_vfs {
-                    // Dedicated+Synchronous: refresh manifest from S3 and open
-                    // through turbolite VFS.
+                if inner.shared_turbolite_vfs.is_some() {
+                    // Dedicated+Synchronous: open through turbolite VFS.
+                    // catchup_on_promotion already applied the latest manifest.
                     inner.set_conn(None);
-                    let vfs_clone = vfs.clone();
-                    let _ = tokio::task::block_in_place(|| {
-                        vfs_clone.fetch_and_apply_s3_manifest()
-                    });
-
                     match inner.ensure_turbolite_conn() {
-                        Ok(conn_arc) => {
-                            let c = conn_arc.lock().expect("conn lock");
-                            let data_count: i64 = c.query_row(
-                                "SELECT COUNT(*) FROM test_data", [], |r| r.get(0),
-                            ).unwrap_or(-1);
-                            if data_count == 0 {
-                                // Data not visible. Drop connection, force VFS to refetch.
-                                drop(c);
-                                inner.set_conn(None);
-                                tracing::warn!(
-                                    "HaQLite: turbolite conn on promotion has 0 rows, reopening...",
-                                );
-                                // Reopen
-                                match inner.ensure_turbolite_conn() {
-                                    Ok(c2) => {
-                                        let c = c2.lock().expect("conn lock");
-                                        let count2: i64 = c.query_row(
-                                            "SELECT COUNT(*) FROM test_data", [], |r| r.get(0),
-                                        ).unwrap_or(-1);
-                                        tracing::info!(
-                                            "HaQLite: turbolite conn after reopen: {} rows",
-                                            count2,
-                                        );
-                                    }
-                                    Err(e) => tracing::error!("reopen failed: {}", e),
-                                }
-                            } else {
-                                tracing::info!(
-                                    "HaQLite: turbolite conn on promotion: {} rows",
-                                    data_count,
-                                );
-                                drop(c);
-                            }
+                        Ok(_) => {
+                            tracing::info!("HaQLite: opened turbolite connection on promotion");
                         }
                         Err(e) => {
                             tracing::error!(
