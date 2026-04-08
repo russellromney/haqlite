@@ -990,24 +990,25 @@ def test_double_failover(mode_test, result):
         f"Leader-3 has {len(phase2_writes) - phase2_missing}/{len(phase2_writes)} phase-2 rows (missing={phase2_missing})"
     )
 
-    # Dump logs from leader-3 if data was lost
+    # Dump logs from ALL servers if data was lost
     if not p1_ok or not p2_ok:
-        remaining_server = None
+        import re as _re
         for s in mode_test.servers:
-            if s.url == remaining_url:
-                remaining_server = s
-                break
-        if remaining_server:
-            import re as _re
-            log = remaining_server.read_output()
-            print("    --- Leader-3 log (relevant lines) ---")
+            log = s.read_output()
+            if not log:
+                continue
+            relevant = []
             for line in log.split("\n"):
                 line = _re.sub(chr(27) + r'\[[0-9;]*m', '', line).strip()
-                if any(k in line for k in ['S3 fetch', 'prefetch', 'CACHE MISS', 'CACHE HIT',
-                                           'override', 'not found', 'evict', 'set_manifest',
-                                           'catchup', 'promotion', 'test_data']):
-                    if 'page 0' not in line:  # skip noisy page 0 reads
-                        print(f"      {line[:200]}")
+                if any(k in line for k in ['S3 fetch', 'CACHE MISS', 'CACHE HIT',
+                                           'evict', 'set_manifest', 'catchup',
+                                           'promotion', 'test_data', 'promoted']):
+                    if 'page 0' not in line:
+                        relevant.append(line[:200])
+            if relevant:
+                print(f"    --- {s.instance_id} log ({len(relevant)} lines) ---")
+                for line in relevant[-20:]:  # last 20 relevant lines
+                    print(f"      {line}")
 
 
 def test_durability_across_restarts(mode_test, result):

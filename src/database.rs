@@ -1662,13 +1662,13 @@ async fn run_role_listener(
 
                 if let Some(ref vfs) = inner.shared_turbolite_vfs {
                     // Dedicated+Synchronous: refresh manifest from S3 and open
-                    // through turbolite VFS. The follower's catch-up should have
-                    // already applied the latest manifest, but re-fetch to be safe.
+                    // through turbolite VFS.
                     inner.set_conn(None);
                     let vfs_clone = vfs.clone();
                     let _ = tokio::task::block_in_place(|| {
                         vfs_clone.fetch_and_apply_s3_manifest()
                     });
+
                     match inner.ensure_turbolite_conn() {
                         Ok(conn_arc) => {
                             let c = conn_arc.lock().expect("conn lock");
