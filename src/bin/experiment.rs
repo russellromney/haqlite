@@ -103,6 +103,10 @@ struct Args {
     /// Write timeout in seconds (Shared mode)
     #[arg(long, default_value = "30")]
     write_timeout: u64,
+
+    /// NATS URL for lease store (e.g. nats://localhost:4222). Uses S3 if not set.
+    #[arg(long, env = "NATS_URL")]
+    nats_url: Option<String>,
 }
 
 // ============================================================================
@@ -450,6 +454,14 @@ async fn main() -> Result<()> {
     }
     if let Some(ref secret) = args.secret {
         builder = builder.secret(secret);
+    }
+
+    if let Some(ref nats_url) = args.nats_url {
+        let nats_lease = hadb_lease_nats::NatsLeaseStore::connect(nats_url, "haqlite-leases")
+            .await
+            .map_err(|e| anyhow::anyhow!("NATS lease connect: {}", e))?;
+        builder = builder.lease_store(std::sync::Arc::new(nats_lease));
+        info!("Using NATS lease store: {}", nats_url);
     }
 
     match mode {

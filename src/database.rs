@@ -1214,9 +1214,9 @@ impl HaQLite {
 
     /// Acquire the distributed write lease with retry + backoff.
     ///
-    /// Uses read-then-CAS (If-Match) instead of create-if-not-exists (If-None-Match: *)
-    /// because Tigris doesn't enforce If-None-Match atomically for concurrent PUTs.
-    /// If-Match IS atomic: only one writer can match a given etag.
+    /// Requires a lease store with atomic CAS (NATS, Redis, real S3).
+    /// Tigris S3 does NOT work: its conditional PUTs (If-None-Match, If-Match)
+    /// are not atomic for concurrent requests. Two concurrent PUTs both return 200.
     async fn acquire_lease(
         &self,
         lease_store: &dyn hadb::LeaseStore,
@@ -1242,42 +1242,16 @@ impl HaQLite {
 
             match lease_store.read(lease_key).await {
                 Ok(None) => {
-                    // No lease exists. Try to create one. If-None-Match: * has a
-                    // race on Tigris, but the next iteration will read-then-CAS
-                    // if another writer also created it.
+                    // No lease exists. Create it.
                     let result = lease_store.write_if_not_exists(lease_key, lease_data).await;
                     match result {
-                        Ok(cas) if cas.success => {
-                            // Verify we actually won (Tigris If-None-Match race).
-                            // Sleep with jitter so concurrent writers' PUTs all
-                            // complete before either reads back. Strong read
-                            // consistency then shows the true last-writer-wins state.
-                            let jitter = {
-                                use rand::Rng;
-                                rand::thread_rng().gen_range(100..350)
-                            };
-                            tokio::time::sleep(Duration::from_millis(jitter)).await;
-                            match lease_store.read(lease_key).await {
-                                Ok(Some((data, _etag))) => {
-                                    if let Ok(j) = serde_json::from_slice::<serde_json::Value>(&data) {
-                                        let holder = j.get("instance_id")
-                                            .and_then(|v| v.as_str()).unwrap_or("");
-                                        if holder == self.inner.shared_instance_id {
-                                            return Ok(());
-                                        }
-                                        // Another writer won the race. Fall through to retry.
-                                    }
-                                }
-                                _ => {} // Can't read back, retry
-                            }
-                        }
-                        Ok(_) => {} // Key exists, fall through to retry
+                        Ok(cas) if cas.success => return Ok(()),
+                        Ok(_) => {} // Someone else created it. Retry.
                         Err(e) => return Err(HaQLiteError::CoordinatorError(
                             format!("lease write failed: {}", e))),
                     }
                 }
                 Ok(Some((data, etag))) => {
-                    // Lease exists. Check if it's ours or expired.
                     let is_ours = serde_json::from_slice::<serde_json::Value>(&data)
                         .map(|j| {
                             j.get("instance_id").and_then(|v| v.as_str()).unwrap_or("") ==
@@ -1299,38 +1273,15 @@ impl HaQLite {
                         }).unwrap_or(true);
 
                     if expired {
-                        // CAS replace the expired lease with ours (If-Match).
-                        // Verify after write: Tigris conditionals have a small
-                        // race window even for If-Match on concurrent PUTs.
+                        // CAS replace the expired lease.
                         let result = lease_store.write_if_match(lease_key, lease_data, &etag).await;
                         match result {
-                            Ok(cas) if cas.success => {
-                                // Verify we actually hold it (jitter for Tigris race).
-                                let jitter = {
-                                    use rand::Rng;
-                                    rand::thread_rng().gen_range(100..350)
-                                };
-                                tokio::time::sleep(Duration::from_millis(jitter)).await;
-                                match lease_store.read(lease_key).await {
-                                    Ok(Some((data, _))) => {
-                                        if let Ok(j) = serde_json::from_slice::<serde_json::Value>(&data) {
-                                            let holder = j.get("instance_id")
-                                                .and_then(|v| v.as_str()).unwrap_or("");
-                                            if holder == self.inner.shared_instance_id {
-                                                return Ok(());
-                                            }
-                                        }
-                                        // Lost the race. Retry.
-                                    }
-                                    _ => {} // Can't verify, retry
-                                }
-                            }
-                            Ok(_) => {} // CAS conflict, someone else took it. Retry.
+                            Ok(cas) if cas.success => return Ok(()),
+                            Ok(_) => {} // CAS conflict. Retry.
                             Err(e) => return Err(HaQLiteError::CoordinatorError(
                                 format!("lease CAS failed: {}", e))),
                         }
                     }
-                    // Active lease held by another node. Wait and retry.
                 }
                 Err(e) => return Err(HaQLiteError::CoordinatorError(
                     format!("lease read failed: {}", e))),
