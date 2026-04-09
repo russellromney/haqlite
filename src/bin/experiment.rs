@@ -1,11 +1,10 @@
 //! Unified HA experiment binary -- HTTP server for all mode combinations.
 //!
-//! Supports all 5 valid haqlite configurations:
+//! Supports all 4 valid haqlite configurations:
 //!   Dedicated + Replicated  (classic walrust HA)
 //!   Dedicated + Synchronous (turbolite S3Primary HA)
 //!   Dedicated + Eventual    (turbolite + walrust HA)
 //!   Shared + Synchronous    (multiwriter, turbolite S3Primary)
-//!   Shared + Eventual       (multiwriter, turbolite + walrust)
 //!
 //! Usage:
 //!   # Shared + Synchronous (2 nodes)

@@ -2,12 +2,11 @@
 """
 Comprehensive e2e tests for all haqlite mode combinations.
 
-Tests each of the 5 valid mode combinations:
+Tests each of the 4 valid mode combinations:
   1. Shared + Synchronous    (multiwriter, turbolite S3Primary)
-  2. Shared + Eventual       (multiwriter, turbolite + walrust)
-  3. Dedicated + Replicated  (classic walrust HA)
-  4. Dedicated + Synchronous (turbolite S3Primary HA)
-  5. Dedicated + Eventual    (turbolite + walrust HA)
+  2. Dedicated + Replicated  (classic walrust HA)
+  3. Dedicated + Synchronous (turbolite S3Primary HA)
+  4. Dedicated + Eventual    (turbolite + walrust HA)
 
 Runs haqlite-experiment server processes, sends HTTP requests, verifies correctness.
 Requires: Tigris credentials via soup or env vars.
@@ -559,6 +558,145 @@ def test_shared_empty_reads(mode_test, result):
 
 
 # ---------------------------------------------------------------------------
+# Shared mode linearizability tests
+# ---------------------------------------------------------------------------
+
+def test_shared_last_writer_wins(mode_test, result):
+    """Two nodes write to same row sequentially. Last write must win."""
+    urls = mode_test.urls()
+    if len(urls) < 2:
+        result.ok("Skipped (need 2 nodes)")
+        return
+
+    row_id = f"lww-{uuid.uuid4().hex[:6]}"
+
+    # Node A writes v1
+    resp = post_json(f"{urls[0]}/write", {"id": row_id, "value": "v1", "seq": 1})
+    result.check(resp.get("ok"), "Node A wrote v1")
+
+    # Node B writes v2
+    resp = post_json(f"{urls[1]}/write", {"id": row_id, "value": "v2", "seq": 2})
+    result.check(resp.get("ok"), "Node B wrote v2")
+
+    # Both nodes must see v2
+    for i, url in enumerate(urls):
+        resp = get_json(f"{url}/read?id={row_id}")
+        val = resp.get("value", "")
+        seq = resp.get("seq", -1)
+        result.check(val == "v2" and seq == 2,
+                     f"Node {i} sees last write (value={val}, seq={seq})")
+
+
+def test_shared_counter_increment(mode_test, result):
+    """Both nodes increment a counter. Final value must equal total increments."""
+    urls = mode_test.urls()
+    if len(urls) < 2:
+        result.ok("Skipped (need 2 nodes)")
+        return
+
+    row_id = f"counter-{uuid.uuid4().hex[:6]}"
+    increments_per_node = 10
+    total_expected = increments_per_node * len(urls)
+
+    # Seed the counter
+    resp = post_json(f"{urls[0]}/write", {"id": row_id, "value": "counter", "seq": 0})
+    result.check(resp.get("ok"), "Seeded counter at 0")
+
+    # Alternate increments between nodes
+    errors = 0
+    for i in range(increments_per_node):
+        for url in urls:
+            resp = post_json(f"{url}/execute", {
+                "sql": "UPDATE test_data SET seq = seq + 1 WHERE id = ?1",
+                "params": [row_id],
+            })
+            if not resp.get("ok"):
+                errors += 1
+
+    result.check(errors == 0, f"All {total_expected} increments succeeded ({errors} errors)")
+
+    # Read final counter value from both nodes
+    for i, url in enumerate(urls):
+        resp = get_json(f"{url}/read?id={row_id}")
+        if resp.get("found"):
+            final_val = resp.get("seq", -1)
+            result.check(final_val == total_expected,
+                         f"Node {i} counter={final_val} (expected {total_expected})")
+        else:
+            result.fail(f"Node {i} counter row missing")
+
+
+def test_shared_alternating_inserts(mode_test, result):
+    """Nodes alternate inserting unique rows. All must be present.
+
+    Writes are sequential (not threaded) because S3 lease stores don't support
+    truly concurrent lease acquisition. Each write: acquire lease, catch up,
+    execute, release. The next node's write sees the previous node's data.
+    """
+    urls = mode_test.urls()
+    if len(urls) < 2:
+        result.ok("Skipped (need 2 nodes)")
+        return
+
+    writes_per_node = 10
+    prefix = f"ai-{uuid.uuid4().hex[:6]}"
+    all_ids = []
+
+    # Alternate writes between nodes sequentially
+    for i in range(writes_per_node):
+        for node_idx, url in enumerate(urls):
+            row_id = f"{prefix}-n{node_idx}-{i}"
+            resp = post_json(f"{url}/write", {"id": row_id, "value": f"node{node_idx}", "seq": i})
+            if resp.get("ok"):
+                all_ids.append(row_id)
+
+    total = writes_per_node * len(urls)
+    result.check(len(all_ids) == total,
+                 f"All {total} alternating inserts succeeded ({len(all_ids)}/{total})")
+
+    # Verify all rows visible from both nodes
+    for i, url in enumerate(urls):
+        missing = 0
+        for row_id in all_ids:
+            resp = get_json(f"{url}/read?id={row_id}")
+            if not resp.get("found"):
+                missing += 1
+        result.check(missing == 0,
+                     f"Node {i} sees all {len(all_ids)} rows (missing={missing})")
+
+
+def test_shared_delete_insert_consistency(mode_test, result):
+    """Node A deletes a row, node B re-inserts it. Final state must be consistent."""
+    urls = mode_test.urls()
+    if len(urls) < 2:
+        result.ok("Skipped (need 2 nodes)")
+        return
+
+    row_id = f"di-{uuid.uuid4().hex[:6]}"
+
+    # Seed the row
+    resp = post_json(f"{urls[0]}/write", {"id": row_id, "value": "original", "seq": 1})
+    result.check(resp.get("ok"), "Seeded row")
+
+    # Node A deletes
+    resp = post_json(f"{urls[0]}/execute", {
+        "sql": "DELETE FROM test_data WHERE id = ?1",
+        "params": [row_id],
+    })
+    result.check(resp.get("ok"), "Node A deleted row")
+
+    # Node B re-inserts
+    resp = post_json(f"{urls[1]}/write", {"id": row_id, "value": "reinserted", "seq": 2})
+    result.check(resp.get("ok"), "Node B re-inserted row")
+
+    # Both nodes must see the re-inserted version
+    for i, url in enumerate(urls):
+        resp = get_json(f"{url}/read?id={row_id}")
+        result.check(resp.get("found") and resp.get("value") == "reinserted",
+                     f"Node {i} sees re-inserted row (found={resp.get('found')}, value={resp.get('value')})")
+
+
+# ---------------------------------------------------------------------------
 # Dedicated mode tests
 # ---------------------------------------------------------------------------
 
@@ -642,6 +780,22 @@ def test_dedicated_follower_replication(mode_test, result):
         count_resp = get_json(f"{furl}/count")
         follower_count = count_resp.get("count", 0)
         # Follower should have at least some rows (may lag slightly)
+        if follower_count == 0:
+            # Dump follower status and server log for diagnostics
+            status = get_json(f"{furl}/status")
+            port = furl.split(":")[-1]
+            print(f"    DEBUG: follower {port} has 0 rows, status={status}")
+            for s in mode_test.servers:
+                if str(s.port) == port:
+                    log = s.read_output()
+                    # Show lines with pull/restore/error info
+                    import re as _re
+                    for line in log.split("\n")[-50:]:
+                        line = _re.sub(chr(27) + r'\[[0-9;]*m', '', line).strip()
+                        if any(k in line.lower() for k in ['pull', 'restore', 'error', 'failed',
+                                                           'follower', 'changeset', 'snapshot',
+                                                           'seq', 'synced', 'replicator']):
+                            print(f"      {line[:250]}")
         result.check(
             follower_count > 0,
             f"Follower {furl.split(':')[-1]} has {follower_count} rows (expected >= {len(writes)})"
@@ -1057,6 +1211,23 @@ def test_durability_across_restarts(mode_test, result):
     settle_time = 2 if mode_test.durability == "synchronous" else 15
     time.sleep(settle_time)
 
+    # Dump writer log after settle to see if walrust synced
+    for s in mode_test.servers:
+        if s.url == write_url and s.is_alive():
+            import re as _re
+            log = s.read_output()
+            wal_lines = []
+            for line in log.split("\n")[-80:]:
+                line = _re.sub(chr(27) + r'\[[0-9;]*m', '', line).strip()
+                if any(k in line.lower() for k in ['synced', 'sync_wal', 'flush',
+                                                    'replicator', 'promoted', 'add_continuing',
+                                                    'added', 'wal frame']):
+                    wal_lines.append(line[:250])
+            if wal_lines:
+                print(f"    --- writer walrust log (post-settle) ---")
+                for line in wal_lines[-10:]:
+                    print(f"      {line}")
+
     # Kill all nodes
     for s in mode_test.servers:
         s.kill()
@@ -1111,8 +1282,11 @@ def test_durability_across_restarts(mode_test, result):
         for line in log.split("\n"):
             line = _re.sub(chr(27) + r'\[[0-9;]*m', '', line).strip()
             if any(k in line for k in ['manifest', 'S3 fetch', 'CACHE', 'ensure_fresh',
-                                       'set_manifest', 'catchup', 'page_count', 'building']):
-                print(f"      {line[:200]}")
+                                       'set_manifest', 'catchup', 'page_count', 'building',
+                                       'Replicator', 'restore', 'changeset', 'snapshot',
+                                       'Synced', 'flush', 'pull', 'walrust', 'seq',
+                                       'promoted', 'Leader', 'ERROR', 'error', 'WARN']):
+                print(f"      {line[:250]}")
 
         # Also try a count query directly
         count_resp = get_json(f"{fresh_url}/count")
@@ -1184,6 +1358,18 @@ def run_shared_synchronous(args):
 
         print("  --- Empty reads ---")
         test_shared_empty_reads(mt, result)
+
+        print("  --- Last writer wins ---")
+        test_shared_last_writer_wins(mt, result)
+
+        print("  --- Counter increment linearizability ---")
+        test_shared_counter_increment(mt, result)
+
+        print("  --- Alternating inserts ---")
+        test_shared_alternating_inserts(mt, result)
+
+        print("  --- Delete + re-insert consistency ---")
+        test_shared_delete_insert_consistency(mt, result)
 
         print("  --- Sustained writes ---")
         test_shared_sustained_writes(mt, result)
@@ -1398,6 +1584,9 @@ def run_dedicated_synchronous(args):
 
         print("  --- Sustained writes ---")
         test_dedicated_sustained_writes(mt, result)
+
+        print("  --- Durability across restarts ---")
+        test_durability_across_restarts(mt, result)
 
     except Exception as e:
         result.fail(f"Unexpected error: {e}")
@@ -1778,8 +1967,107 @@ def test_changeset_chain_integrity(result, topology="dedicated", durability="eve
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_shared_concurrent_readers(result, durability):
+    """Readers on node B while node A writes continuously. No corruption allowed."""
+    prefix = f"chaos-shared-readers-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
+    tmp = tempfile.mkdtemp(prefix="haqlite_chaos_shared_readers_")
+
+    s0 = ServerProcess("shared", durability, BASE_PORT + 80, "sr-0",
+                       prefix, tmp, lease_ttl=10,
+                       extra_args=["--write-timeout", "30"])
+    s1 = ServerProcess("shared", durability, BASE_PORT + 81, "sr-1",
+                       prefix, tmp, lease_ttl=10,
+                       extra_args=["--write-timeout", "30"])
+    s0.start(); s1.start()
+    if not s0.wait_healthy(timeout=30) or not s1.wait_healthy(timeout=30):
+        result.fail("Shared concurrent readers: servers didn't start")
+        s0.stop(); s1.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    # Seed some data so reads have something to check
+    for i in range(5):
+        post_json(f"{s0.url}/write", {"id": f"seed-{i}", "value": f"v{i}"}, timeout=10)
+
+    import threading
+
+    # Writer thread: node A writes continuously
+    stop_event = threading.Event()
+    write_count = [0]
+    write_errors = [0]
+
+    def writer_loop():
+        while not stop_event.is_set():
+            row_id = f"w-{write_count[0]}"
+            resp = post_json(f"{s0.url}/write",
+                             {"id": row_id, "value": f"val-{write_count[0]}", "seq": write_count[0]},
+                             timeout=15)
+            if resp.get("ok"):
+                write_count[0] += 1
+            else:
+                write_errors[0] += 1
+            time.sleep(0.1)
+
+    # Reader threads: node B reads continuously
+    read_count = [0]
+    read_errors = [0]
+    corrupt_reads = [0]
+
+    def reader_loop():
+        while not stop_event.is_set():
+            try:
+                # Count query
+                resp = get_json(f"{s1.url}/count")
+                if "error" in resp:
+                    read_errors[0] += 1
+                else:
+                    count = resp.get("count", -1)
+                    if count < 0:
+                        corrupt_reads[0] += 1
+                    read_count[0] += 1
+
+                # Spot read a seeded row
+                resp = get_json(f"{s1.url}/read?id=seed-0")
+                if "error" in resp and "500" in str(resp.get("error", "")):
+                    corrupt_reads[0] += 1
+                else:
+                    read_count[0] += 1
+            except Exception:
+                read_errors[0] += 1
+            time.sleep(0.05)
+
+    writer = threading.Thread(target=writer_loop, daemon=True)
+    readers = [threading.Thread(target=reader_loop, daemon=True) for _ in range(3)]
+
+    writer.start()
+    for r in readers:
+        r.start()
+
+    # Let it run for 10 seconds
+    time.sleep(10)
+    stop_event.set()
+    writer.join(timeout=5)
+    for r in readers:
+        r.join(timeout=5)
+
+    s0.stop(); s1.stop()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    result.check(corrupt_reads[0] == 0,
+                 f"No corrupt reads during concurrent writes ({read_count[0]} reads, {corrupt_reads[0]} corrupt)")
+    result.check(read_count[0] > 0,
+                 f"Concurrent readers: {read_count[0]} reads, {write_count[0]} writes completed")
+
+
 def test_concurrent_readers_during_failover(result, topology="dedicated", durability="eventual"):
-    """Readers on follower must not crash or return corrupt data during leader kill."""
+    """Readers must not crash or return corrupt data during leader kill.
+
+    For dedicated mode: readers on follower during leader kill.
+    For shared mode: readers on node B while node A writes continuously.
+    """
+    if topology == "shared":
+        return _test_shared_concurrent_readers(result, durability)
+
     prefix = f"chaos-readers-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
     tmp = tempfile.mkdtemp(prefix="haqlite_chaos_readers_")
     extra = ["--sync-interval-ms", "500", "--follower-pull-ms", "500",
@@ -1934,8 +2222,252 @@ def test_rapid_kill_restart(result, topology="dedicated", durability="eventual")
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Shared-mode-specific chaos tests
+# ---------------------------------------------------------------------------
+
+def test_shared_sigkill_mid_write(result, durability="synchronous"):
+    """SIGKILL one node while it holds the lease. Other node must take over after TTL."""
+    prefix = f"chaos-shared-kill-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
+    tmp = tempfile.mkdtemp(prefix="haqlite_chaos_shared_kill_")
+
+    s0 = ServerProcess("shared", durability, BASE_PORT + 90, "sk-0",
+                       prefix, tmp, lease_ttl=5,
+                       extra_args=["--write-timeout", "30"])
+    s1 = ServerProcess("shared", durability, BASE_PORT + 91, "sk-1",
+                       prefix, tmp, lease_ttl=5,
+                       extra_args=["--write-timeout", "30"])
+    s0.start(); s1.start()
+    if not s0.wait_healthy(timeout=30) or not s1.wait_healthy(timeout=30):
+        result.fail("Shared SIGKILL: servers didn't start")
+        s0.stop(); s1.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    # Node A writes 5 rows
+    pre_kill_ids = []
+    for i in range(5):
+        row_id = f"pre-{i}-{uuid.uuid4().hex[:6]}"
+        resp = post_json(f"{s0.url}/write", {"id": row_id, "value": f"v{i}"}, timeout=15)
+        if resp.get("ok"):
+            pre_kill_ids.append(row_id)
+
+    result.check(len(pre_kill_ids) == 5, f"Pre-kill: wrote {len(pre_kill_ids)} rows from node A")
+
+    # SIGKILL node A (it may hold the lease from the last write)
+    s0.kill()
+    result.ok("SIGKILL'd node A")
+
+    # Node B should be able to write after lease TTL expires
+    time.sleep(7)  # lease TTL (5s) + margin
+
+    post_kill_ids = []
+    for i in range(5):
+        row_id = f"post-{i}-{uuid.uuid4().hex[:6]}"
+        resp = post_json(f"{s1.url}/write", {"id": row_id, "value": f"v{i}"}, timeout=30)
+        if resp.get("ok"):
+            post_kill_ids.append(row_id)
+
+    result.check(len(post_kill_ids) == 5,
+                 f"Post-kill: node B wrote {len(post_kill_ids)} rows after lease expiry")
+
+    # Verify node B sees ALL data (pre-kill + post-kill)
+    missing_pre = sum(1 for rid in pre_kill_ids
+                      if not get_json(f"{s1.url}/read?id={rid}").get("found"))
+    missing_post = sum(1 for rid in post_kill_ids
+                       if not get_json(f"{s1.url}/read?id={rid}").get("found"))
+
+    result.check(missing_pre == 0,
+                 f"Node B sees all pre-kill rows (missing={missing_pre}/{len(pre_kill_ids)})")
+    result.check(missing_post == 0,
+                 f"Node B sees all post-kill rows (missing={missing_post}/{len(post_kill_ids)})")
+
+    s1.stop()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_shared_simultaneous_crash(result, durability="synchronous"):
+    """SIGKILL both nodes, restart both. No corruption, data consistent."""
+    prefix = f"chaos-shared-simcrash-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
+    tmp = tempfile.mkdtemp(prefix="haqlite_chaos_simcrash_")
+
+    s0 = ServerProcess("shared", durability, BASE_PORT + 92, "sc-0",
+                       prefix, tmp, lease_ttl=5,
+                       extra_args=["--write-timeout", "30"])
+    s1 = ServerProcess("shared", durability, BASE_PORT + 93, "sc-1",
+                       prefix, tmp, lease_ttl=5,
+                       extra_args=["--write-timeout", "30"])
+    s0.start(); s1.start()
+    if not s0.wait_healthy(timeout=30) or not s1.wait_healthy(timeout=30):
+        result.fail("Simultaneous crash: servers didn't start")
+        s0.stop(); s1.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    # Write from both nodes alternately
+    written_ids = []
+    for i in range(10):
+        url = s0.url if i % 2 == 0 else s1.url
+        row_id = f"sim-{i}-{uuid.uuid4().hex[:6]}"
+        resp = post_json(f"{url}/write", {"id": row_id, "value": f"v{i}"}, timeout=15)
+        if resp.get("ok"):
+            written_ids.append(row_id)
+
+    result.check(len(written_ids) == 10, f"Wrote {len(written_ids)} rows before crash")
+
+    # SIGKILL both simultaneously
+    s0.kill()
+    s1.kill()
+    result.ok("SIGKILL'd both nodes simultaneously")
+    time.sleep(3)
+
+    # Restart both
+    s0_new = ServerProcess("shared", durability, BASE_PORT + 92, "sc-0-restart",
+                           prefix, tmp, lease_ttl=5,
+                           extra_args=["--write-timeout", "30"])
+    s1_new = ServerProcess("shared", durability, BASE_PORT + 93, "sc-1-restart",
+                           prefix, tmp, lease_ttl=5,
+                           extra_args=["--write-timeout", "30"])
+    s0_new.start(); s1_new.start()
+    if not s0_new.wait_healthy(timeout=30) or not s1_new.wait_healthy(timeout=30):
+        result.fail("Simultaneous crash: restarted servers didn't become healthy")
+        s0_new.stop(); s1_new.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    result.ok("Both nodes restarted")
+
+    # Verify no corruption
+    for s in [s0_new, s1_new]:
+        ic_resp = get_json(f"{s.url}/query?sql=PRAGMA%20integrity_check")
+        ic_ok = ic_resp.get("rows", [[]])[0] == ["ok"] if ic_resp.get("rows") else False
+        result.check(ic_ok, f"Integrity check on {s.instance_id}: {'ok' if ic_ok else ic_resp}")
+
+    # Both nodes must see all written data
+    for s in [s0_new, s1_new]:
+        missing = sum(1 for rid in written_ids
+                      if not get_json(f"{s.url}/read?id={rid}").get("found"))
+        result.check(missing == 0,
+                     f"{s.instance_id} sees all {len(written_ids)} rows (missing={missing})")
+
+    s0_new.stop(); s1_new.stop()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_shared_rapid_alternating(result, durability="synchronous"):
+    """Rapid alternating writes between 2 nodes. All must survive."""
+    prefix = f"chaos-shared-rapid-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
+    tmp = tempfile.mkdtemp(prefix="haqlite_chaos_rapid_alt_")
+
+    s0 = ServerProcess("shared", durability, BASE_PORT + 94, "ra-0",
+                       prefix, tmp, lease_ttl=10,
+                       extra_args=["--write-timeout", "30"])
+    s1 = ServerProcess("shared", durability, BASE_PORT + 95, "ra-1",
+                       prefix, tmp, lease_ttl=10,
+                       extra_args=["--write-timeout", "30"])
+    s0.start(); s1.start()
+    if not s0.wait_healthy(timeout=30) or not s1.wait_healthy(timeout=30):
+        result.fail("Rapid alternating: servers didn't start")
+        s0.stop(); s1.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    # 50 rapid alternating writes
+    written_ids = []
+    errors = 0
+    for i in range(50):
+        url = s0.url if i % 2 == 0 else s1.url
+        row_id = f"ra-{i}"
+        resp = post_json(f"{url}/write", {"id": row_id, "value": f"v{i}", "seq": i}, timeout=15)
+        if resp.get("ok"):
+            written_ids.append(row_id)
+        else:
+            errors += 1
+
+    result.check(len(written_ids) == 50,
+                 f"Rapid alternating: {len(written_ids)}/50 writes ok ({errors} errors)")
+
+    # Verify all from both nodes
+    for s in [s0, s1]:
+        missing = sum(1 for rid in written_ids
+                      if not get_json(f"{s.url}/read?id={rid}").get("found"))
+        result.check(missing == 0,
+                     f"{s.instance_id} sees all {len(written_ids)} rows (missing={missing})")
+
+    s0.stop(); s1.stop()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_shared_stale_lease(result, durability="synchronous"):
+    """Freeze node A (SIGSTOP), lease expires, node B writes. Unfreeze A. A must not overwrite B."""
+    prefix = f"chaos-shared-stale-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
+    tmp = tempfile.mkdtemp(prefix="haqlite_chaos_stale_")
+
+    s0 = ServerProcess("shared", durability, BASE_PORT + 96, "stale-0",
+                       prefix, tmp, lease_ttl=5,
+                       extra_args=["--write-timeout", "10"])
+    s1 = ServerProcess("shared", durability, BASE_PORT + 97, "stale-1",
+                       prefix, tmp, lease_ttl=5,
+                       extra_args=["--write-timeout", "30"])
+    s0.start(); s1.start()
+    if not s0.wait_healthy(timeout=30) or not s1.wait_healthy(timeout=30):
+        result.fail("Stale lease: servers didn't start")
+        s0.stop(); s1.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    row_id = f"stale-{uuid.uuid4().hex[:6]}"
+
+    # Node A writes the row
+    resp = post_json(f"{s0.url}/write", {"id": row_id, "value": "from-A", "seq": 1}, timeout=15)
+    result.check(resp.get("ok"), "Node A wrote initial value")
+
+    # SIGSTOP node A (freeze, simulates hang). Its lease will expire.
+    pid_a = s0.proc.pid
+    os.kill(pid_a, signal.SIGSTOP)
+    result.ok("Froze node A (SIGSTOP)")
+
+    # Wait for lease to expire
+    time.sleep(7)  # TTL (5s) + margin
+
+    # Node B writes a new value
+    resp = post_json(f"{s1.url}/write", {"id": row_id, "value": "from-B", "seq": 2}, timeout=30)
+    result.check(resp.get("ok"), "Node B overwrote after lease expiry")
+
+    # Verify node B sees its own value
+    resp = get_json(f"{s1.url}/read?id={row_id}")
+    result.check(resp.get("value") == "from-B",
+                 f"Node B reads 'from-B' (got '{resp.get('value')}')")
+
+    # Unfreeze node A
+    os.kill(pid_a, signal.SIGCONT)
+    result.ok("Unfroze node A (SIGCONT)")
+    time.sleep(2)
+
+    # Node A's next write should catch up from S3 and see B's value.
+    # Write a DIFFERENT row to force catch-up without overwriting the test row.
+    resp = post_json(f"{s0.url}/write", {"id": f"after-unfreeze", "value": "check", "seq": 3}, timeout=15)
+    catchup_ok = resp.get("ok", False)
+
+    if catchup_ok:
+        # Verify node A sees B's value (not its own stale value)
+        resp = get_json(f"{s0.url}/read?id={row_id}")
+        result.check(resp.get("value") == "from-B",
+                     f"Node A sees B's value after unfreeze (got '{resp.get('value')}')")
+    else:
+        # Node A might fail to write (lease contention, timeout). That's acceptable.
+        result.ok("Node A write after unfreeze failed (expected if lease conflict)")
+        # Still verify via node B that B's value is authoritative
+        resp = get_json(f"{s1.url}/read?id={row_id}")
+        result.check(resp.get("value") == "from-B",
+                     f"Node B's value is authoritative (got '{resp.get('value')}')")
+
+    s0.stop(); s1.stop()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def run_chaos(args, topology, durability):
-    """Generic chaos runner for any dedicated mode."""
+    """Generic chaos runner for any mode."""
     mode_label = f"{topology}-{durability}"
     print("\n" + "=" * 70)
     print(f"CHAOS: {topology.title()} + {durability.title()} resilience tests")
@@ -1959,6 +2491,19 @@ def run_chaos(args, topology, durability):
         print("\n  --- Rapid kill/restart cycle ---")
         test_rapid_kill_restart(result, topology, durability)
 
+        if topology == "shared":
+            print("\n  --- SIGKILL mid-write (lease held) ---")
+            test_shared_sigkill_mid_write(result, durability)
+
+            print("\n  --- Simultaneous crash ---")
+            test_shared_simultaneous_crash(result, durability)
+
+            print("\n  --- Rapid alternating writes (50x) ---")
+            test_shared_rapid_alternating(result, durability)
+
+            print("\n  --- Stale lease (SIGSTOP/SIGCONT) ---")
+            test_shared_stale_lease(result, durability)
+
     except Exception as e:
         result.fail(f"Unexpected error: {e}")
         import traceback
@@ -1975,6 +2520,15 @@ def run_chaos_dedicated_replicated(args):
     return run_chaos(args, "dedicated", "replicated")
 
 
+def run_chaos_dedicated_synchronous(args):
+    return run_chaos(args, "dedicated", "synchronous")
+
+
+def run_chaos_shared_synchronous(args):
+    """Chaos tests for shared mode. Uses single-node (no followers in shared mode)."""
+    return run_chaos(args, "shared", "synchronous")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1987,7 +2541,6 @@ def run_chaos_dedicated_replicated(args):
 
 BASIC_MODES = {
     ("shared", "synchronous"): run_shared_synchronous,
-    ("shared", "eventual"): run_shared_eventual,
     ("dedicated", "replicated"): run_dedicated_replicated,
     ("dedicated", "synchronous"): run_dedicated_synchronous,
     ("dedicated", "eventual"): run_dedicated_eventual,
@@ -1996,6 +2549,8 @@ BASIC_MODES = {
 CHAOS_MODES = {
     ("dedicated", "eventual"): run_chaos_dedicated_eventual,
     ("dedicated", "replicated"): run_chaos_dedicated_replicated,
+    ("dedicated", "synchronous"): run_chaos_dedicated_synchronous,
+    ("shared", "synchronous"): run_chaos_shared_synchronous,
 }
 
 def resolve_modes(mode_str):
