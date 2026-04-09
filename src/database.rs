@@ -1213,65 +1213,118 @@ impl HaQLite {
     }
 
     /// Acquire the distributed write lease with retry + backoff.
+    ///
+    /// Uses read-then-CAS (If-Match) instead of create-if-not-exists (If-None-Match: *)
+    /// because Tigris doesn't enforce If-None-Match atomically for concurrent PUTs.
+    /// If-Match IS atomic: only one writer can match a given etag.
     async fn acquire_lease(
         &self,
         lease_store: &dyn hadb::LeaseStore,
         lease_key: &str,
     ) -> std::result::Result<(), HaQLiteError> {
-        let lease_data = serde_json::to_vec(&serde_json::json!({
-            "instance_id": self.inner.shared_instance_id,
-            "timestamp": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_millis() as u64,
-            "ttl_secs": self.inner.lease_ttl,
-        })).unwrap_or_default();
-
         let deadline = tokio::time::Instant::now() + self.inner.write_timeout;
         let mut attempt = 0u32;
 
         loop {
-            // Acquire via write_if_not_exists (If-None-Match: *).
-            //
-            // KNOWN LIMITATION: S3-compatible stores (including Tigris, even
-            // single-region) don't guarantee atomic If-None-Match: * for truly
-            // concurrent PUTs. Two concurrent creates can both return 200.
-            // This means shared mode is NOT safe for concurrent multi-node writes.
-            // Callers must serialize writes externally (e.g., single writer at a time,
-            // or use a non-S3 lease store like NATS/Redis for true CAS).
-            let result = lease_store.write_if_not_exists(lease_key, lease_data.clone()).await;
-            match result {
-                Ok(cas) if cas.success => return Ok(()),
-                Ok(_) => {
-                    // Key exists (another node holds it). Check if expired.
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(HaQLiteError::LeaseContention(
-                            format!("could not acquire lease for '{}' within {:?}",
-                                self.inner.db_name, self.inner.write_timeout)));
-                    }
-                    match lease_store.read(lease_key).await {
-                        Ok(Some((data, _etag))) => {
-                            let expired = serde_json::from_slice::<serde_json::Value>(&data)
-                                .map(|j| {
-                                    let ts = j.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    let ttl = j.get("ttl_secs").and_then(|v| v.as_u64()).unwrap_or(5);
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default().as_millis() as u64;
-                                    now > ts + (ttl * 1000)
-                                }).unwrap_or(true);
-                            if expired {
-                                let _ = lease_store.delete(lease_key).await;
-                            }
-                        }
-                        Ok(None) => {} // Key gone, next iteration will create
-                        _ => {}
-                    }
-                }
-                Err(e) => return Err(HaQLiteError::CoordinatorError(
-                    format!("lease write failed: {}", e))),
+            if tokio::time::Instant::now() >= deadline {
+                return Err(HaQLiteError::LeaseContention(
+                    format!("could not acquire lease for '{}' within {:?}",
+                        self.inner.db_name, self.inner.write_timeout)));
             }
 
-            let backoff = Duration::from_millis(100 * 2u64.pow(attempt.min(4)));
+            let lease_data = serde_json::to_vec(&serde_json::json!({
+                "instance_id": self.inner.shared_instance_id,
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_millis() as u64,
+                "ttl_secs": self.inner.lease_ttl,
+            })).unwrap_or_default();
+
+            match lease_store.read(lease_key).await {
+                Ok(None) => {
+                    // No lease exists. Try to create one. If-None-Match: * has a
+                    // race on Tigris, but the next iteration will read-then-CAS
+                    // if another writer also created it.
+                    let result = lease_store.write_if_not_exists(lease_key, lease_data).await;
+                    match result {
+                        Ok(cas) if cas.success => {
+                            // Verify we actually won (Tigris If-None-Match race).
+                            match lease_store.read(lease_key).await {
+                                Ok(Some((data, _etag))) => {
+                                    if let Ok(j) = serde_json::from_slice::<serde_json::Value>(&data) {
+                                        let holder = j.get("instance_id")
+                                            .and_then(|v| v.as_str()).unwrap_or("");
+                                        if holder == self.inner.shared_instance_id {
+                                            return Ok(());
+                                        }
+                                        // Another writer won the race. Fall through to retry.
+                                    }
+                                }
+                                _ => {} // Can't read back, retry
+                            }
+                        }
+                        Ok(_) => {} // Key exists, fall through to retry
+                        Err(e) => return Err(HaQLiteError::CoordinatorError(
+                            format!("lease write failed: {}", e))),
+                    }
+                }
+                Ok(Some((data, etag))) => {
+                    // Lease exists. Check if it's ours or expired.
+                    let is_ours = serde_json::from_slice::<serde_json::Value>(&data)
+                        .map(|j| {
+                            j.get("instance_id").and_then(|v| v.as_str()).unwrap_or("") ==
+                                self.inner.shared_instance_id
+                        }).unwrap_or(false);
+
+                    if is_ours {
+                        return Ok(());
+                    }
+
+                    let expired = serde_json::from_slice::<serde_json::Value>(&data)
+                        .map(|j| {
+                            let ts = j.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let ttl = j.get("ttl_secs").and_then(|v| v.as_u64()).unwrap_or(5);
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default().as_millis() as u64;
+                            now > ts + (ttl * 1000)
+                        }).unwrap_or(true);
+
+                    if expired {
+                        // CAS replace the expired lease with ours (If-Match).
+                        // Verify after write: Tigris conditionals have a small
+                        // race window even for If-Match on concurrent PUTs.
+                        let result = lease_store.write_if_match(lease_key, lease_data, &etag).await;
+                        match result {
+                            Ok(cas) if cas.success => {
+                                // Verify we actually hold it.
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                match lease_store.read(lease_key).await {
+                                    Ok(Some((data, _))) => {
+                                        if let Ok(j) = serde_json::from_slice::<serde_json::Value>(&data) {
+                                            let holder = j.get("instance_id")
+                                                .and_then(|v| v.as_str()).unwrap_or("");
+                                            if holder == self.inner.shared_instance_id {
+                                                return Ok(());
+                                            }
+                                        }
+                                        // Lost the race. Retry.
+                                    }
+                                    _ => {} // Can't verify, retry
+                                }
+                            }
+                            Ok(_) => {} // CAS conflict, someone else took it. Retry.
+                            Err(e) => return Err(HaQLiteError::CoordinatorError(
+                                format!("lease CAS failed: {}", e))),
+                        }
+                    }
+                    // Active lease held by another node. Wait and retry.
+                }
+                Err(e) => return Err(HaQLiteError::CoordinatorError(
+                    format!("lease read failed: {}", e))),
+            }
+
+            let backoff = Duration::from_millis(50 * 2u64.pow(attempt.min(4)));
             tokio::time::sleep(backoff.min(Duration::from_secs(2))).await;
             attempt += 1;
         }

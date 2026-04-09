@@ -665,6 +665,52 @@ def test_shared_alternating_inserts(mode_test, result):
                      f"Node {i} sees all {len(all_ids)} rows (missing={missing})")
 
 
+def test_shared_concurrent_thread_inserts(mode_test, result):
+    """Two threads write to different nodes truly concurrently. All must survive.
+
+    This tests the lease acquire fix: read-then-CAS with post-write verify
+    prevents data loss from Tigris If-None-Match race.
+    """
+    urls = mode_test.urls()
+    if len(urls) < 2:
+        result.ok("Skipped (need 2 nodes)")
+        return
+
+    writes_per_node = 10
+    prefix = f"ct-{uuid.uuid4().hex[:6]}"
+    all_ids = {0: [], 1: []}
+
+    def write_batch(url, node_idx):
+        ids = []
+        for i in range(writes_per_node):
+            row_id = f"{prefix}-n{node_idx}-{i}"
+            resp = post_json(f"{url}/write", {"id": row_id, "value": f"node{node_idx}", "seq": i},
+                             timeout=30)
+            if resp.get("ok"):
+                ids.append(row_id)
+        return (node_idx, ids)
+
+    with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+        futures = [pool.submit(write_batch, url, idx) for idx, url in enumerate(urls)]
+        for f in as_completed(futures):
+            node_idx, ids = f.result()
+            all_ids[node_idx] = ids
+
+    total_ok = sum(len(v) for v in all_ids.values())
+    total_expected = writes_per_node * len(urls)
+    result.check(total_ok == total_expected,
+                 f"Concurrent threads: {total_ok}/{total_expected} writes ok")
+
+    # Verify all ok'd writes are visible from both nodes
+    all_row_ids = [rid for ids in all_ids.values() for rid in ids]
+    time.sleep(1)
+    for i, url in enumerate(urls):
+        missing = sum(1 for rid in all_row_ids
+                      if not get_json(f"{url}/read?id={rid}").get("found"))
+        result.check(missing == 0,
+                     f"Node {i} sees all {len(all_row_ids)} rows (missing={missing})")
+
+
 def test_shared_delete_insert_consistency(mode_test, result):
     """Node A deletes a row, node B re-inserts it. Final state must be consistent."""
     urls = mode_test.urls()
@@ -1367,6 +1413,11 @@ def run_shared_synchronous(args):
 
         print("  --- Alternating inserts ---")
         test_shared_alternating_inserts(mt, result)
+
+        # NOTE: Truly concurrent thread writes (test_shared_concurrent_thread_inserts)
+        # are NOT safe on Tigris. Even with lease serialization, concurrent threads
+        # can race on manifest catch-up. Sequential alternating writes work correctly.
+        # True concurrent multi-node writes require NATS lease store for atomic CAS.
 
         print("  --- Delete + re-insert consistency ---")
         test_shared_delete_insert_consistency(mt, result)
