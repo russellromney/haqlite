@@ -1414,10 +1414,8 @@ def run_shared_synchronous(args):
         print("  --- Alternating inserts ---")
         test_shared_alternating_inserts(mt, result)
 
-        # NOTE: Truly concurrent thread writes (test_shared_concurrent_thread_inserts)
-        # are NOT safe on Tigris. Even with lease serialization, concurrent threads
-        # can race on manifest catch-up. Sequential alternating writes work correctly.
-        # True concurrent multi-node writes require NATS lease store for atomic CAS.
+        print("  --- Concurrent thread inserts ---")
+        test_shared_concurrent_thread_inserts(mt, result)
 
         print("  --- Delete + re-insert consistency ---")
         test_shared_delete_insert_consistency(mt, result)

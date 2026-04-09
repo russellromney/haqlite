@@ -1249,6 +1249,14 @@ impl HaQLite {
                     match result {
                         Ok(cas) if cas.success => {
                             // Verify we actually won (Tigris If-None-Match race).
+                            // Sleep with jitter so concurrent writers' PUTs all
+                            // complete before either reads back. Strong read
+                            // consistency then shows the true last-writer-wins state.
+                            let jitter = {
+                                use rand::Rng;
+                                rand::thread_rng().gen_range(100..350)
+                            };
+                            tokio::time::sleep(Duration::from_millis(jitter)).await;
                             match lease_store.read(lease_key).await {
                                 Ok(Some((data, _etag))) => {
                                     if let Ok(j) = serde_json::from_slice::<serde_json::Value>(&data) {
@@ -1297,8 +1305,12 @@ impl HaQLite {
                         let result = lease_store.write_if_match(lease_key, lease_data, &etag).await;
                         match result {
                             Ok(cas) if cas.success => {
-                                // Verify we actually hold it.
-                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                // Verify we actually hold it (jitter for Tigris race).
+                                let jitter = {
+                                    use rand::Rng;
+                                    rand::thread_rng().gen_range(100..350)
+                                };
+                                tokio::time::sleep(Duration::from_millis(jitter)).await;
                                 match lease_store.read(lease_key).await {
                                     Ok(Some((data, _))) => {
                                         if let Ok(j) = serde_json::from_slice::<serde_json::Value>(&data) {
