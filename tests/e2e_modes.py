@@ -1729,12 +1729,16 @@ def test_sigkill_during_sync(result, topology="dedicated", durability="eventual"
 
         time.sleep(3)
 
-        # Run integrity check via SQL
-        ic_resp = get_json(f"{fresh.url}/query?sql=PRAGMA%20integrity_check")
+        # Run integrity check via SQL. Retry once on HTTP error (server may still be loading).
         ic_ok = False
-        if ic_resp.get("rows"):
-            first_row = ic_resp["rows"][0] if ic_resp["rows"] else []
-            ic_ok = (first_row == ["ok"] if first_row else False)
+        for attempt in range(2):
+            ic_resp = get_json(f"{fresh.url}/query?sql=PRAGMA%20integrity_check")
+            if ic_resp.get("rows"):
+                first_row = ic_resp["rows"][0] if ic_resp["rows"] else []
+                ic_ok = (first_row == ["ok"] if first_row else False)
+                break
+            elif "error" in ic_resp and attempt == 0:
+                time.sleep(3)  # server still loading, retry
         if not ic_ok:
             corruption_count += 1
             result.fail(f"Iteration {iteration}: integrity_check FAILED: {ic_resp}")
@@ -2084,17 +2088,21 @@ def test_concurrent_readers_during_failover(result, topology="dedicated", durabi
         shutil.rmtree(tmp, ignore_errors=True)
         return
 
-    time.sleep(3)
-
+    # Wait for leader election with retry
     leader_s = None; follower_s = None
-    for s in [s0, s1]:
-        if get_json(f"{s.url}/status").get("role") == "Leader":
-            leader_s = s
-        else:
-            follower_s = s
+    for attempt in range(10):
+        time.sleep(2)
+        leader_s = follower_s = None
+        for s in [s0, s1]:
+            if get_json(f"{s.url}/status").get("role") == "Leader":
+                leader_s = s
+            else:
+                follower_s = s
+        if leader_s and follower_s:
+            break
 
     if not leader_s or not follower_s:
-        result.fail("Need leader + follower")
+        result.fail("Need leader + follower (no election after 20s)")
         s0.stop(); s1.stop()
         shutil.rmtree(tmp, ignore_errors=True)
         return
@@ -2466,6 +2474,270 @@ def test_shared_stale_lease(result, durability="synchronous"):
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Network partition / split brain test
+# ---------------------------------------------------------------------------
+
+def test_network_partition(result, topology="dedicated", durability="replicated"):
+    """Simulate partition by freezing leader. Verify self-demotion and clean promotion.
+
+    Uses SIGSTOP to freeze the leader process, preventing lease renewals.
+    The leader should self-demote when it unfreezes and discovers its lease
+    was taken. The follower should promote after the lease expires.
+    No split brain: the old leader must not accept writes after demotion.
+    """
+    if topology == "shared":
+        result.ok("Network partition: skipped (shared mode uses per-write leases)")
+        return
+
+    prefix = f"chaos-partition-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
+    tmp = tempfile.mkdtemp(prefix="haqlite_chaos_partition_")
+    extra = ["--sync-interval-ms", "500", "--follower-pull-ms", "500",
+             "--follower-poll-ms", "500", "--renew-interval-ms", "500"]
+
+    s0 = ServerProcess(topology, durability, BASE_PORT + 200, "part-0",
+                       prefix, tmp, lease_ttl=3, extra_args=extra)
+    s1 = ServerProcess(topology, durability, BASE_PORT + 201, "part-1",
+                       prefix, tmp, lease_ttl=3, extra_args=extra)
+    s0.start(); s1.start()
+    if not s0.wait_healthy(timeout=30) or not s1.wait_healthy(timeout=30):
+        result.fail("Partition: servers didn't start")
+        s0.stop(); s1.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    time.sleep(5)  # leader election
+
+    # Identify leader and follower
+    leader = follower = None
+    for s in [s0, s1]:
+        status = get_json(f"{s.url}/status")
+        if status.get("role") == "Leader":
+            leader = s
+        else:
+            follower = s
+
+    if not leader or not follower:
+        result.fail("Partition: need 1 leader + 1 follower")
+        s0.stop(); s1.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    result.ok(f"Leader={leader.instance_id}, Follower={follower.instance_id}")
+
+    # Write pre-partition data
+    pre_ids = []
+    for i in range(5):
+        row_id = f"pre-{i}-{uuid.uuid4().hex[:6]}"
+        resp = post_json(f"{leader.url}/write", {"id": row_id, "value": f"v{i}"}, timeout=10)
+        if resp.get("ok"):
+            pre_ids.append(row_id)
+    result.check(len(pre_ids) == 5, f"Pre-partition: wrote {len(pre_ids)} rows")
+
+    # Wait for replication
+    time.sleep(3)
+
+    # SIGSTOP the leader (simulates network partition)
+    leader_pid = leader.proc.pid
+    os.kill(leader_pid, signal.SIGSTOP)
+    result.ok(f"Froze leader (SIGSTOP pid={leader_pid})")
+
+    # Wait for lease to expire + follower to promote
+    # Lease TTL=3s, follower polls every 500ms, needs 1 expired read + claim + verify
+    time.sleep(12)
+
+    # Check follower promoted
+    follower_status = get_json(f"{follower.url}/status")
+    follower_promoted = follower_status.get("role") == "Leader"
+    result.check(follower_promoted,
+                 f"Follower promoted to leader (role={follower_status.get('role')})")
+
+    if not follower_promoted:
+        os.kill(leader_pid, signal.SIGCONT)
+        s0.stop(); s1.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    # New leader writes post-partition data
+    post_ids = []
+    for i in range(5):
+        row_id = f"post-{i}-{uuid.uuid4().hex[:6]}"
+        resp = post_json(f"{follower.url}/write", {"id": row_id, "value": f"v{i}"}, timeout=10)
+        if resp.get("ok"):
+            post_ids.append(row_id)
+    result.check(len(post_ids) == 5, f"Post-partition: new leader wrote {len(post_ids)} rows")
+
+    # Unfreeze old leader
+    os.kill(leader_pid, signal.SIGCONT)
+    result.ok("Unfroze old leader (SIGCONT)")
+    time.sleep(3)  # let it discover lease loss
+
+    # Old leader should have self-demoted (CAS conflict on renewal)
+    old_leader_status = get_json(f"{leader.url}/status")
+    old_leader_role = old_leader_status.get("role", "unknown")
+    result.check(old_leader_role == "Follower",
+                 f"Old leader self-demoted (role={old_leader_role})")
+
+    # Old leader must reject writes
+    reject_resp = post_json(f"{leader.url}/write",
+                            {"id": "should-reject", "value": "bad"}, timeout=10)
+    # Should either fail or be forwarded to new leader
+    wrote_locally = reject_resp.get("ok") and reject_resp.get("node") == leader.instance_id
+    result.check(not wrote_locally,
+                 f"Old leader did not accept local write (ok={reject_resp.get('ok')}, node={reject_resp.get('node')})")
+
+    # New leader has all data
+    all_ids = pre_ids + post_ids
+    missing = sum(1 for rid in all_ids
+                  if not get_json(f"{follower.url}/read?id={rid}").get("found"))
+    result.check(missing == 0,
+                 f"New leader sees all {len(all_ids)} rows (missing={missing})")
+
+    s0.stop(); s1.stop()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Soak / scale test
+# ---------------------------------------------------------------------------
+
+def test_soak(result, topology="dedicated", durability="replicated", soak_secs=60):
+    """Sustained writes for soak_secs, verify 0 data loss for Ok'd writes."""
+    prefix = f"chaos-soak-{int(time.time())}-{uuid.uuid4().hex[:4]}/"
+    tmp = tempfile.mkdtemp(prefix="haqlite_chaos_soak_")
+
+    if topology == "shared":
+        extra = ["--write-timeout", "30"]
+        lease_ttl = 10
+        num_nodes = 2
+    else:
+        extra = ["--sync-interval-ms", "500", "--follower-pull-ms", "500",
+                 "--follower-poll-ms", "500", "--renew-interval-ms", "1000"]
+        lease_ttl = 5
+        num_nodes = 2  # 1 leader + 1 follower (keep it simple)
+
+    servers = []
+    for i in range(num_nodes):
+        s = ServerProcess(topology, durability, BASE_PORT + 210 + i, f"soak-{i}",
+                          prefix, tmp, lease_ttl=lease_ttl, extra_args=extra)
+        s.start()
+        servers.append(s)
+
+    all_healthy = all(s.wait_healthy(timeout=30) for s in servers)
+    if not all_healthy:
+        result.fail("Soak: servers didn't start")
+        for s in servers:
+            s.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    if topology == "dedicated":
+        time.sleep(5)  # leader election
+
+    # Find write target
+    write_url = None
+    if topology == "shared":
+        write_url = servers[0].url
+    else:
+        for s in servers:
+            status = get_json(f"{s.url}/status")
+            if status.get("role") == "Leader":
+                write_url = s.url
+                break
+        if not write_url:
+            # Try forwarding through first node
+            write_url = servers[0].url
+
+    if not write_url:
+        result.fail("Soak: no write target found")
+        for s in servers:
+            s.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    # Sustained writes
+    ok_ids = []
+    errors = 0
+    start = time.time()
+    i = 0
+    while time.time() - start < soak_secs:
+        row_id = f"soak-{i}"
+        if topology == "shared" and num_nodes > 1:
+            # Alternate between nodes for shared mode
+            url = servers[i % num_nodes].url
+        else:
+            url = write_url
+        resp = post_json(f"{url}/write", {"id": row_id, "value": f"v{i}", "seq": i}, timeout=15)
+        if resp.get("ok"):
+            ok_ids.append(row_id)
+        else:
+            errors += 1
+        i += 1
+
+    elapsed = time.time() - start
+    ops_per_sec = len(ok_ids) / elapsed if elapsed > 0 else 0
+    result.check(len(ok_ids) > 0,
+                 f"Soak: {len(ok_ids)} ok writes in {elapsed:.0f}s ({ops_per_sec:.1f} ops/s, {errors} errors)")
+
+    # Wait for async sync to settle. Async modes need longer (walrust sync interval).
+    settle = 2 if durability == "synchronous" else 5
+    time.sleep(settle)
+
+    # Verify ALL ok'd writes are readable from the writer node.
+    # Follower may lag behind for async modes; we verify follower catch-up
+    # separately via the fresh restore test below.
+    read_url = write_url
+    missing = 0
+    for rid in ok_ids:
+        resp = get_json(f"{read_url}/read?id={rid}")
+        if not resp.get("found"):
+            missing += 1
+
+    result.check(missing == 0,
+                 f"Soak: all {len(ok_ids)} ok'd writes readable (missing={missing})")
+
+    # Integrity check
+    ic_resp = get_json(f"{read_url}/query?sql=PRAGMA%20integrity_check")
+    ic_ok = False
+    if ic_resp.get("rows"):
+        first_row = ic_resp["rows"][0] if ic_resp["rows"] else []
+        ic_ok = (first_row == ["ok"] if first_row else False)
+    result.check(ic_ok, f"Soak: integrity_check {'ok' if ic_ok else ic_resp}")
+
+    # Kill all, fresh node restore (10K+ row restore test)
+    for s in servers:
+        s.kill()
+    time.sleep(2)
+
+    fresh = ServerProcess(topology, durability, BASE_PORT + 215, "soak-fresh",
+                          prefix, tmp, lease_ttl=lease_ttl, extra_args=extra)
+    fresh.start()
+    if not fresh.wait_healthy(timeout=60):
+        result.fail("Soak: fresh node didn't start")
+        fresh.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+
+    if topology == "dedicated":
+        wait_role(fresh.url, "Leader", timeout=15)
+    time.sleep(3)
+
+    fresh_count = get_json(f"{fresh.url}/count").get("count", 0)
+    # For synchronous modes, all ok'd writes must survive.
+    # For async modes, some recent writes may be lost (RPO window).
+    if durability == "synchronous":
+        result.check(fresh_count == len(ok_ids),
+                     f"Soak restore: {fresh_count}/{len(ok_ids)} rows (synchronous, expect all)")
+    else:
+        # Allow up to 1 sync_interval worth of loss
+        min_expected = len(ok_ids) - int(ops_per_sec * 1.0)  # ~1s of writes
+        result.check(fresh_count >= min_expected,
+                     f"Soak restore: {fresh_count}/{len(ok_ids)} rows (async, min {min_expected})")
+
+    fresh.stop()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def run_chaos(args, topology, durability):
     """Generic chaos runner for any mode."""
     mode_label = f"{topology}-{durability}"
@@ -2490,6 +2762,12 @@ def run_chaos(args, topology, durability):
 
         print("\n  --- Rapid kill/restart cycle ---")
         test_rapid_kill_restart(result, topology, durability)
+
+        print("\n  --- Network partition (SIGSTOP) ---")
+        test_network_partition(result, topology, durability)
+
+        print("\n  --- Soak test (60s) ---")
+        test_soak(result, topology, durability, soak_secs=60)
 
         if topology == "shared":
             print("\n  --- SIGKILL mid-write (lease held) ---")
