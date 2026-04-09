@@ -47,7 +47,7 @@ Node 1 (leader)                    Node 2 (follower)
            └────────── S3 bucket ─────────────┘
 ```
 
-- **Leader election** via S3 conditional PUTs (compare-and-swap on ETags), or [NATS](https://github.com/russellromney/hadb/tree/main/hadb-lease-nats) for faster failover. No Raft, no Paxos.
+- **Leader election** via S3 conditional PUTs (compare-and-swap on ETags), or [NATS](https://github.com/russellromney/hadb/tree/main/hadb-lease-nats) for faster failover. No Raft, no Paxos. **Note:** Tigris S3 does not support atomic conditional PUTs. Use AWS S3 or NATS for the lease store.
 - **WAL replication** via [walrust](https://github.com/russellromney/walrust). Leader syncs WAL frames to S3, followers pull and apply.
 - **Write forwarding**: `execute()` on a follower transparently forwards to the leader via an internal HTTP server. Your app doesn't need to know who the leader is.
 - **Auto-promotion**: when the leader dies, a follower claims the lease, catches up from S3, and promotes itself.
@@ -120,7 +120,7 @@ let config = CoordinatorConfig {
 
 ## Custom lease store
 
-By default, haqlite uses S3 conditional PUTs for leader election. For faster failover (2-5ms vs 50-200ms), plug in a NATS lease store:
+The lease store must support atomic conditional writes. AWS S3 and NATS JetStream KV both work. **Tigris S3 does not** (its conditional PUTs are not atomic for concurrent requests). For fastest failover (2-5ms vs 50-200ms), use NATS:
 
 ```rust
 use hadb_lease_nats::NatsLeaseStore;
@@ -139,7 +139,7 @@ Or in CLI mode, just set the env var (requires `--features nats-lease`):
 WAL_LEASE_NATS_URL=nats://localhost:4222 haqlite serve
 ```
 
-If NATS is unreachable at startup, haqlite logs an error and falls back to S3 leases.
+If NATS is unreachable at startup, haqlite falls back to S3 leases (requires AWS S3, not Tigris).
 
 ## What it does
 
