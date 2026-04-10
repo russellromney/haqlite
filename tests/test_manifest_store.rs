@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use common::InMemoryStorage;
 use hadb::{InMemoryLeaseStore, LeaseStore};
 use haqlite::{HaMode, HaQLite, InMemoryManifestStore, ManifestStore, SqlValue};
-use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{SharedTurboliteVfs, SyncMode, TurboliteConfig, TurboliteVfs};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
 fn make_local_vfs(cache_dir: &std::path::Path) -> (SharedTurboliteVfs, String) {
@@ -32,6 +32,37 @@ fn make_local_vfs(cache_dir: &std::path::Path) -> (SharedTurboliteVfs, String) {
         ..Default::default()
     };
     let vfs = TurboliteVfs::new(config).expect("create VFS");
+    let shared_vfs = SharedTurboliteVfs::new(vfs);
+    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
+    (shared_vfs, vfs_name)
+}
+
+fn test_bucket() -> String {
+    std::env::var("TIERED_TEST_BUCKET").expect("TIERED_TEST_BUCKET required")
+}
+
+fn endpoint_url() -> Option<String> {
+    std::env::var("AWS_ENDPOINT_URL").ok()
+}
+
+#[cfg(feature = "turbolite-cloud")]
+fn make_s3_vfs(cache_dir: &std::path::Path, s3_prefix: &str) -> (SharedTurboliteVfs, String) {
+    let n = VFS_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let vfs_name = format!("tms_s3_{}", n);
+    let config = TurboliteConfig {
+        bucket: test_bucket(),
+        prefix: s3_prefix.to_string(),
+        cache_dir: cache_dir.to_path_buf(),
+        endpoint_url: endpoint_url(),
+        region: Some(std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string())),
+        pages_per_group: 4,
+        sub_pages_per_frame: 2,
+        sync_mode: SyncMode::S3Primary,
+        eager_index_load: false,
+        runtime_handle: Some(tokio::runtime::Handle::current()),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("create S3-backed VFS");
     let shared_vfs = SharedTurboliteVfs::new(vfs);
     turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
     (shared_vfs, vfs_name)
@@ -61,6 +92,7 @@ async fn dedicated_mode_with_manifest_store() {
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
         .walrust_storage(storage)
         .instance_id("test-node")
+        .forwarding_port(19201)
         .open(db_path.to_str().expect("path"), SCHEMA)
         .await
         .expect("open dedicated mode with manifest store");
@@ -93,6 +125,7 @@ async fn dedicated_mode_without_manifest_store_still_works() {
         .lease_store(lease_store)
         .walrust_storage(storage)
         .instance_id("test-node")
+        .forwarding_port(19202)
         .open(db_path.to_str().expect("path"), SCHEMA)
         .await
         .expect("open dedicated mode without manifest store");
@@ -141,7 +174,7 @@ async fn shared_mode_manifest_published_on_write() {
 
     // Before write: no manifest
     let meta = manifest_store
-        .meta("test/_manifest")
+        .meta("test/shared_manifest/_manifest")
         .await
         .expect("meta");
     assert!(meta.is_none(), "no manifest before first write");
@@ -156,7 +189,7 @@ async fn shared_mode_manifest_published_on_write() {
 
     // After write: manifest exists with correct writer_id
     let meta = manifest_store
-        .meta("test/_manifest")
+        .meta("test/shared_manifest/_manifest")
         .await
         .expect("meta")
         .expect("manifest should exist after write");
@@ -197,7 +230,7 @@ async fn shared_mode_sequential_writes_increment_manifest_version() {
     }
 
     let meta = manifest_store
-        .meta("test/_manifest")
+        .meta("test/shared_seq/_manifest")
         .await
         .expect("meta")
         .expect("manifest should exist");
@@ -208,7 +241,7 @@ async fn shared_mode_sequential_writes_increment_manifest_version() {
 // Regression: two writers see each other's data via manifest catch-up
 // ============================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "turbolite-cloud")]
 async fn shared_mode_two_writers_see_each_others_data() {
     let tmp1 = TempDir::new().expect("temp dir 1");
@@ -217,11 +250,13 @@ async fn shared_mode_two_writers_see_each_others_data() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-    let (vfs1, vfs_name1) = make_local_vfs(tmp1.path());
-    let db1 = HaQLite::builder("test-bucket")
+    let s3_prefix = format!("test/two_writers/{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).expect("time").as_nanos());
+    let (vfs1, vfs_name1) = make_s3_vfs(tmp1.path(), &s3_prefix);
+    let db1 = HaQLite::builder(&test_bucket())
         .prefix("test/")
         .mode(HaMode::Shared)
-                .durability(haqlite::Durability::Synchronous)
+        .durability(haqlite::Durability::Synchronous)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
         .walrust_storage(storage.clone())
@@ -244,11 +279,11 @@ async fn shared_mode_two_writers_see_each_others_data() {
     .expect("insert from writer 1");
 
     // Writer 2 opens and writes (should catch up from manifest first)
-    let (vfs2, vfs_name2) = make_local_vfs(tmp2.path());
-    let mut db2 = HaQLite::builder("test-bucket")
+    let (vfs2, vfs_name2) = make_s3_vfs(tmp2.path(), &s3_prefix);
+    let mut db2 = HaQLite::builder(&test_bucket())
         .prefix("test/")
         .mode(HaMode::Shared)
-                .durability(haqlite::Durability::Synchronous)
+        .durability(haqlite::Durability::Synchronous)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
         .walrust_storage(storage.clone())
@@ -277,7 +312,7 @@ async fn shared_mode_two_writers_see_each_others_data() {
 
     // Manifest should be at version 2
     let meta = manifest_store
-        .meta("test/_manifest")
+        .meta("test/two_writers/_manifest")
         .await
         .expect("meta")
         .expect("manifest");

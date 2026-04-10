@@ -2,7 +2,7 @@
 
 > **Experimental.** haqlite is under active development and not yet stable. APIs will change without notice.
 
-Embed HA SQLite in your app with one line of code + an S3 bucket. Leader election, WAL replication, write forwarding.
+Embed HA SQLite in your app with one line of code. Leader election, WAL replication, write forwarding.
 
 Part of the [hadb](https://github.com/russellromney/hadb) ecosystem for making any embedded database highly available.
 
@@ -15,44 +15,97 @@ let db = HaQLite::builder("my-bucket")
     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);")
     .await?;
 
-// Writes — forwarded to leader automatically
+// Writes: forwarded to leader automatically
 db.execute(
     "INSERT INTO users (name) VALUES (?1)",
     &[SqlValue::Text("Alice".into())],
 ).await?;
 
-// Reads — always local
+// Reads: always local
 let count: i64 = db.query_row("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;
 
 // Clean shutdown
 db.close().await?;
 ```
 
-That's it. No S3 client setup, no lease configuration, no write proxy, no role event handlers. HaQLite handles everything internally.
-
 ## How it works
 
 ```
 Node 1 (leader)                    Node 2 (follower)
-┌──────────────────────┐           ┌──────────────────────┐
-│  Your App            │           │  Your App            │
-│         │            │           │         │            │
-│    HaQLite           │           │    HaQLite           │
-│    ├─ execute() ─────┤──local    │    ├─ execute() ─────┤──► HTTP to leader
-│    ├─ query_row() ───┤──local    │    ├─ query_row() ───┤──local (read replica)
-│    ├─ Coordinator    │           │    ├─ Coordinator    │
-│    ├─ SQLite (rw)    │           │    ├─ SQLite (ro)    │
-│    └─ walrust sync   │           │    └─ walrust pull   │
-└──────────┬───────────┘           └──────────┬───────────┘
-           └────────── S3 bucket ─────────────┘
++-----------------------+          +-----------------------+
+|  Your App             |          |  Your App             |
+|         |             |          |         |             |
+|    HaQLite            |          |    HaQLite            |
+|    +- execute() ------+--local   |    +- execute() ------+--> HTTP to leader
+|    +- query_row() ----+--local   |    +- query_row() ----+--local (read replica)
+|    +- Coordinator     |          |    +- Coordinator     |
+|    +- SQLite (rw)     |          |    +- SQLite (ro)     |
+|    +- walrust sync    |          |    +- walrust pull    |
++-----------+-----------+          +-----------+-----------+
+            +--------- lease + storage --------+
 ```
 
-- **Leader election** via S3 conditional PUTs (compare-and-swap on ETags), or [NATS](https://github.com/russellromney/hadb/tree/main/hadb-lease-nats) for faster failover. No Raft, no Paxos. **Note:** Tigris S3 does not support atomic conditional PUTs. Use AWS S3 or NATS for the lease store.
+- **Leader election** via pluggable lease store (S3, NATS, HTTP, etcd). No Raft, no Paxos.
 - **WAL replication** via [walrust](https://github.com/russellromney/walrust). Leader syncs WAL frames to S3, followers pull and apply.
-- **Write forwarding**: `execute()` on a follower transparently forwards to the leader via an internal HTTP server. Your app doesn't need to know who the leader is.
-- **Auto-promotion**: when the leader dies, a follower claims the lease, catches up from S3, and promotes itself.
-- **Self-fencing**: if a leader loses its lease (partition, slow renewal), it demotes itself immediately. No split-brain.
-- **Coordination** via [hadb](https://github.com/russellromney/hadb). Generic HA framework with pluggable lease stores, follower readiness, and Prometheus metrics.
+- **Write forwarding**: `execute()` on a follower transparently forwards to the leader. Your app doesn't need to know who the leader is.
+- **Auto-promotion**: when the leader dies, a follower claims the lease, catches up, and promotes itself.
+- **Self-fencing**: if a leader loses its lease, it demotes itself immediately. No split-brain.
+
+## Lease and manifest store
+
+haqlite requires a lease store for leader election and (for some durability modes) a manifest store for coordination. Configure via env vars or builder methods.
+
+### Environment variables
+
+One env var per store, scheme picks the backend:
+
+```bash
+# S3 (uses builder bucket/endpoint)
+HAQLITE_LEASE_URL=s3
+HAQLITE_MANIFEST_URL=s3
+
+# S3 explicit
+HAQLITE_LEASE_URL=s3://my-bucket?endpoint=https://fly.storage.tigris.dev
+
+# NATS (requires nats-lease / nats-manifest feature)
+HAQLITE_LEASE_URL=nats://localhost:4222?bucket=leases
+HAQLITE_MANIFEST_URL=nats://localhost:4222?bucket=manifests
+
+# HTTP (for embedded replicas via a proxy)
+HAQLITE_LEASE_URL=http://proxy:8080?token=mytoken
+HAQLITE_MANIFEST_URL=http://proxy:8080?token=mytoken
+```
+
+No fallbacks. If the env var is missing and no store is set on the builder, haqlite errors with a clear message.
+
+### Builder methods
+
+```rust
+// Explicit store objects
+let db = HaQLite::builder("my-bucket")
+    .lease_store(Arc::new(my_nats_store))
+    .manifest_store(Arc::new(my_manifest_store))
+    .open("/data/my.db", schema)
+    .await?;
+
+// HTTP convenience (equivalent to setting the env vars)
+let db = HaQLite::builder("my-bucket")
+    .lease_endpoint("http://proxy:8080", "my-token")
+    .manifest_endpoint("http://proxy:8080", "my-token")
+    .open("/data/my.db", schema)
+    .await?;
+```
+
+### Supported backends
+
+| Backend | Lease | Manifest | Failover | Feature flag |
+|---------|-------|----------|----------|-------------|
+| S3 | yes | yes | 50-200ms | always on / `s3-manifest` |
+| NATS | yes | yes | 2-5ms | `nats-lease` / `nats-manifest` |
+| HTTP | yes | yes | 10-15ms | always on |
+| etcd | yes | yes | ~50ms | `etcd-lease` / `etcd-manifest` |
+
+**Note:** Tigris S3 does not support atomic conditional PUTs. Use NATS, HTTP, or AWS S3 for the lease store.
 
 ## Builder options
 
@@ -64,7 +117,8 @@ let db = HaQLite::builder("my-bucket")
     .address("http://node1.internal:18080")   // default: auto-detected
     .forwarding_port(18080)                   // internal HTTP port (default: 18080)
     .secret("my-auth-token")                  // inter-node forwarding auth
-    .lease_store(my_nats_store)               // custom lease backend (default: S3)
+    .mode(HaMode::Dedicated)                  // Dedicated (default) or Shared
+    .durability(Durability::Replicated)        // Replicated, Synchronous, or Eventual
     .coordinator_config(config)               // override lease/sync timing
     .open("/data/my.db", schema)
     .await?;
@@ -72,7 +126,7 @@ let db = HaQLite::builder("my-bucket")
 
 ## Local mode (no HA)
 
-For development and testing — same API, no S3:
+For development and testing, same API, no coordination:
 
 ```rust
 let db = HaQLite::local("/tmp/dev.db", schema)?;
@@ -92,7 +146,7 @@ let client = HaQLiteClient::new("my-bucket")
     .connect()
     .await?;
 
-// Discovers leader from S3, forwards reads/writes over HTTP
+// Discovers leader, forwards reads/writes over HTTP
 client.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Eve".into())]).await?;
 let row = client.query_row("SELECT COUNT(*) FROM users", &[]).await?;
 let count = row[0].as_integer().unwrap();
@@ -118,52 +172,17 @@ let config = CoordinatorConfig {
 };
 ```
 
-## Custom lease store
-
-The lease store must support atomic conditional writes. AWS S3 and NATS JetStream KV both work. **Tigris S3 does not** (its conditional PUTs are not atomic for concurrent requests). For fastest failover (2-5ms vs 50-200ms), use NATS:
-
-```rust
-use hadb_lease_nats::NatsLeaseStore;
-
-let nats_store = NatsLeaseStore::connect("nats://localhost:4222", "hadb-leases").await?;
-
-let db = HaQLite::builder("my-bucket")
-    .lease_store(Arc::new(nats_store))
-    .open("/data/my.db", schema)
-    .await?;
-```
-
-Or in CLI mode, just set the env var (requires `--features nats-lease`):
-
-```bash
-WAL_LEASE_NATS_URL=nats://localhost:4222 haqlite serve
-```
-
-If NATS is unreachable at startup, haqlite falls back to S3 leases (requires AWS S3, not Tigris).
-
-## What it does
-
-- S3 is the only required dependency (no etcd, no ZooKeeper, no sidecar)
-- Pluggable lease store: S3 by default, NATS via `nats-lease` feature, or any `LeaseStore` impl
-- `query_row()` is sync (always local), `execute()` is async (forwards to leader if follower)
-- Followers catch up from S3 before promoting (warm promotion)
-- Forwarding retries with exponential backoff, skips 4xx
-- Read concurrency bounded by semaphore (default 32)
-- Structured error types (`HaQLiteError`) for matching on failure modes
-- Follower readiness tracking (`is_caught_up()`, `replay_position()`)
-- Prometheus metrics for lease operations, promotions, catchup timing, readiness
-
 ## Architecture
 
 ```
-hadb        — coordination (leader election, role management, metrics)
-hadb-io     — shared infrastructure (S3, retry, circuit breaker)
-walrust     — SQLite WAL replication to S3
-haqlite     — HA API + write forwarding + CLI
-your app    — uses haqlite as an embedded library or CLI server
+hadb        - coordination (leader election, role management, metrics)
+hadb-io     - shared infrastructure (S3, retry, circuit breaker)
+walrust     - SQLite WAL replication to S3
+haqlite     - HA API + write forwarding + CLI
+your app    - uses haqlite as an embedded library or CLI server
 ```
 
-See [hadb](https://github.com/russellromney/hadb) for the full ecosystem. [hakuzu](https://github.com/russellromney/hakuzu) is the equivalent for Kuzu/graph databases, using [graphstream](https://github.com/russellromney/graphstream) for journal replication.
+See [hadb](https://github.com/russellromney/hadb) for the full ecosystem.
 
 ## License
 

@@ -121,7 +121,7 @@ async fn turbolite_shared_manifest_published_after_write() {
 
     // Manifest should exist
     let meta = manifest_store
-        .meta("test/_manifest")
+        .meta("test/test/_manifest")
         .await
         .expect("meta call")
         .expect("manifest should exist");
@@ -129,7 +129,7 @@ async fn turbolite_shared_manifest_published_after_write() {
 
     // Manifest should be Turbolite variant
     let manifest = manifest_store
-        .get("test/_manifest")
+        .get("test/test/_manifest")
         .await
         .expect("get call")
         .expect("manifest should exist");
@@ -167,7 +167,7 @@ async fn turbolite_shared_sequential_writes_increment_manifest() {
     }
 
     let meta = manifest_store
-        .meta("test/_manifest")
+        .meta("test/test/_manifest")
         .await
         .expect("meta call")
         .expect("manifest should exist");
@@ -208,7 +208,7 @@ async fn turbolite_shared_manifest_has_turbolite_fields() {
     .expect("insert");
 
     let manifest = manifest_store
-        .get("test/_manifest")
+        .get("test/test/_manifest")
         .await
         .expect("get")
         .expect("manifest");
@@ -356,7 +356,7 @@ async fn turbolite_shared_manifest_writer_id_set() {
     .expect("insert");
 
     let manifest = manifest_store
-        .get("test/_manifest")
+        .get("test/test/_manifest")
         .await
         .expect("get")
         .expect("manifest");

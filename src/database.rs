@@ -28,6 +28,24 @@ use hadb_lease_s3::S3LeaseStore;
 use crate::error::HaQLiteError;
 use crate::follower_behavior::SqliteFollowerBehavior;
 use crate::forwarding::{self, ForwardingState, SqlValue};
+
+/// Custom authorizer callback for SQLite connections.
+///
+/// Called by haqlite when applying or updating the connection authorizer.
+/// The `fenced` parameter indicates whether the database has lost its lease
+/// and writes should be blocked.
+///
+/// When `fenced=false`, the authorizer should enforce security policy
+/// (e.g. block ATTACH, dangerous functions, non-allowlisted PRAGMAs).
+/// When `fenced=true`, the authorizer should additionally block all writes.
+///
+/// The returned closure is installed as the SQLite authorizer via
+/// `conn.authorizer()`. It must be `FnMut` + `Send` + `'static`.
+pub type AuthorizerFactory = Arc<
+    dyn Fn(bool) -> Box<dyn FnMut(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization + Send>
+        + Send
+        + Sync,
+>;
 use crate::replicator::SqliteReplicator;
 
 const DEFAULT_PREFIX: &str = "haqlite/";
@@ -103,6 +121,9 @@ pub struct HaQLiteBuilder {
     walrust_storage: Option<Arc<dyn walrust::StorageBackend>>,
     lease_ttl: Option<u64>,
     turbolite_vfs: Option<(turbolite::tiered::SharedTurboliteVfs, String)>,
+    cinch_endpoint: Option<String>,
+    cinch_token: Option<String>,
+    authorizer: Option<AuthorizerFactory>,
 }
 
 impl HaQLiteBuilder {
@@ -127,6 +148,9 @@ impl HaQLiteBuilder {
             walrust_storage: None,
             lease_ttl: None,
             turbolite_vfs: None,
+            cinch_endpoint: std::env::var("CINCH_ENDPOINT").ok(),
+            cinch_token: std::env::var("CINCH_TOKEN").ok(),
+            authorizer: None,
         }
     }
 
@@ -189,11 +213,20 @@ impl HaQLiteBuilder {
 
     /// Use a custom LeaseStore instead of the default S3LeaseStore.
     ///
-    /// Works with any `LeaseStore` implementation: NATS, Redis, etcd, etc.
+    /// Works with any `LeaseStore` implementation: NATS, Redis, etcd, HTTP, etc.
     /// When set, the builder skips S3LeaseStore construction in `open()`.
     pub fn lease_store(mut self, store: Arc<dyn hadb::LeaseStore>) -> Self {
         self.lease_store = Some(store);
         self
+    }
+
+    /// Use an HTTP-based LeaseStore (for embedded replicas via a proxy).
+    ///
+    /// Shorthand for `.lease_store(Arc::new(HttpLeaseStore::new(endpoint, token)))`.
+    pub fn lease_endpoint(self, endpoint: &str, token: &str) -> Self {
+        self.lease_store(Arc::new(
+            hadb_lease_http::HttpLeaseStore::new(endpoint, token),
+        ))
     }
 
     /// Set the coordination topology. Default: `HaMode::Dedicated`.
@@ -216,6 +249,15 @@ impl HaQLiteBuilder {
     pub fn manifest_store(mut self, store: Arc<dyn hadb::ManifestStore>) -> Self {
         self.manifest_store = Some(store);
         self
+    }
+
+    /// Use an HTTP-based ManifestStore (for embedded replicas via a proxy).
+    ///
+    /// Shorthand for `.manifest_store(Arc::new(HttpManifestStore::new(endpoint, token)))`.
+    pub fn manifest_endpoint(self, endpoint: &str, token: &str) -> Self {
+        self.manifest_store(Arc::new(
+            hadb_manifest_http::HttpManifestStore::new(endpoint, token),
+        ))
     }
 
     /// Manifest polling interval for Shared mode. Default: 1s.
@@ -253,6 +295,24 @@ impl HaQLiteBuilder {
         self
     }
 
+    /// Custom authorizer factory for SQLite connections.
+    ///
+    /// The factory is called with `fenced: bool` and must return a closure
+    /// that will be installed as the SQLite authorizer. When `fenced=false`,
+    /// enforce your security sandbox (block ATTACH, etc.). When `fenced=true`,
+    /// additionally block all write operations.
+    ///
+    /// If not set, haqlite uses its built-in authorizer (read-only allowlist
+    /// when fenced, no authorizer when unfenced).
+    pub fn authorizer<F, G>(mut self, factory: F) -> Self
+    where
+        F: Fn(bool) -> G + Send + Sync + 'static,
+        G: FnMut(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization + Send + 'static,
+    {
+        self.authorizer = Some(Arc::new(move |fenced| Box::new(factory(fenced))));
+        self
+    }
+
     /// Open the database and join the HA cluster.
     ///
     /// `schema` is run once on first open (e.g. CREATE TABLE IF NOT EXISTS ...).
@@ -273,6 +333,16 @@ impl HaQLiteBuilder {
             detect_address(&instance_id, self.forwarding_port)
         });
 
+        // Validate CINCH_ENDPOINT and CINCH_TOKEN: both or neither.
+        if self.cinch_endpoint.is_some() != self.cinch_token.is_some() {
+            return Err(anyhow::anyhow!(
+                "CINCH_ENDPOINT and CINCH_TOKEN must both be set or both be unset. \
+                 Got CINCH_ENDPOINT={}, CINCH_TOKEN={}",
+                if self.cinch_endpoint.is_some() { "set" } else { "unset" },
+                if self.cinch_token.is_some() { "set" } else { "unset" },
+            ));
+        }
+
         // Validate topology + durability combination.
         // Shared mode only supports Synchronous durability. Multiple concurrent
         // writers need every write to go through S3 so each writer always sees
@@ -289,45 +359,42 @@ impl HaQLiteBuilder {
         // Build walrust storage backend.
         // Dedicated mode always needs walrust for follower replication.
         // Shared mode (Synchronous only) uses turbolite manifest for catch-up.
+        // Shared fence token: updated by DbLease on acquire/renew, read by
+        // HttpObjectStore and turbolite HttpClient on every write.
+        let fence_token = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         let walrust_storage_opt: Option<Arc<dyn walrust::StorageBackend>> = match self.walrust_storage {
             Some(storage) => Some(storage),
             None => {
                 if self.mode == HaMode::Dedicated {
-                    Some(Arc::new(
-                        walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
-                    ))
+                    if let (Some(ref endpoint), Some(ref token)) = (&self.cinch_endpoint, &self.cinch_token) {
+                        Some(Arc::new(
+                            hadb_io::HttpObjectStore::new(endpoint, token, "wal", fence_token.clone()),
+                        ))
+                    } else {
+                        Some(Arc::new(
+                            walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
+                        ))
+                    }
                 } else {
                     None
                 }
             }
         };
 
-        // Use custom lease store if provided, otherwise build S3 lease store.
-        // Only construct the S3 client when we actually need it for S3LeaseStore.
+        // Resolve lease store: explicit > HAQLITE_LEASE_URL env var > error.
         let lease_store: Arc<dyn hadb::LeaseStore> = match self.lease_store {
             Some(store) => store,
-            None => {
-                let s3_config = match &self.endpoint {
-                    Some(endpoint) => {
-                        aws_config::defaults(aws_config::BehaviorVersion::latest())
-                            .endpoint_url(endpoint)
-                            .load()
-                            .await
-                    }
-                    None => {
-                        aws_config::defaults(aws_config::BehaviorVersion::latest())
-                            .load()
-                            .await
-                    }
-                };
-                let s3_client = aws_sdk_s3::Client::new(&s3_config);
-                Arc::new(S3LeaseStore::new(s3_client, self.bucket.clone()))
-            }
+            None => resolve_lease_store_from_env(&self.bucket, self.endpoint.as_deref()).await?,
         };
 
         // Build coordinator config.
         let mut config = self.coordinator_config.unwrap_or_default();
         config.lease = Some(LeaseConfig::new(instance_id.clone(), address.clone()));
+        // Pass the fence token so DbLease updates it on acquire/renew.
+        if self.cinch_endpoint.is_some() {
+            config.fence_token = Some(fence_token.clone());
+        }
 
         match self.mode {
             HaMode::Dedicated => {
@@ -351,23 +418,7 @@ impl HaQLiteBuilder {
                 let (follower_behavior, tl_state) = if self.durability == Durability::Synchronous {
                     let ms: Arc<dyn hadb::ManifestStore> = match self.manifest_store.clone() {
                         Some(ms) => ms,
-                        None => {
-                            #[cfg(feature = "s3-manifest")]
-                            {
-                                let s3_config = match &self.endpoint {
-                                    Some(ep) => aws_config::defaults(aws_config::BehaviorVersion::latest())
-                                        .endpoint_url(ep).load().await,
-                                    None => aws_config::defaults(aws_config::BehaviorVersion::latest())
-                                        .load().await,
-                                };
-                                let client = aws_sdk_s3::Client::new(&s3_config);
-                                Arc::new(hadb_manifest_s3::S3ManifestStore::new(client, self.bucket.clone()))
-                            }
-                            #[cfg(not(feature = "s3-manifest"))]
-                            return Err(anyhow::anyhow!(
-                                "Dedicated+Synchronous requires s3-manifest feature"
-                            ));
-                        }
+                        None => resolve_manifest_store_from_env(&self.bucket, self.endpoint.as_deref()).await?,
                     };
                     let vfs_name = format!("haqlite_ded_sync_{}", uuid::Uuid::new_v4());
                     let cache_dir = db_path.parent()
@@ -375,7 +426,18 @@ impl HaQLiteBuilder {
                         .join(".haqlite_cache");
                     std::fs::create_dir_all(&cache_dir)?;
                     let tl_prefix = format!("{}tl/", self.prefix);
+                    let storage_backend = if let (Some(ref ep), Some(ref tok)) = (&self.cinch_endpoint, &self.cinch_token) {
+                        turbolite::tiered::StorageBackend::Http {
+                            endpoint: ep.clone(),
+                            token: tok.clone(),
+                            prefix: tl_prefix.clone(),
+                            fence_token: fence_token.clone(),
+                        }
+                    } else {
+                        turbolite::tiered::StorageBackend::default() // auto-upgrades to S3 if bucket is set
+                    };
                     let tl_config = turbolite::tiered::TurboliteConfig {
+                        storage_backend,
                         bucket: self.bucket.clone(),
                         prefix: tl_prefix,
                         cache_dir,
@@ -383,6 +445,7 @@ impl HaQLiteBuilder {
                         region: Some(std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string())),
                         sync_mode: turbolite::tiered::SyncMode::S3Primary,
                         eager_index_load: false,
+                        #[cfg(feature = "cloud")]
                         runtime_handle: Some(tokio::runtime::Handle::current()),
                         ..Default::default()
                     };
@@ -432,6 +495,7 @@ impl HaQLiteBuilder {
                     self.secret,
                     self.read_concurrency,
                     tl_state,
+                    self.authorizer,
                 )
                 .await
             }
@@ -445,24 +509,7 @@ impl HaQLiteBuilder {
                 // Auto-create manifest store from S3 if not provided.
                 let manifest_store: Arc<dyn hadb::ManifestStore> = match self.manifest_store {
                     Some(ms) => ms,
-                    None => {
-                        #[cfg(feature = "s3-manifest")]
-                        {
-                            let s3_config = match &self.endpoint {
-                                Some(ep) => aws_config::defaults(aws_config::BehaviorVersion::latest())
-                                    .endpoint_url(ep).load().await,
-                                None => aws_config::defaults(aws_config::BehaviorVersion::latest())
-                                    .load().await,
-                            };
-                            let client = aws_sdk_s3::Client::new(&s3_config);
-                            Arc::new(hadb_manifest_s3::S3ManifestStore::new(client, self.bucket.clone()))
-                        }
-                        #[cfg(not(feature = "s3-manifest"))]
-                        return Err(anyhow::anyhow!(
-                            "Shared mode requires a manifest_store. Enable the s3-manifest feature \
-                             or provide one via .manifest_store()."
-                        ));
-                    }
+                    None => resolve_manifest_store_from_env(&self.bucket, self.endpoint.as_deref()).await?,
                 };
 
                 // Auto-create turbolite VFS if not provided.
@@ -482,7 +529,18 @@ impl HaQLiteBuilder {
                         // turbolite gets its own sub-prefix to avoid key collisions
                         // with haqlite lease/manifest keys.
                         let tl_prefix = format!("{}tl/", self.prefix);
+                        let storage_backend = if let (Some(ref ep), Some(ref tok)) = (&self.cinch_endpoint, &self.cinch_token) {
+                            turbolite::tiered::StorageBackend::Http {
+                                endpoint: ep.clone(),
+                                token: tok.clone(),
+                                prefix: tl_prefix.clone(),
+                                fence_token: fence_token.clone(),
+                            }
+                        } else {
+                            turbolite::tiered::StorageBackend::default()
+                        };
                         let config = turbolite::tiered::TurboliteConfig {
+                            storage_backend,
                             bucket: self.bucket.clone(),
                             prefix: tl_prefix,
                             cache_dir,
@@ -490,6 +548,7 @@ impl HaQLiteBuilder {
                             region: Some(std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string())),
                             sync_mode,
                             eager_index_load: false,
+                            #[cfg(feature = "cloud")]
                             runtime_handle: Some(tokio::runtime::Handle::current()),
                             ..Default::default()
                         };
@@ -601,6 +660,8 @@ pub(crate) struct HaQLiteInner {
     schema_sql: Option<String>,
     /// Whether schema has been applied on this node.
     schema_applied: AtomicBool,
+    /// Custom authorizer factory. If set, used instead of built-in fence/unfence authorizer.
+    authorizer: Option<AuthorizerFactory>,
 }
 
 impl HaQLiteInner {
@@ -638,6 +699,53 @@ impl HaQLiteInner {
     fn set_conn(&self, conn: Option<Arc<Mutex<rusqlite::Connection>>>) {
         *self.conn.write()
             .expect("conn write lock poisoned") = conn;
+    }
+
+    /// Block all writes on the connection via SQLite authorizer.
+    /// Called on demotion/fencing. The connection stays open for reads.
+    fn fence_connection(&self) {
+        if let Ok(Some(conn_arc)) = self.get_conn() {
+            if let Ok(conn) = conn_arc.lock() {
+                if let Some(ref factory) = self.authorizer {
+                    conn.authorizer(Some(factory(true)));
+                } else {
+                    // Default: read-only allowlist.
+                    conn.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
+                        use rusqlite::hooks::{AuthAction, Authorization};
+                        match ctx.action {
+                            AuthAction::Select
+                            | AuthAction::Read { .. }
+                            | AuthAction::Function { .. }
+                            | AuthAction::Recursive => Authorization::Allow,
+                            _ => Authorization::Deny,
+                        }
+                    }));
+                }
+                tracing::info!("HaQLite: connection fenced (writes blocked)");
+            }
+        }
+    }
+
+    /// Apply unfenced authorizer (or clear authorizer). Called on promotion.
+    fn unfence_connection(&self) {
+        if let Ok(Some(conn_arc)) = self.get_conn() {
+            if let Ok(conn) = conn_arc.lock() {
+                if let Some(ref factory) = self.authorizer {
+                    conn.authorizer(Some(factory(false)));
+                } else {
+                    conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>);
+                }
+                tracing::info!("HaQLite: connection unfenced (writes allowed)");
+            }
+        }
+    }
+
+    /// Apply the custom authorizer (unfenced) to a connection, if one is configured.
+    /// Called when a new connection is opened (local mode, promotion, etc.).
+    fn apply_initial_authorizer(&self, conn: &rusqlite::Connection) {
+        if let Some(ref factory) = self.authorizer {
+            conn.authorizer(Some(factory(false)));
+        }
     }
 
     pub(crate) fn get_conn(&self) -> std::result::Result<Option<Arc<Mutex<rusqlite::Connection>>>, HaQLiteError> {
@@ -697,6 +805,15 @@ impl HaQLite {
     ///
     /// Same `execute()`/`query_row()` API. Useful for development and testing.
     pub fn local(db_path: &str, schema: &str) -> Result<HaQLite> {
+        Self::local_with_authorizer(db_path, schema, None)
+    }
+
+    /// Open a local-only SQLite database with a custom authorizer.
+    pub fn local_with_authorizer(
+        db_path: &str,
+        schema: &str,
+        authorizer: Option<AuthorizerFactory>,
+    ) -> Result<HaQLite> {
         let db_path = PathBuf::from(db_path);
         ensure_schema(&db_path, schema)?;
 
@@ -733,7 +850,15 @@ impl HaQLite {
             shared_turbolite_vfs_name: None,
             schema_sql: None,
             schema_applied: AtomicBool::new(true),
+            authorizer,
         });
+
+        // Apply custom authorizer (unfenced) on initial connection.
+        if let Ok(Some(conn_arc)) = inner.get_conn() {
+            if let Ok(c) = conn_arc.lock() {
+                inner.apply_initial_authorizer(&c);
+            }
+        }
 
         // No forwarding server or role listener in local mode.
         let fwd_handle = tokio::spawn(async {});
@@ -792,6 +917,7 @@ impl HaQLite {
             secret,
             DEFAULT_READ_CONCURRENCY,
             None, // no turbolite state for from_coordinator
+            None, // no custom authorizer for from_coordinator
         )
         .await
     }
@@ -997,6 +1123,46 @@ impl HaQLite {
         self.inner.current_role()
     }
 
+    /// Get the underlying rusqlite connection.
+    ///
+    /// This is the primary API for using haqlite. You get the connection,
+    /// use it like normal rusqlite (queries, transactions, prepared statements),
+    /// and haqlite handles HA (lease, WAL shipping, turbolite tiering) transparently
+    /// at the storage layer.
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let db = haqlite::HaQLite::builder("bucket").open("/data/my.db", "").await?;
+    /// let conn = db.connection()?;
+    /// let guard = conn.lock().unwrap();
+    /// guard.execute("INSERT INTO users (name) VALUES (?1)", ["Alice"])?;
+    /// let count: i64 = guard.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn connection(&self) -> std::result::Result<Arc<Mutex<rusqlite::Connection>>, HaQLiteError> {
+        if self.inner.shared_turbolite_vfs.is_some() {
+            self.inner.ensure_turbolite_conn()
+        } else {
+            self.inner.get_conn()?
+                .ok_or(HaQLiteError::DatabaseError("No connection available".into()))
+        }
+    }
+
+    /// Block all writes on the connection. Reads keep working.
+    ///
+    /// Called automatically on lease loss (demotion/fencing). Can also be
+    /// called explicitly by the engine to fence a database.
+    pub fn fence(&self) {
+        self.inner.fence_connection();
+    }
+
+    /// Allow writes again. Called automatically on promotion.
+    pub fn unfence(&self) {
+        self.inner.unfence_connection();
+    }
+
     /// Subscribe to role change events.
     pub fn role_events(&self) -> Option<tokio::sync::broadcast::Receiver<RoleEvent>> {
         self.inner.coordinator.as_ref().map(|c| c.role_events())
@@ -1131,18 +1297,28 @@ impl HaQLite {
             None => return Ok(()),
         };
 
-        // Fetch turbolite S3 manifest directly (single source of truth).
-        let vfs_clone = vfs.clone();
-        let current_version = vfs.manifest().version;
-        let fetch_result = tokio::task::spawn_blocking(move || {
-            vfs_clone.fetch_and_apply_s3_manifest()
-        }).await.map_err(|e| HaQLiteError::DatabaseError(
-            format!("manifest fetch panicked: {}", e)))?;
-        match fetch_result {
-            Ok(Some(version)) if version > current_version => {
-                self.inner.set_conn(None);
+        // Catch up from haqlite's manifest store (the source of truth for Shared mode).
+        // Writers publish here in execute_shared step 4.
+        let manifest_store = match &self.inner.shared_manifest_store {
+            Some(ms) => ms,
+            None => return Ok(()), // no manifest store = local-only, already fresh
+        };
+        let manifest_key = format!("{}{}/_manifest", self.inner.shared_prefix, self.inner.db_name);
+        let current_version = self.inner.cached_manifest_version.load(Ordering::SeqCst);
+
+        match manifest_store.get(&manifest_key).await {
+            Ok(Some(ha_manifest)) if ha_manifest.version > current_version => {
+                // Apply the turbolite manifest from the store.
+                let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
+                vfs.set_manifest(tl_manifest);
+                self.inner.cached_manifest_version.store(ha_manifest.version, Ordering::SeqCst);
+                self.inner.set_conn(None); // reopen with new manifest
             }
-            _ => {}
+            Ok(_) => {} // no manifest or same version
+            Err(e) => {
+                return Err(HaQLiteError::ReplicationError(
+                    format!("manifest store fetch failed: {}", e)));
+            }
         }
         Ok(())
     }
@@ -1160,29 +1336,29 @@ impl HaQLite {
             .ok_or(HaQLiteError::ConfigurationError("shared_turbolite_vfs required".into()))?;
 
         let _write_guard = self.inner.write_mutex.lock().await;
-        let lease_key = format!("{}_lease", self.inner.shared_prefix);
-        let manifest_key = format!("{}_manifest", self.inner.shared_prefix);
+        let lease_key = format!("{}{}/_lease", self.inner.shared_prefix, self.inner.db_name);
+        let manifest_key = format!("{}{}/_manifest", self.inner.shared_prefix, self.inner.db_name);
 
         // 1. Acquire lease
         self.acquire_lease(lease_store.as_ref(), &lease_key).await?;
 
         // 2-5. Critical section (lease always released, even on error)
         let result: std::result::Result<u64, HaQLiteError> = async {
-            // 2. Catch up from turbolite's S3 manifest (the source of truth).
-            // xSync publishes it atomically on every commit.
+            // 2. Catch up from haqlite's manifest store (the single source of truth).
+            // Writers publish here in step 4. Reading from the store (not turbolite S3)
+            // ensures we see the latest manifest even if turbolite's S3 is eventually consistent.
             {
-                let vfs_clone = vfs.clone();
-                let fetch_result = tokio::task::spawn_blocking(move || {
-                    vfs_clone.fetch_and_apply_s3_manifest()
-                }).await.map_err(|e| HaQLiteError::DatabaseError(
-                    format!("manifest fetch task panicked: {}", e)))?;
-                match fetch_result {
-                    Ok(Some(_version)) => {
+                let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
+                match manifest_store.get(&manifest_key).await {
+                    Ok(Some(ha_manifest)) if ha_manifest.version > cached => {
+                        let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
+                        vfs.set_manifest(tl_manifest);
+                        self.inner.cached_manifest_version.store(ha_manifest.version, Ordering::SeqCst);
                         self.inner.set_conn(None);
                     }
-                    Ok(None) => {} // no manifest yet (first write)
+                    Ok(_) => {} // no manifest or same version
                     Err(e) => return Err(HaQLiteError::ReplicationError(
-                        format!("turbolite manifest fetch: {}", e))),
+                        format!("manifest store catch-up failed: {}", e))),
                 }
             }
 
@@ -1200,8 +1376,48 @@ impl HaQLite {
             }
             let rows = self.execute_local(sql, params)?;
 
-            // 4. xSync already published the turbolite manifest during
-            // execute_local, so no separate sync or manifest publish needed.
+            // 4. Publish turbolite manifest to haqlite's manifest store.
+            // We hold the lease, so we're the only writer. Use the current
+            // version from the store for CAS (not our cached version, which
+            // may be stale if another writer published between our reads).
+            {
+                let tl_manifest = vfs.manifest();
+                let ha_manifest = hadb::HaManifest {
+                    version: 0, // assigned by store
+                    writer_id: self.inner.shared_instance_id.clone(),
+                    lease_epoch: 0,
+                    timestamp_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    storage: crate::turbolite_replicator::turbolite_to_ha_storage(&tl_manifest),
+                };
+                // Fetch current version from store for correct CAS.
+                let current_version = match manifest_store.meta(&manifest_key).await {
+                    Ok(Some(meta)) => Some(meta.version),
+                    Ok(None) => None,
+                    Err(e) => return Err(HaQLiteError::ReplicationError(
+                        format!("manifest meta fetch failed: {}", e))),
+                };
+                match manifest_store.put(
+                    &manifest_key,
+                    &ha_manifest,
+                    current_version,
+                ).await {
+                    Ok(cas) if cas.success => {
+                        let new_version = current_version.map(|v| v + 1).unwrap_or(1);
+                        self.inner.cached_manifest_version.store(new_version, Ordering::SeqCst);
+                    }
+                    Ok(_) => {
+                        return Err(HaQLiteError::ReplicationError(
+                            "manifest CAS conflict (concurrent writer despite holding lease)".into()));
+                    }
+                    Err(e) => {
+                        return Err(HaQLiteError::ReplicationError(
+                            format!("manifest publish failed: {}", e)));
+                    }
+                }
+            }
 
             Ok(rows)
         }.await;
@@ -1400,9 +1616,14 @@ impl HaQLite {
             last_err = format!("{status}: {body_text}");
         }
 
-        Err(HaQLiteError::LeaderConnectionError(format!(
-            "all {} forwarding attempts failed: {last_err}", backoffs.len() + 1
-        )))
+        // If we never had a leader address, this is NotLeader, not a connection error.
+        if last_err == "no leader address available" {
+            Err(HaQLiteError::NotLeader)
+        } else {
+            Err(HaQLiteError::LeaderConnectionError(format!(
+                "all {} forwarding attempts failed: {last_err}", backoffs.len() + 1
+            )))
+        }
     }
 }
 
@@ -1431,6 +1652,7 @@ async fn open_with_coordinator(
     secret: Option<String>,
     read_concurrency: usize,
     turbolite_state: Option<DedicatedTurboliteState>,
+    authorizer: Option<AuthorizerFactory>,
 ) -> Result<HaQLite> {
     ensure_schema(&db_path, schema)?;
 
@@ -1489,6 +1711,7 @@ async fn open_with_coordinator(
         shared_turbolite_vfs_name: tl_vfs_name,
         schema_sql: None,
         schema_applied: AtomicBool::new(true),
+        authorizer,
     });
 
     // If leader, open rw connection.
@@ -1504,8 +1727,10 @@ async fn open_with_coordinator(
                 .map_err(|_| anyhow::anyhow!("conn lock poisoned"))?;
             conn.execute_batch(schema)
                 .map_err(|e| anyhow::anyhow!("schema via turbolite: {}", e))?;
+            inner.apply_initial_authorizer(&conn);
         } else {
             let conn = open_leader_connection(&db_path)?;
+            inner.apply_initial_authorizer(&conn);
             inner.set_conn(Some(Arc::new(Mutex::new(conn))));
         }
     }
@@ -1569,6 +1794,11 @@ async fn run_role_listener(
                     inner.set_conn(None);
                     match inner.ensure_turbolite_conn() {
                         Ok(_) => {
+                            if let Ok(Some(conn_arc)) = inner.get_conn() {
+                                if let Ok(c) = conn_arc.lock() {
+                                    inner.apply_initial_authorizer(&c);
+                                }
+                            }
                             tracing::info!("HaQLite: opened turbolite connection on promotion");
                         }
                         Err(e) => {
@@ -1578,9 +1808,14 @@ async fn run_role_listener(
                             );
                         }
                     }
+                } else if inner.get_conn().ok().flatten().is_some() {
+                    // Connection already exists (was fenced). Unfence it.
+                    inner.unfence_connection();
                 } else {
+                    // No connection (first promotion or after sleep). Open one.
                     match open_leader_connection(&inner.db_path) {
                         Ok(conn) => {
+                            inner.apply_initial_authorizer(&conn);
                             inner.set_conn(Some(Arc::new(Mutex::new(conn))));
                         }
                         Err(e) => {
@@ -1595,12 +1830,12 @@ async fn run_role_listener(
             Ok(RoleEvent::Demoted { db_name }) => {
                 tracing::error!("HaQLite: demoted from leader for '{}'", db_name);
                 inner.set_role(Role::Follower);
-                inner.set_conn(None);
+                inner.fence_connection();
             }
             Ok(RoleEvent::Fenced { db_name }) => {
                 tracing::error!("HaQLite: fenced for '{}' — stopping writes", db_name);
                 inner.set_role(Role::Follower);
-                inner.set_conn(None);
+                inner.fence_connection();
             }
             Ok(RoleEvent::Sleeping { db_name }) => {
                 tracing::info!("HaQLite: sleeping signal for '{}'", db_name);
@@ -1693,7 +1928,7 @@ async fn open_shared_turbolite(
     // ensure_turbolite_conn() on first execute/query.
     let conn: Option<Arc<Mutex<rusqlite::Connection>>> = None;
 
-    let manifest_key = format!("{}_manifest", prefix);
+    let manifest_key = format!("{}{}/_manifest", prefix, db_name);
     let cached_version = match manifest_store.meta(&manifest_key).await? {
         Some(meta) => meta.version,
         None => 0,
@@ -1728,6 +1963,7 @@ async fn open_shared_turbolite(
         shared_turbolite_vfs_name: Some(vfs_name.to_string()),
         schema_sql: Some(schema.to_string()),
         schema_applied: AtomicBool::new(false),
+        authorizer: None, // Shared mode doesn't support custom authorizer (no fencing)
     });
 
     // Use standard manifest poller (walrust-based, not turbolite-based)
@@ -1775,6 +2011,314 @@ fn open_leader_connection(db_path: &Path) -> Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open(db_path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
     Ok(conn)
+}
+
+/// Resolve lease store from HAQLITE_LEASE_URL env var.
+///
+/// Supported schemes:
+///   http://host:port?token=...   -> HttpLeaseStore
+///   https://host:port?token=...  -> HttpLeaseStore
+///   nats://host:port?bucket=...  -> NatsLeaseStore (requires nats-lease feature)
+///   s3://bucket?endpoint=...     -> S3LeaseStore
+///
+/// Falls back to S3LeaseStore using the builder's bucket/endpoint if
+/// HAQLITE_LEASE_URL is "s3" (bare keyword, uses builder config).
+async fn resolve_lease_store_from_env(
+    bucket: &str,
+    endpoint: Option<&str>,
+) -> Result<Arc<dyn hadb::LeaseStore>> {
+    let url = std::env::var("HAQLITE_LEASE_URL").map_err(|_| {
+        anyhow::anyhow!(
+            "No lease store configured. Either call .lease_store() / .lease_endpoint() \
+             on the builder, or set HAQLITE_LEASE_URL.\n\
+             Examples:\n  \
+               HAQLITE_LEASE_URL=http://proxy:8080?token=mytoken\n  \
+               HAQLITE_LEASE_URL=nats://localhost:4222?bucket=leases\n  \
+               HAQLITE_LEASE_URL=s3  (uses builder bucket/endpoint)"
+        )
+    })?;
+
+    if url == "s3" || url.starts_with("s3://") {
+        let (s3_bucket, s3_endpoint) = if url == "s3" {
+            (bucket.to_string(), endpoint.map(|s| s.to_string()))
+        } else {
+            // s3://bucket-name?endpoint=https://...
+            let parsed = parse_url_params(&url[5..]);
+            (parsed.host, parsed.params.get("endpoint").cloned())
+        };
+        let s3_config = match s3_endpoint {
+            Some(ep) => {
+                aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .endpoint_url(&ep)
+                    .load()
+                    .await
+            }
+            None => {
+                aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .load()
+                    .await
+            }
+        };
+        let client = aws_sdk_s3::Client::new(&s3_config);
+        tracing::info!("Using S3 lease store: bucket={}", s3_bucket);
+        return Ok(Arc::new(S3LeaseStore::new(client, s3_bucket)));
+    }
+
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let parsed = parse_url_params(&url);
+        let token = parsed.params.get("token").cloned().unwrap_or_default();
+        let endpoint = parsed.base;
+        tracing::info!("Using HTTP lease store: {}", endpoint);
+        return Ok(Arc::new(hadb_lease_http::HttpLeaseStore::new(
+            &endpoint, &token,
+        )));
+    }
+
+    #[cfg(feature = "nats-lease")]
+    if url.starts_with("nats://") {
+        let parsed = parse_url_params(&url);
+        let nats_bucket = parsed
+            .params
+            .get("bucket")
+            .cloned()
+            .unwrap_or_else(|| "haqlite-leases".to_string());
+        tracing::info!("Using NATS lease store: {} bucket={}", parsed.base, nats_bucket);
+        let store = hadb_lease_nats::NatsLeaseStore::connect(&parsed.base, &nats_bucket).await?;
+        return Ok(Arc::new(store));
+    }
+    #[cfg(not(feature = "nats-lease"))]
+    if url.starts_with("nats://") {
+        return Err(anyhow::anyhow!(
+            "HAQLITE_LEASE_URL uses nats:// but haqlite was compiled without the nats-lease feature"
+        ));
+    }
+
+    Err(anyhow::anyhow!(
+        "Unsupported HAQLITE_LEASE_URL scheme: {}. Supported: http://, https://, nats://, s3://, s3",
+        url
+    ))
+}
+
+/// Resolve manifest store from HAQLITE_MANIFEST_URL env var.
+///
+/// Same scheme dispatch as lease store.
+async fn resolve_manifest_store_from_env(
+    bucket: &str,
+    endpoint: Option<&str>,
+) -> Result<Arc<dyn hadb::ManifestStore>> {
+    let url = std::env::var("HAQLITE_MANIFEST_URL").map_err(|_| {
+        anyhow::anyhow!(
+            "No manifest store configured. Either call .manifest_store() / .manifest_endpoint() \
+             on the builder, or set HAQLITE_MANIFEST_URL.\n\
+             Examples:\n  \
+               HAQLITE_MANIFEST_URL=http://proxy:8080?token=mytoken\n  \
+               HAQLITE_MANIFEST_URL=nats://localhost:4222?bucket=manifests\n  \
+               HAQLITE_MANIFEST_URL=s3  (uses builder bucket/endpoint)"
+        )
+    })?;
+
+    if url == "s3" || url.starts_with("s3://") {
+        #[cfg(feature = "s3-manifest")]
+        {
+            let (s3_bucket, s3_endpoint) = if url == "s3" {
+                (bucket.to_string(), endpoint.map(|s| s.to_string()))
+            } else {
+                let parsed = parse_url_params(&url[5..]);
+                (parsed.host, parsed.params.get("endpoint").cloned())
+            };
+            let s3_config = match s3_endpoint {
+                Some(ep) => {
+                    aws_config::defaults(aws_config::BehaviorVersion::latest())
+                        .endpoint_url(&ep)
+                        .load()
+                        .await
+                }
+                None => {
+                    aws_config::defaults(aws_config::BehaviorVersion::latest())
+                        .load()
+                        .await
+                }
+            };
+            let client = aws_sdk_s3::Client::new(&s3_config);
+            tracing::info!("Using S3 manifest store: bucket={}", s3_bucket);
+            return Ok(Arc::new(hadb_manifest_s3::S3ManifestStore::new(
+                client, s3_bucket,
+            )));
+        }
+        #[cfg(not(feature = "s3-manifest"))]
+        return Err(anyhow::anyhow!(
+            "HAQLITE_MANIFEST_URL uses s3 but haqlite was compiled without the s3-manifest feature"
+        ));
+    }
+
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let parsed = parse_url_params(&url);
+        let token = parsed.params.get("token").cloned().unwrap_or_default();
+        let endpoint = parsed.base;
+        tracing::info!("Using HTTP manifest store: {}", endpoint);
+        return Ok(Arc::new(hadb_manifest_http::HttpManifestStore::new(
+            &endpoint, &token,
+        )));
+    }
+
+    #[cfg(feature = "nats-manifest")]
+    if url.starts_with("nats://") {
+        let parsed = parse_url_params(&url);
+        let nats_bucket = parsed
+            .params
+            .get("bucket")
+            .cloned()
+            .unwrap_or_else(|| "haqlite-manifests".to_string());
+        tracing::info!("Using NATS manifest store: {} bucket={}", parsed.base, nats_bucket);
+        let store =
+            hadb_manifest_nats::NatsManifestStore::connect(&parsed.base, &nats_bucket).await?;
+        return Ok(Arc::new(store));
+    }
+    #[cfg(not(feature = "nats-manifest"))]
+    if url.starts_with("nats://") {
+        return Err(anyhow::anyhow!(
+            "HAQLITE_MANIFEST_URL uses nats:// but haqlite was compiled without the nats-manifest feature"
+        ));
+    }
+
+    Err(anyhow::anyhow!(
+        "Unsupported HAQLITE_MANIFEST_URL scheme: {}. Supported: http://, https://, nats://, s3://, s3",
+        url
+    ))
+}
+
+/// Parse a URL into base (scheme + host + port + path) and query params.
+struct ParsedUrl {
+    base: String,
+    host: String,
+    params: std::collections::HashMap<String, String>,
+}
+
+fn parse_url_params(url: &str) -> ParsedUrl {
+    let (base, query) = match url.find('?') {
+        Some(i) => (&url[..i], &url[i + 1..]),
+        None => (url, ""),
+    };
+
+    // Extract host from base: strip scheme, take up to first /
+    let host = base
+        .split("://")
+        .last()
+        .unwrap_or(base)
+        .split('/')
+        .next()
+        .unwrap_or(base)
+        .split(':')
+        .next()
+        .unwrap_or(base)
+        .to_string();
+
+    let params: std::collections::HashMap<String, String> = query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .filter_map(|kv| {
+            let mut parts = kv.splitn(2, '=');
+            match (parts.next(), parts.next()) {
+                (Some(k), Some(v)) => Some((k.to_string(), v.to_string())),
+                _ => None,
+            }
+        })
+        .collect();
+
+    ParsedUrl {
+        base: base.to_string(),
+        host,
+        params,
+    }
+}
+
+#[cfg(test)]
+mod url_parsing_tests {
+    use super::*;
+
+    #[test]
+    fn parse_http_with_token() {
+        let parsed = parse_url_params("http://proxy:8080?token=mytoken");
+        assert_eq!(parsed.base, "http://proxy:8080");
+        assert_eq!(parsed.host, "proxy");
+        assert_eq!(parsed.params.get("token").unwrap(), "mytoken");
+    }
+
+    #[test]
+    fn parse_https_with_token() {
+        let parsed = parse_url_params("https://proxy.example.com?token=abc123");
+        assert_eq!(parsed.base, "https://proxy.example.com");
+        assert_eq!(parsed.host, "proxy.example.com");
+        assert_eq!(parsed.params.get("token").unwrap(), "abc123");
+    }
+
+    #[test]
+    fn parse_nats_with_bucket() {
+        let parsed = parse_url_params("nats://localhost:4222?bucket=leases");
+        assert_eq!(parsed.base, "nats://localhost:4222");
+        assert_eq!(parsed.host, "localhost");
+        assert_eq!(parsed.params.get("bucket").unwrap(), "leases");
+    }
+
+    #[test]
+    fn parse_no_query_params() {
+        let parsed = parse_url_params("http://proxy:8080");
+        assert_eq!(parsed.base, "http://proxy:8080");
+        assert_eq!(parsed.host, "proxy");
+        assert!(parsed.params.is_empty());
+    }
+
+    #[test]
+    fn parse_multiple_params() {
+        let parsed = parse_url_params("http://proxy:8080?token=abc&timeout=30");
+        assert_eq!(parsed.params.get("token").unwrap(), "abc");
+        assert_eq!(parsed.params.get("timeout").unwrap(), "30");
+    }
+
+    #[test]
+    fn parse_s3_bucket_with_endpoint() {
+        // Used in resolve_lease_store_from_env for s3://bucket?endpoint=...
+        let url = "s3://my-bucket?endpoint=https://fly.storage.tigris.dev";
+        // The function is called with url[5..] for s3:// prefix stripping
+        let parsed = parse_url_params(&url[5..]);
+        assert_eq!(parsed.host, "my-bucket");
+        assert_eq!(
+            parsed.params.get("endpoint").unwrap(),
+            "https://fly.storage.tigris.dev"
+        );
+    }
+
+    #[test]
+    fn parse_value_with_equals_sign() {
+        // Endpoint URLs contain = in query params of their own
+        let parsed = parse_url_params("http://proxy:8080?token=abc=def");
+        // splitn(2, '=') means only split on first '='
+        assert_eq!(parsed.params.get("token").unwrap(), "abc=def");
+    }
+
+    #[test]
+    fn parse_empty_string() {
+        let parsed = parse_url_params("");
+        assert_eq!(parsed.base, "");
+        assert_eq!(parsed.host, "");
+        assert!(parsed.params.is_empty());
+    }
+
+    #[test]
+    fn parse_url_with_path() {
+        let parsed = parse_url_params("http://proxy:8080/v1/lease?token=abc");
+        assert_eq!(parsed.base, "http://proxy:8080/v1/lease");
+        assert_eq!(parsed.host, "proxy");
+        assert_eq!(parsed.params.get("token").unwrap(), "abc");
+    }
+
+    #[test]
+    fn parse_bare_host() {
+        let parsed = parse_url_params("my-bucket");
+        assert_eq!(parsed.base, "my-bucket");
+        assert_eq!(parsed.host, "my-bucket");
+        assert!(parsed.params.is_empty());
+    }
 }
 
 /// Auto-detect this node's network address for the forwarding server.

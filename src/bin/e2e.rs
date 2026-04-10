@@ -12,7 +12,7 @@
 //! 6. Write without lease fails cleanly
 //!
 //! Usage:
-//!   TIERED_TEST_BUCKET=cinch-data AWS_ENDPOINT_URL=https://fly.storage.tigris.dev \
+//!   TIERED_TEST_BUCKET=haqlite-test AWS_ENDPOINT_URL=https://fly.storage.tigris.dev \
 //!   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=auto \
 //!   cargo run --features turbolite-cloud,s3-manifest --bin haqlite-e2e -- \
 //!     --durability synchronous --workers 4 --writes-per-worker 20
@@ -53,7 +53,7 @@ struct Args {
     writes_per_worker: usize,
 
     /// S3 bucket
-    #[arg(long, env = "TIERED_TEST_BUCKET", default_value = "cinch-data")]
+    #[arg(long, env = "TIERED_TEST_BUCKET", default_value = "haqlite-test")]
     bucket: String,
 
     /// S3 endpoint

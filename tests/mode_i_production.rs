@@ -70,7 +70,7 @@ async fn build_mode_i_node(
         compression_level: 3,
         pages_per_group: 4,
         sub_pages_per_frame: 2,
-        sync_mode: SyncMode::Durable,
+        sync_mode: SyncMode::S3Primary,
         eager_index_load: false,
         runtime_handle: Some(tokio::runtime::Handle::current()),
         ..Default::default()
@@ -84,7 +84,7 @@ async fn build_mode_i_node(
     HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
-        .durability(haqlite::Durability::Eventual)
+        .durability(haqlite::Durability::Synchronous)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .walrust_storage(walrust_storage)

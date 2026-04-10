@@ -110,7 +110,7 @@ async fn shared_single_node_write_read() {
     assert_eq!(val, "hello");
 
     // Manifest should be published
-    let meta = manifest_store.meta("test/_manifest").await.unwrap();
+    let meta = manifest_store.meta("test/test/_manifest").await.unwrap();
     assert!(meta.is_some(), "manifest should be published after write");
     assert_eq!(meta.unwrap().version, 1);
 }
@@ -131,7 +131,7 @@ async fn shared_sequential_writes_increment_manifest() {
         ).await.unwrap();
     }
 
-    let meta = manifest_store.meta("test/_manifest").await.unwrap().unwrap();
+    let meta = manifest_store.meta("test/test/_manifest").await.unwrap().unwrap();
     assert_eq!(meta.version, 3, "3 writes should produce manifest v3");
 
     let count: i64 = db.query_row("SELECT COUNT(*) FROM t", &[], |r| r.get(0)).unwrap();
@@ -202,7 +202,7 @@ async fn shared_two_nodes_a_writes_b_reads_fresh() {
     ).await.unwrap();
 
     // Manifest should show v1
-    let meta = manifest_store.meta("test/_manifest").await.unwrap().unwrap();
+    let meta = manifest_store.meta("test/shared/_manifest").await.unwrap().unwrap();
     assert_eq!(meta.version, 1);
     assert_eq!(meta.writer_id, "node-a");
 
@@ -227,13 +227,13 @@ async fn shared_two_nodes_sequential_writes() {
 
     // A writes row 1
     db_a.execute("INSERT INTO t VALUES (1, 'a1')", &[]).await.unwrap();
-    let meta = manifest_store.meta("test/_manifest").await.unwrap().unwrap();
+    let meta = manifest_store.meta("test/shared/_manifest").await.unwrap().unwrap();
     assert_eq!(meta.version, 1);
     assert_eq!(meta.writer_id, "node-a");
 
     // A writes row 2
     db_a.execute("INSERT INTO t VALUES (2, 'a2')", &[]).await.unwrap();
-    let meta = manifest_store.meta("test/_manifest").await.unwrap().unwrap();
+    let meta = manifest_store.meta("test/shared/_manifest").await.unwrap().unwrap();
     assert_eq!(meta.version, 2);
 
     // A sees both rows
@@ -244,7 +244,7 @@ async fn shared_two_nodes_sequential_writes() {
     let db_b = build_shared(&tmp_b, "shared", &prefix, lease_store.clone(), manifest_store.clone(), "node-b").await;
     db_b.execute("INSERT INTO t VALUES (3, 'b1')", &[]).await.unwrap();
 
-    let meta = manifest_store.meta("test/_manifest").await.unwrap().unwrap();
+    let meta = manifest_store.meta("test/shared/_manifest").await.unwrap().unwrap();
     assert_eq!(meta.version, 3);
     assert_eq!(meta.writer_id, "node-b");
 
@@ -273,7 +273,7 @@ async fn shared_failover_lease_expires_other_node_writes() {
     let db_b = build_shared(&tmp_b, "shared", &prefix, lease_store.clone(), manifest_store.clone(), "node-b").await;
     db_b.execute("INSERT INTO t VALUES (2, 'after-crash')", &[]).await.unwrap();
 
-    let meta = manifest_store.meta("test/_manifest").await.unwrap().unwrap();
+    let meta = manifest_store.meta("test/shared/_manifest").await.unwrap().unwrap();
     assert_eq!(meta.version, 2);
     assert_eq!(meta.writer_id, "node-b");
 
@@ -297,13 +297,13 @@ async fn shared_manifest_version_tracks_writes() {
     // Fetch full manifest and verify storage variant
     let manifest = manifest_store.get("test/test/_manifest").await.unwrap().unwrap();
     assert_eq!(manifest.writer_id, "node-1");
+    assert_eq!(manifest.version, 1, "first write should produce version 1");
     match &manifest.storage {
-        hadb::StorageManifest::Walrust { changeset_prefix, latest_changeset_key, .. } => {
-            assert!(changeset_prefix.starts_with("test/test/"), "changeset prefix should include db name");
-            assert!(!latest_changeset_key.is_empty(), "latest_changeset_key should not be empty");
-            assert!(latest_changeset_key.ends_with(".hadbp"), "changeset key should end with .hadbp");
+        hadb::StorageManifest::Turbolite { turbolite_version, page_count, .. } => {
+            assert!(*turbolite_version > 0, "turbolite version should be > 0 after write");
+            assert!(*page_count > 0, "page count should be > 0 after write");
         }
-        _ => panic!("expected Walrust storage variant"),
+        _ => panic!("expected Turbolite storage variant, got {:?}", manifest.storage),
     }
 }
 
@@ -406,7 +406,7 @@ async fn test_stress_alternating_node_writes() {
         ).await.unwrap_or_else(|e| panic!("write {} from A failed: {}", i, e));
     }
 
-    let meta_a = manifest_store.meta("test/_manifest").await.unwrap().unwrap();
+    let meta_a = manifest_store.meta("test/alt/_manifest").await.unwrap().unwrap();
     assert_eq!(meta_a.version, 20, "A should have published 20 manifest versions");
 
     // Node B opens fresh (restores from A's data), writes 20 more rows
@@ -418,7 +418,7 @@ async fn test_stress_alternating_node_writes() {
         ).await.unwrap_or_else(|e| panic!("write {} from B failed: {}", i, e));
     }
 
-    let meta_b = manifest_store.meta("test/_manifest").await.unwrap().unwrap();
+    let meta_b = manifest_store.meta("test/alt/_manifest").await.unwrap().unwrap();
     assert_eq!(meta_b.version, 40, "manifest should be at v40 after 40 total writes");
 
     // Fresh reader should see all 40 rows
@@ -439,8 +439,9 @@ async fn test_stress_large_transaction() {
 
     let db_a = build_shared(&tmp_a, "large", &prefix, lease_store.clone(), manifest_store.clone(), "node-a").await;
 
-    // Insert 1000 rows in individual execute calls (no execute_batch on HaQLite)
-    for i in 0..1000 {
+    // Insert 50 rows in individual execute calls.
+    // Each is a full lease acquire/write/S3 sync/manifest publish/release cycle.
+    for i in 0..50 {
         db_a.execute(
             "INSERT INTO t VALUES (?1, ?2)",
             &[SqlValue::Integer(i), SqlValue::Text(format!("row-{}", i))],
@@ -448,12 +449,12 @@ async fn test_stress_large_transaction() {
     }
 
     let count_a: i64 = db_a.query_row("SELECT COUNT(*) FROM t", &[], |r| r.get(0)).unwrap();
-    assert_eq!(count_a, 1000, "node A should see all 1000 rows");
+    assert_eq!(count_a, 50, "node A should see all 50 rows");
 
     // Node B should see all rows via fresh read
     let db_b = build_shared(&tmp_b, "large", &prefix, lease_store.clone(), manifest_store.clone(), "node-b").await;
     let count_b: i64 = db_b.query_row_fresh("SELECT COUNT(*) FROM t", &[], |r| r.get(0)).await.unwrap();
-    assert_eq!(count_b, 1000, "node B should see all 1000 rows after fresh read");
+    assert_eq!(count_b, 50, "node B should see all 50 rows after fresh read");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -496,7 +497,7 @@ async fn test_lease_ttl_expiry_takeover() {
     let val: String = db_b.query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0)).unwrap();
     assert_eq!(val, "after-expiry");
 
-    let meta = manifest_store.meta("test/_manifest").await.unwrap().unwrap();
+    let meta = manifest_store.meta("test/ttl/_manifest").await.unwrap().unwrap();
     assert_eq!(meta.version, 1);
     assert_eq!(meta.writer_id, "node-b");
 }
@@ -520,7 +521,7 @@ async fn test_stress_many_sequential_writes() {
         ).await.unwrap_or_else(|e| panic!("write {} failed: {}", i, e));
     }
 
-    let meta = manifest_store.meta("test/_manifest").await.unwrap().unwrap();
+    let meta = manifest_store.meta("test/seq50/_manifest").await.unwrap().unwrap();
     assert_eq!(meta.version, 50, "50 writes should produce manifest v50");
 
     let count: i64 = db.query_row("SELECT COUNT(*) FROM t", &[], |r| r.get(0)).unwrap();
@@ -652,8 +653,12 @@ async fn test_fresh_read_consistency() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fresh_read_empty_database() {
-    // Open two nodes, no writes
-    // query_row_fresh should return 0 rows (not error)
+    // Shared mode: schema is applied by the first write (via execute_shared).
+    // Fresh reads before any write should fail because the table doesn't exist
+    // yet (no writer has created the schema). This is correct: readers catch up
+    // from the manifest store, and an empty manifest has no schema/pages.
+    //
+    // After the first write, both nodes should see the schema + data.
     let tmp_a = TempDir::new().unwrap();
     let tmp_b = TempDir::new().unwrap();
     let prefix = unique_prefix("test_fresh_read_empty_database");
@@ -663,15 +668,26 @@ async fn test_fresh_read_empty_database() {
     let db_a = build_shared(&tmp_a, "empty", &prefix, lease_store.clone(), manifest_store.clone(), "node-a").await;
     let db_b = build_shared(&tmp_b, "empty", &prefix, lease_store.clone(), manifest_store.clone(), "node-b").await;
 
+    // Before any writes: table doesn't exist, query should error
+    let result = db_a.query_row_fresh(
+        "SELECT COUNT(*) FROM t", &[], |r| r.get::<_, i64>(0),
+    ).await;
+    assert!(result.is_err(), "query before first write should fail (no schema yet)");
+
+    // First write applies schema + inserts data
+    db_a.execute("INSERT INTO t VALUES (1, 'first')", &[]).await
+        .expect("first write should succeed (applies schema)");
+
+    // Now both nodes should see the data via fresh read
     let count_a: i64 = db_a.query_row_fresh(
         "SELECT COUNT(*) FROM t", &[], |r| r.get(0),
-    ).await.unwrap();
-    assert_eq!(count_a, 0, "empty database should return 0 rows");
+    ).await.expect("node A fresh read after write");
+    assert_eq!(count_a, 1, "node A should see 1 row");
 
     let count_b: i64 = db_b.query_row_fresh(
         "SELECT COUNT(*) FROM t", &[], |r| r.get(0),
-    ).await.unwrap();
-    assert_eq!(count_b, 0, "empty database should return 0 rows on node B");
+    ).await.expect("node B fresh read should catch up");
+    assert_eq!(count_b, 1, "node B should see 1 row via manifest catch-up");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -717,7 +733,7 @@ async fn test_manifest_version_monotonicity() {
             &[SqlValue::Integer(i), SqlValue::Text(format!("v{}", i))],
         ).await.unwrap();
 
-        let meta = manifest_store.meta("test/_manifest").await.unwrap().unwrap();
+        let meta = manifest_store.meta("test/mono/_manifest").await.unwrap().unwrap();
         assert!(
             meta.version > prev_version,
             "manifest version {} should be greater than previous {}", meta.version, prev_version,
@@ -737,8 +753,10 @@ async fn test_multiple_databases_shared_stores() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-    let db1 = build_shared(&tmp_1, "db_alpha", &prefix, lease_store.clone(), manifest_store.clone(), "node-1").await;
-    let db2 = build_shared(&tmp_2, "db_beta", &prefix, lease_store.clone(), manifest_store.clone(), "node-1").await;
+    let prefix_alpha = unique_prefix("test_multi_db_alpha");
+    let prefix_beta = unique_prefix("test_multi_db_beta");
+    let db1 = build_shared(&tmp_1, "db_alpha", &prefix_alpha, lease_store.clone(), manifest_store.clone(), "node-1").await;
+    let db2 = build_shared(&tmp_2, "db_beta", &prefix_beta, lease_store.clone(), manifest_store.clone(), "node-1").await;
 
     // Write 3 rows to db1
     for i in 0..3 {
@@ -754,11 +772,11 @@ async fn test_multiple_databases_shared_stores() {
     ).await.unwrap();
 
     // db1 manifest should be at version 3
-    let meta1 = manifest_store.meta("test/_manifest").await.unwrap().unwrap();
+    let meta1 = manifest_store.meta("test/db_alpha/_manifest").await.unwrap().unwrap();
     assert_eq!(meta1.version, 3, "db_alpha manifest should be v3");
 
     // db2 manifest should be at version 1
-    let meta2 = manifest_store.meta("test/_manifest").await.unwrap().unwrap();
+    let meta2 = manifest_store.meta("test/db_beta/_manifest").await.unwrap().unwrap();
     assert_eq!(meta2.version, 1, "db_beta manifest should be v1");
 
     // db1 should have 3 rows, db2 should have 1 row

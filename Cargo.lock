@@ -1448,7 +1448,6 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
- "rand 0.8.5",
  "reqwest",
  "rmp-serde",
  "serde",
@@ -1509,6 +1508,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hadb-lease-http"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "hadb",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hadb-lease-nats"
 version = "0.4.0"
 dependencies = [
@@ -1531,6 +1545,20 @@ dependencies = [
  "aws-smithy-types",
  "chrono",
  "hadb",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "hadb-manifest-http"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hadb",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -1581,8 +1609,11 @@ dependencies = [
  "futures",
  "hadb",
  "hadb-cli",
+ "hadb-io",
+ "hadb-lease-http",
  "hadb-lease-nats",
  "hadb-lease-s3",
+ "hadb-manifest-http",
  "hadb-manifest-nats",
  "hadb-manifest-s3",
  "hostname",
@@ -3691,6 +3722,7 @@ dependencies = [
  "libsqlite3-sys",
  "once_cell",
  "parking_lot",
+ "reqwest",
  "rmp-serde",
  "rusqlite",
  "serde",

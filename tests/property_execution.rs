@@ -89,6 +89,9 @@ proptest! {
 }
 
 proptest! {
+    // Each case creates a new TempDir + SQLite DB. 50 cases covers the
+    // 20*100 input space well without 256 filesystem round-trips.
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(50))]
     #[test]
     fn query_row_never_mutates_state(
         initial_rows in 0..20usize,
@@ -155,6 +158,9 @@ proptest! {
 }
 
 proptest! {
+    // S3-backed: each case does num_writes S3 round-trips. 20 cases covers
+    // the 1..10 range well without burning 256 * ~5 = 1280 S3 calls.
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(20))]
     #[test]
     fn shared_mode_serialized_writes(
         num_writes in 1..10usize,

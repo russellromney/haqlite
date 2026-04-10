@@ -12,6 +12,7 @@ categories = ["database", "network-programming"]
 [dependencies]
 # HA coordination framework
 hadb = { path = "../hadb/hadb", version = "0.4.0" }
+hadb-io = { path = "../hadb/hadb-io", version = "0.4.0" }
 hadb-lease-s3 = { path = "../hadb/hadb-lease-s3", version = "0.4.0" }
 
 # WAL sync primitives
@@ -44,6 +45,10 @@ reqwest = { version = "0.12", features = ["json"] }
 
 # NATS lease store (optional)
 hadb-lease-nats = { path = "../hadb/hadb-lease-nats", version = "0.4.0", optional = true }
+
+# HTTP lease/manifest stores (for embedded replicas via proxy)
+hadb-lease-http = { path = "../hadb/hadb-lease-http", version = "0.4.0" }
+hadb-manifest-http = { path = "../hadb/hadb-manifest-http", version = "0.4.0" }
 
 # Manifest stores (optional, for Shared mode and Dedicated mode manifest polling)
 hadb-manifest-nats = { path = "../hadb/hadb-manifest-nats", version = "0.4.0", optional = true }

@@ -5,7 +5,7 @@
 //!
 //! Usage:
 //!   # Node 1
-//!   TIERED_TEST_BUCKET=cinch-data AWS_ENDPOINT_URL=https://fly.storage.tigris.dev \
+//!   TIERED_TEST_BUCKET=haqlite-test AWS_ENDPOINT_URL=https://fly.storage.tigris.dev \
 //!   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=auto \
 //!   cargo run --features turbolite-cloud,s3-manifest --bin haqlite-shared-experiment -- \
 //!     --port 9001 --instance node-1
@@ -39,7 +39,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS test_data (
 #[command(about = "Shared-mode HA experiment for external e2e testing")]
 struct Args {
     /// S3 bucket
-    #[arg(long, env = "TIERED_TEST_BUCKET", default_value = "cinch-data")]
+    #[arg(long, env = "TIERED_TEST_BUCKET", default_value = "haqlite-test")]
     bucket: String,
 
     /// S3 prefix for this database

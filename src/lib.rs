@@ -35,7 +35,7 @@ pub mod serve;
 pub mod turbolite_replicator;
 
 // Re-export HaQLite as the primary API.
-pub use database::{HaQLite, HaQLiteBuilder, HaMode, Durability};
+pub use database::{AuthorizerFactory, HaQLite, HaQLiteBuilder, HaMode, Durability};
 pub use error::HaQLiteError;
 pub use client::{HaQLiteClient, HaQLiteClientBuilder};
 pub use forwarding::SqlValue;
@@ -53,6 +53,10 @@ pub use hadb::{
 
 // Re-export hadb-lease-s3 implementations.
 pub use hadb_lease_s3::{S3LeaseStore, S3NodeRegistry, S3StorageBackend};
+
+// Re-export HTTP store implementations.
+pub use hadb_lease_http::HttpLeaseStore;
+pub use hadb_manifest_http::HttpManifestStore;
 
 // Re-export SQLite-specific implementations.
 pub use follower_behavior::SqliteFollowerBehavior;

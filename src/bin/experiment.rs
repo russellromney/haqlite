@@ -49,7 +49,7 @@ struct Args {
     durability: String,
 
     /// S3 bucket
-    #[arg(long, env = "TIERED_TEST_BUCKET", default_value = "cinch-data")]
+    #[arg(long, env = "TIERED_TEST_BUCKET", default_value = "haqlite-test")]
     bucket: String,
 
     /// S3 prefix for this database (unique per test run)
@@ -456,6 +456,7 @@ async fn main() -> Result<()> {
         builder = builder.secret(secret);
     }
 
+    #[cfg(feature = "nats-lease")]
     if let Some(ref nats_url) = args.nats_url {
         let nats_lease = hadb_lease_nats::NatsLeaseStore::connect(nats_url, "haqlite-leases")
             .await

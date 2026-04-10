@@ -205,55 +205,10 @@ async fn e2e_synchronous_four_nodes_concurrent() {
         "reader should see {} rows (all successes), got {}", total, rows.len());
 }
 
-// ============================================================================
-// Eventual durability (turbolite S3 + walrust WAL shipping)
-// ============================================================================
-
-/// Two nodes write sequentially with Eventual durability.
-#[tokio::test(flavor = "multi_thread")]
-async fn e2e_eventual_two_nodes_sequential() {
-    let prefix = unique_prefix("even_seq");
-    let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
-    let walrust_storage = Arc::new(InMemoryStorage::new());
-
-    let tmp_a = TempDir::new().expect("tmp");
-    let db_a = build_node(
-        tmp_a.path(), &prefix, SyncMode::default(), Durability::Eventual,
-        lease_store.clone(), manifest_store.clone(), Some(walrust_storage.clone()), "node-a",
-    ).await;
-
-    let tmp_b = TempDir::new().expect("tmp");
-    let db_b = build_node(
-        tmp_b.path(), &prefix, SyncMode::default(), Durability::Eventual,
-        lease_store.clone(), manifest_store.clone(), Some(walrust_storage.clone()), "node-b",
-    ).await;
-
-    // Node A writes 5 items
-    for i in 0..5 {
-        db_a.execute(
-            "INSERT INTO items (id, node, value) VALUES (?1, ?2, ?3)",
-            &[SqlValue::Integer(i), SqlValue::Text("a".into()), SqlValue::Text(format!("val_{}", i))],
-        ).await.expect("node-a write");
-    }
-
-    // Node B writes 5 items (catches up via set_manifest)
-    for i in 5..10 {
-        db_b.execute(
-            "INSERT INTO items (id, node, value) VALUES (?1, ?2, ?3)",
-            &[SqlValue::Integer(i), SqlValue::Text("b".into()), SqlValue::Text(format!("val_{}", i))],
-        ).await.expect("node-b write");
-    }
-
-    // Both see all 10
-    let rows_a = db_a.query_values_fresh("SELECT id FROM items ORDER BY id", &[])
-        .await.expect("query a");
-    let rows_b = db_b.query_values_fresh("SELECT id FROM items ORDER BY id", &[])
-        .await.expect("query b");
-
-    assert_eq!(rows_a.len(), 10, "node-a should see 10, got {}", rows_a.len());
-    assert_eq!(rows_b.len(), 10, "node-b should see 10, got {}", rows_b.len());
-}
+// Eventual + Shared is an invalid configuration (haqlite rejects it at open time).
+// Multi-writer requires every write to be durable to S3 so each writer sees the
+// latest state. Eventual durability with Dedicated mode (single leader + followers)
+// is tested in ha_database.rs.
 
 // ============================================================================
 // Write failure without lease
@@ -269,8 +224,8 @@ async fn e2e_write_fails_without_lease() {
     let manifest_store = Arc::new(InMemoryManifestStore::new());
 
     // Pre-populate a lease that won't expire (held by another node).
-    // Key must match what execute_shared constructs: {prefix}_lease
-    let lease_key = "test/_lease";
+    // Key must match what execute_shared constructs: {prefix}{db_name}/_lease
+    let lease_key = "test/blocked/_lease";
     let lease_data = serde_json::to_vec(&serde_json::json!({
         "instance_id": "other-node",
         "timestamp": std::time::SystemTime::now()
