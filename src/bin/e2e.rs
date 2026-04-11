@@ -163,14 +163,14 @@ async fn run_worker(
                 "INSERT INTO e2e (id, worker, seq, payload, op) VALUES (?1, ?2, ?3, ?4, 'insert')",
                 &[SqlValue::Text(id.clone()), SqlValue::Text(instance_id.clone()),
                   SqlValue::Integer(seq as i64), SqlValue::Text(payload.clone())],
-            ).await,
+            ),
             WriteOp::Update { id, new_payload } => db.execute(
                 "UPDATE e2e SET payload = ?1, op = 'update', seq = ?2 WHERE id = ?3",
                 &[SqlValue::Text(new_payload.clone()), SqlValue::Integer(seq as i64), SqlValue::Text(id.clone())],
-            ).await,
+            ),
             WriteOp::Delete { id } => db.execute(
                 "DELETE FROM e2e WHERE id = ?1", &[SqlValue::Text(id.clone())],
-            ).await,
+            ),
         };
 
         let succeeded = result.is_ok();

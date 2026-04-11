@@ -139,7 +139,6 @@ async fn handle_write(
                 SqlValue::Integer(seq),
             ],
         )
-        .await
     {
         Ok(rows) => Ok(Json(
             serde_json::json!({"ok": true, "rows_affected": rows, "node": state.instance_id}),
@@ -459,7 +458,6 @@ async fn main() -> Result<()> {
     #[cfg(feature = "nats-lease")]
     if let Some(ref nats_url) = args.nats_url {
         let nats_lease = hadb_lease_nats::NatsLeaseStore::connect(nats_url, "haqlite-leases")
-            .await
             .map_err(|e| anyhow::anyhow!("NATS lease connect: {}", e))?;
         builder = builder.lease_store(std::sync::Arc::new(nats_lease));
         info!("Using NATS lease store: {}", nats_url);
@@ -533,7 +531,7 @@ async fn main() -> Result<()> {
                             SqlValue::Integer(i as i64),
                         ],
                     )
-                    .await?;
+                    ?;
                 }
                 info!("Seeded {} rows", args.seed_rows);
             }

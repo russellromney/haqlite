@@ -779,7 +779,7 @@ impl HaQLiteInner {
             new_conn.execute_batch("PRAGMA journal_mode=DELETE;")
                 .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma DELETE: {}", e)))?;
         } else if current_mode != "wal" && current_mode != "delete" && current_mode != "memory" {
-            new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")
                 .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma WAL: {}", e)))?;
         }
 
@@ -2027,7 +2027,7 @@ fn ensure_schema(db_path: &Path, schema: &str) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let conn = rusqlite::Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")?;
     conn.execute_batch(schema)?;
     drop(conn);
     Ok(())
@@ -2036,7 +2036,7 @@ fn ensure_schema(db_path: &Path, schema: &str) -> Result<()> {
 /// Open a read-write connection with WAL mode and autocheckpoint disabled.
 fn open_leader_connection(db_path: &Path) -> Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")?;
     Ok(conn)
 }
 

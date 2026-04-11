@@ -89,7 +89,7 @@ async fn handle_write(
         "INSERT OR REPLACE INTO test_data (id, value, writer) VALUES (?1, ?2, ?3)",
         &[SqlValue::Text(id.into()), SqlValue::Text(value.into()),
           SqlValue::Text(state.instance_id.clone())],
-    ).await {
+    ) {
         Ok(rows) => Ok(Json(serde_json::json!({"ok": true, "rows_affected": rows}))),
         Err(e) => Ok(Json(serde_json::json!({"ok": false, "error": format!("{}", e)}))),
     }

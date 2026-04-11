@@ -115,7 +115,6 @@ async fn handle_write(
             SqlValue::Text(format!("row-{}", id)),
         ],
     )
-    .await
     .map_err(|e| {
         error!("Write failed: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -339,8 +338,7 @@ async fn main() -> Result<()> {
                         SqlValue::Integer(i as i64),
                         SqlValue::Text(format!("row-{}", i)),
                     ],
-                )
-                .await?;
+                )?;
             }
             let count: i64 = db
                 .query_row("SELECT COUNT(*) FROM test_data", &[], |r| r.get(0))
