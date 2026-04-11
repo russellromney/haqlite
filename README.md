@@ -55,21 +55,18 @@ Node 1 (leader)                    Node 2 (follower)
 
 haqlite adds zero measurable overhead to SQLite. Leader election, WAL replication, write forwarding, and automatic failover run entirely in background tasks with no impact on the read/write hot path.
 
-50K rows, WAL mode, single-node leader, macOS (Apple Silicon):
+100K rows, Fly.io performance-2x (dedicated vCPU, NVMe, IAD), single-node leader:
 
 | Operation | SQLite | haqlite (replicated) | Overhead |
 |-----------|--------|---------------------|----------|
-| Point lookup | 307K ops/s | 332K ops/s | **none** |
-| Range scan | 27K ops/s | 29K ops/s | **none** |
-| Full table scan | 335 ops/s | 368 ops/s | **none** |
-| Single INSERT | 27K ops/s | 34K ops/s | **none** |
-| UPDATE by PK | 39K ops/s | 67K ops/s | **none** |
-| Concurrent reads (4 threads) | 68K ops/s | 42K ops/s | 1.6x |
-| Writes + 4 readers | 11K writes/s | 20K writes/s | **faster** |
+| Point lookup | 145K/s | 151K/s | **none** |
+| Range scan | 8.8K/s | 8.1K/s | **none** |
+| Full table scan | 56/s | 55/s | **none** |
+| Single INSERT | 19K/s | 28K/s | **faster** |
+| UPDATE by PK | 40K/s | 44K/s | **none** |
+| Batch INSERT (in txn) | 685K/s | 295K/s | 2.3x |
 
-Run-to-run variance is ~20%. The haqlite API layer (role check, connection lock, SqlValue params) adds <1us per call, well within noise.
-
-**Why writes can be faster:** haqlite sets `synchronous=NORMAL` and `cache_size=64MB` by default, which matches SQLite best practices for WAL mode but differs from SQLite's defaults (`synchronous=FULL`, 2MB cache).
+haqlite sets `synchronous=NORMAL` and `cache_size=64MB` by default (WAL mode best practice). The haqlite API layer (role check, connection lock, SqlValue params) adds <1us per call.
 
 **Durability modes have different write costs:**
 
