@@ -618,7 +618,8 @@ pub(crate) struct HaQLiteInner {
     /// Cached role -- updated atomically by the role event listener.
     role: AtomicU8,
     /// Read-write connection when leader, None when follower.
-    pub(crate) conn: RwLock<Option<Arc<Mutex<rusqlite::Connection>>>>,
+    /// ArcSwapOption: lock-free reads (every execute/query), rare writes (role change).
+    pub(crate) conn: arc_swap::ArcSwapOption<Mutex<rusqlite::Connection>>,
     /// Leader's forwarding address (read from S3 lease, updated on role change).
     leader_address: RwLock<String>,
     pub(crate) http_client: reqwest::Client,
@@ -697,8 +698,7 @@ impl HaQLiteInner {
     }
 
     fn set_conn(&self, conn: Option<Arc<Mutex<rusqlite::Connection>>>) {
-        *self.conn.write()
-            .expect("conn write lock poisoned") = conn;
+        self.conn.store(conn);
     }
 
     /// Block all writes on the connection via SQLite authorizer.
@@ -749,9 +749,7 @@ impl HaQLiteInner {
     }
 
     pub(crate) fn get_conn(&self) -> std::result::Result<Option<Arc<Mutex<rusqlite::Connection>>>, HaQLiteError> {
-        self.conn.read()
-            .map(|g| g.clone())
-            .map_err(|_| HaQLiteError::DatabaseError("conn lock poisoned".into()))
+        Ok(self.conn.load_full())
     }
 
     /// Open a turbolite VFS connection if one doesn't exist yet.
@@ -828,7 +826,7 @@ impl HaQLite {
                 .to_string(),
             db_path,
             role: AtomicU8::new(ROLE_LEADER),
-            conn: RwLock::new(Some(Arc::new(Mutex::new(conn)))),
+            conn: arc_swap::ArcSwapOption::new(Some(Arc::new(Mutex::new(conn)))),
             leader_address: RwLock::new(String::new()),
             http_client: reqwest::Client::new(),
             secret: None,
@@ -1045,13 +1043,9 @@ impl HaQLite {
     /// Returns all matching rows. Each row is a Vec of column values.
     /// Returns an empty Vec if no rows match (not an error).
     pub fn query_values_local(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
-        let rusqlite_params: Vec<rusqlite::types::Value> =
-            params.iter().map(|p| p.to_rusqlite()).collect();
+        // SqlValue implements ToSql directly (zero-copy, no String/Blob clone).
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            rusqlite_params
-                .iter()
-                .map(|p| p as &dyn rusqlite::types::ToSql)
-                .collect();
+            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
         let query_with = |conn: &rusqlite::Connection| -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
             let mut stmt = conn
@@ -1521,26 +1515,32 @@ impl HaQLite {
     }
 
     fn execute_local_raw(&self, sql: &str, params: &[&dyn rusqlite::types::ToSql]) -> std::result::Result<u64, HaQLiteError> {
-        let conn_arc = if self.inner.shared_turbolite_vfs.is_some() {
-            self.inner.ensure_turbolite_conn()?
+        // Fast path: load Guard (no Arc clone), lock Mutex directly.
+        let guard = if self.inner.shared_turbolite_vfs.is_some() {
+            // Turbolite path needs ensure_turbolite_conn which may create the connection.
+            drop(self.inner.conn.load()); // drop guard before potential store
+            let conn_arc = self.inner.ensure_turbolite_conn()?;
+            let conn = conn_arc.lock()
+                .map_err(|_| HaQLiteError::DatabaseError("write connection lock poisoned".into()))?;
+            let rows = conn.execute(sql, params)
+                .map_err(|e| HaQLiteError::DatabaseError(format!("execute failed: {e}")))?;
+            return Ok(rows as u64);
         } else {
-            self.inner.get_conn()?
-                .ok_or(HaQLiteError::DatabaseError("No write connection available (not leader?)".into()))?
+            self.inner.conn.load()
         };
+        let conn_arc = guard.as_ref()
+            .ok_or(HaQLiteError::DatabaseError("No write connection available (not leader?)".into()))?;
         let conn = conn_arc.lock()
             .map_err(|_| HaQLiteError::DatabaseError("write connection lock poisoned".into()))?;
-
-        let rows = conn
-            .execute(sql, params)
+        let rows = conn.execute(sql, params)
             .map_err(|e| HaQLiteError::DatabaseError(format!("execute failed: {e}")))?;
-
         Ok(rows as u64)
     }
 
     fn execute_local(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
-        let values: Vec<rusqlite::types::Value> = params.iter().map(|p| p.to_rusqlite()).collect();
+        // SqlValue implements ToSql directly (zero-copy, no String/Blob clone).
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            values.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
         self.execute_local_raw(sql, &param_refs)
     }
 
@@ -1701,7 +1701,7 @@ async fn open_with_coordinator(
             Role::Leader => ROLE_LEADER,
             Role::Follower => ROLE_FOLLOWER,
         }),
-        conn: RwLock::new(None),
+        conn: arc_swap::ArcSwapOption::new(None),
         leader_address: RwLock::new(leader_addr),
         http_client,
         secret: secret.clone(),
@@ -1952,7 +1952,7 @@ async fn open_shared_turbolite(
         db_name: db_name_owned.clone(),
         db_path: db_path.clone(),
         role: AtomicU8::new(ROLE_LEADER),
-        conn: RwLock::new(conn),
+        conn: arc_swap::ArcSwapOption::new(conn),
         leader_address: RwLock::new(String::new()),
         http_client: reqwest::Client::new(),
         secret: None,

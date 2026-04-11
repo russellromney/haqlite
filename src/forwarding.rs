@@ -25,8 +25,23 @@ pub enum SqlValue {
     Blob(Vec<u8>),
 }
 
+impl rusqlite::types::ToSql for SqlValue {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        use rusqlite::types::ToSqlOutput;
+        use rusqlite::types::ValueRef;
+        match self {
+            SqlValue::Null => Ok(ToSqlOutput::Borrowed(ValueRef::Null)),
+            SqlValue::Integer(i) => Ok(ToSqlOutput::Borrowed(ValueRef::Integer(*i))),
+            SqlValue::Real(f) => Ok(ToSqlOutput::Borrowed(ValueRef::Real(*f))),
+            SqlValue::Text(s) => Ok(ToSqlOutput::Borrowed(ValueRef::Text(s.as_bytes()))),
+            SqlValue::Blob(b) => Ok(ToSqlOutput::Borrowed(ValueRef::Blob(b))),
+        }
+    }
+}
+
 impl SqlValue {
-    /// Convert to rusqlite's Value type for local execution.
+    /// Convert to rusqlite's Value type (owned, clones String/Blob).
+    /// Prefer using SqlValue directly as &dyn ToSql (zero-copy) instead.
     pub fn to_rusqlite(&self) -> rusqlite::types::Value {
         match self {
             SqlValue::Null => rusqlite::types::Value::Null,
@@ -107,9 +122,8 @@ pub(crate) async fn handle_forwarded_execute(
     let conn = conn_arc.lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let params: Vec<rusqlite::types::Value> = req.params.iter().map(|p| p.to_rusqlite()).collect();
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        req.params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
     let rows_affected = conn
         .execute(&req.sql, param_refs.as_slice())
@@ -153,9 +167,8 @@ pub(crate) async fn handle_forwarded_query(
     let conn = conn_arc.lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let params: Vec<rusqlite::types::Value> = req.params.iter().map(|p| p.to_rusqlite()).collect();
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        req.params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
     let mut stmt = conn.prepare(&req.sql).map_err(|e| {
         tracing::error!("Forwarded query prepare failed: {}", e);

@@ -258,13 +258,8 @@ impl HaQLiteClient {
         )
         .map_err(|e| anyhow!("Failed to open read-replica DB: {}", e))?;
 
-        let rusqlite_params: Vec<rusqlite::types::Value> =
-            params.iter().map(|p| p.to_rusqlite()).collect();
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            rusqlite_params
-                .iter()
-                .map(|p| p as &dyn rusqlite::types::ToSql)
-                .collect();
+            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
 
         let mut stmt = conn
             .prepare(sql)

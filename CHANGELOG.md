@@ -1,5 +1,23 @@
 # haqlite Changelog
 
+## Phase Thermopylae: HA Hardening
+
+Closed remaining safety gaps across all 4 mode combinations (Shared+Synchronous, Dedicated+Replicated, Dedicated+Synchronous, Dedicated+Eventual). Confirmed Shared+Eventual is invalid (removed).
+
+- **Dedicated+Synchronous durability**: Kill-all-and-recover test, fresh node restores from turbolite S3 manifest
+- **Shared linearizability**: Last-writer-wins verified under contention, read-modify-write counter test (no lost updates), concurrent INSERT OR REPLACE (no silent drops)
+- **RPO measurement**: Synchronous modes confirmed RPO=0, Replicated/Eventual confirmed RPO=sync_interval
+- **Chaos tests (all 4 modes)**: SIGKILL during sync (10 iterations, no corruption), concurrent readers during failover (valid data or clean errors), rapid kill/restart cycles (all Ok'd writes survive)
+- **Shared crash chaos**: Mid-write SIGKILL (lease TTL takeover), dual-node simultaneous kill (no corruption), rapid alternating writes (50 iterations), stale lease SIGSTOP test (no overwrites)
+- **Network partition / split brain**: Leader self-demotes after renewal failures, follower promotes, old leader rejects writes
+- **Scale tests**: 5-minute sustained writes (0 data loss), 10K row full restore
+- **Changeset chain integrity**: Full walrust restore after double failover (no gaps, valid checksums, exact data match)
+- **Code cleanup**: Removed debug tracing, deprecated wrappers, dead Shared+Eventual code paths
+- **Authorizer plugin**: SQL statement filtering for security
+- **Manifest store publish fix**: Turbolite S3 manifest as single source of truth for Shared+Sync
+- **Lease store fix**: Tigris S3 incompatible with lease CAS (requires atomic CAS store like NATS)
+- **Split-brain fix**: Read-then-CAS instead of write_if_not_exists for shared lease
+
 ## Phase Cannae-b: Durability Modes + Multiwriter Bug Fixes
 
 - **Durability enum**: `Replicated` (plain SQLite + walrust WAL shipping, Dedicated only), `Synchronous` (turbolite S3Primary, every write to S3), `Eventual` (turbolite S3 + walrust WAL shipping between checkpoints). Shared mode requires durable sync VFS (turbolite with S3).
