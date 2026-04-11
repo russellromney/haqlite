@@ -965,17 +965,6 @@ impl HaQLite {
         }
     }
 
-    /// Execute SQL with raw rusqlite params (zero-copy, no SqlValue conversion).
-    /// Synchronous. Only works on the leader in Dedicated mode.
-    /// For follower/shared, use `execute()` which handles forwarding.
-    pub fn execute_raw(
-        &self,
-        sql: &str,
-        params: &[&dyn rusqlite::types::ToSql],
-    ) -> std::result::Result<u64, HaQLiteError> {
-        self.execute_local_raw(sql, params)
-    }
-
     /// Query a single row from local state. Does NOT catch up from manifest.
     ///
     /// **In Shared mode, this may return stale data.** If another node has written
