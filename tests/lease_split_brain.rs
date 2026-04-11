@@ -344,7 +344,7 @@ async fn slow_storage_lease_expiration() {
         let db = db_a.clone();
         tokio::spawn(async move {
             let db = db.lock().await;
-            db.execute("INSERT OR REPLACE INTO kv VALUES ('slow_a', 'from_a')", &[]).await
+            db.execute("INSERT OR REPLACE INTO kv VALUES ('slow_a', 'from_a')", &[])
         })
     };
 
@@ -356,7 +356,7 @@ async fn slow_storage_lease_expiration() {
         let db = db_b.clone();
         tokio::spawn(async move {
             let db = db.lock().await;
-            db.execute("INSERT OR REPLACE INTO kv VALUES ('slow_b', 'from_b')", &[]).await
+            db.execute("INSERT OR REPLACE INTO kv VALUES ('slow_b', 'from_b')", &[])
         })
     };
 

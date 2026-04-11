@@ -13,7 +13,7 @@
 //!     .await?;
 //!
 //! // Writes: forwarded to leader automatically
-//! db.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Alice".into())]).await?;
+//! db.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Alice".into())])?;
 //!
 //! // Reads: always local
 //! let count: i64 = db.query_row("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;

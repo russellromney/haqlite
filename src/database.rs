@@ -9,7 +9,7 @@
 //!     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);")
 //!     .await?;
 //!
-//! db.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Alice".into())]).await?;
+//! db.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Alice".into())])?;
 //! let count: i64 = db.query_row("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;
 //! # Ok(())
 //! # }
@@ -917,21 +917,47 @@ impl HaQLite {
 
     /// Execute a write statement. Returns rows affected.
     ///
-    /// On the leader: executes locally.
-    /// On a follower: forwards to the leader via HTTP.
-    pub async fn execute(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
+    /// Execute SQL. Synchronous on the leader (the common path).
+    /// On a follower: blocks on HTTP forwarding to the leader.
+    /// In shared mode: blocks on lease acquisition + S3 commit.
+    pub fn execute(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        match self.inner.mode {
+            HaMode::Shared => {
+                // Shared mode requires async (lease acquisition). Use the tokio handle.
+                let handle = tokio::runtime::Handle::try_current()
+                    .map_err(|_| HaQLiteError::DatabaseError("execute in Shared mode requires tokio runtime".into()))?;
+                handle.block_on(self.execute_shared(sql, params))
+            }
+            HaMode::Dedicated => {
+                let role = self.inner.current_role();
+                match role {
+                    Some(Role::Leader) | None => {
+                        self.execute_local_raw(sql, &param_refs)
+                    }
+                    Some(Role::Follower) => {
+                        let handle = tokio::runtime::Handle::try_current()
+                            .map_err(|_| HaQLiteError::DatabaseError("execute forwarding requires tokio runtime".into()))?;
+                        handle.block_on(self.execute_forwarded(sql, params))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Async execute for callers already in an async context.
+    /// Equivalent to `execute()` but avoids the `block_on` for follower/shared paths.
+    pub async fn execute_async(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
         match self.inner.mode {
             HaMode::Shared => self.execute_shared(sql, params).await,
             HaMode::Dedicated => {
                 let role = self.inner.current_role();
                 match role {
                     Some(Role::Leader) | None => {
-                        let rows = self.execute_local(sql, params)?;
-                        // For Synchronous durability (turbolite S3Primary), followers
-                        // catch up directly from turbolite's S3 manifest (published
-                        // by xSync during execute_local). No separate haqlite manifest
-                        // publish needed.
-                        Ok(rows)
+                        self.execute_local_raw(sql, &param_refs)
                     }
                     Some(Role::Follower) => self.execute_forwarded(sql, params).await,
                 }

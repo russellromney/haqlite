@@ -321,8 +321,8 @@ async fn turbolite_shared_empty_table_read() {
     .await;
 
     // Schema is deferred to first write. Do a no-op write to create the table.
-    db.execute("INSERT INTO t VALUES (1, 'init')", &[]).await.expect("init write");
-    db.execute("DELETE FROM t WHERE id = 1", &[]).await.expect("cleanup");
+    db.execute("INSERT INTO t VALUES (1, 'init')", &[]).expect("init write");
+    db.execute("DELETE FROM t WHERE id = 1", &[]).expect("cleanup");
 
     // Read from empty table
     let count: i64 = db

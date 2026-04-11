@@ -178,7 +178,7 @@ async fn handle_execute(
         _ => vec![],
     };
 
-    match state.db.execute(sql, &params).await {
+    match state.db.execute(sql, &params) {
         Ok(rows) => Ok(Json(serde_json::json!({"ok": true, "rows_affected": rows}))),
         Err(e) => Ok(Json(serde_json::json!({"ok": false, "error": format!("{}", e)}))),
     }

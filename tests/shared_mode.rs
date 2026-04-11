@@ -226,13 +226,13 @@ async fn shared_two_nodes_sequential_writes() {
     let db_a = build_shared(&tmp_a, "shared", &prefix, lease_store.clone(), manifest_store.clone(), "node-a").await;
 
     // A writes row 1
-    db_a.execute("INSERT INTO t VALUES (1, 'a1')", &[]).await.unwrap();
+    db_a.execute("INSERT INTO t VALUES (1, 'a1')", &[]).unwrap();
     let meta = manifest_store.meta("test/shared/_manifest").await.unwrap().unwrap();
     assert_eq!(meta.version, 1);
     assert_eq!(meta.writer_id, "node-a");
 
     // A writes row 2
-    db_a.execute("INSERT INTO t VALUES (2, 'a2')", &[]).await.unwrap();
+    db_a.execute("INSERT INTO t VALUES (2, 'a2')", &[]).unwrap();
     let meta = manifest_store.meta("test/shared/_manifest").await.unwrap().unwrap();
     assert_eq!(meta.version, 2);
 
@@ -242,7 +242,7 @@ async fn shared_two_nodes_sequential_writes() {
 
     // B opens (restores from A's snapshot + changesets) and writes row 3
     let db_b = build_shared(&tmp_b, "shared", &prefix, lease_store.clone(), manifest_store.clone(), "node-b").await;
-    db_b.execute("INSERT INTO t VALUES (3, 'b1')", &[]).await.unwrap();
+    db_b.execute("INSERT INTO t VALUES (3, 'b1')", &[]).unwrap();
 
     let meta = manifest_store.meta("test/shared/_manifest").await.unwrap().unwrap();
     assert_eq!(meta.version, 3);
@@ -265,13 +265,13 @@ async fn shared_failover_lease_expires_other_node_writes() {
     // Node A writes
     {
         let db_a = build_shared(&tmp_a, "shared", &prefix, lease_store.clone(), manifest_store.clone(), "node-a").await;
-        db_a.execute("INSERT INTO t VALUES (1, 'before-crash')", &[]).await.unwrap();
+        db_a.execute("INSERT INTO t VALUES (1, 'before-crash')", &[]).unwrap();
         // db_a drops here, lease should be released in execute_shared
     }
 
     // Node B should be able to write (lease was released by A)
     let db_b = build_shared(&tmp_b, "shared", &prefix, lease_store.clone(), manifest_store.clone(), "node-b").await;
-    db_b.execute("INSERT INTO t VALUES (2, 'after-crash')", &[]).await.unwrap();
+    db_b.execute("INSERT INTO t VALUES (2, 'after-crash')", &[]).unwrap();
 
     let meta = manifest_store.meta("test/shared/_manifest").await.unwrap().unwrap();
     assert_eq!(meta.version, 2);
@@ -292,7 +292,7 @@ async fn shared_manifest_version_tracks_writes() {
 
     let mut db = build_shared(&tmp, "test", &prefix, lease_store, manifest_store.clone(), "node-1").await;
 
-    db.execute("INSERT INTO t VALUES (1, 'v1')", &[]).await.unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'v1')", &[]).unwrap();
 
     // Fetch full manifest and verify storage variant
     let manifest = manifest_store.get("test/test/_manifest").await.unwrap().unwrap();
@@ -491,7 +491,7 @@ async fn test_lease_ttl_expiry_takeover() {
 
     // Node B should be able to write (expired lease gets taken over)
     let db_b = build_shared(&tmp_b, "ttl", &prefix, lease_store.clone(), manifest_store.clone(), "node-b").await;
-    db_b.execute("INSERT INTO t VALUES (1, 'after-expiry')", &[]).await
+    db_b.execute("INSERT INTO t VALUES (1, 'after-expiry')", &[])
         .expect("node B should write after lease expiry");
 
     let val: String = db_b.query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0)).unwrap();
@@ -596,7 +596,7 @@ async fn test_write_timeout_lease_contention() {
         .await
         .expect("open should succeed");
 
-    let result = db.execute("INSERT INTO t VALUES (1, 'blocked')", &[]).await;
+    let result = db.execute("INSERT INTO t VALUES (1, 'blocked')", &[]);
     assert!(result.is_err(), "write should fail due to lease contention");
     let err = result.unwrap_err();
     let msg = format!("{}", err);
@@ -675,7 +675,7 @@ async fn test_fresh_read_empty_database() {
     assert!(result.is_err(), "query before first write should fail (no schema yet)");
 
     // First write applies schema + inserts data
-    db_a.execute("INSERT INTO t VALUES (1, 'first')", &[]).await
+    db_a.execute("INSERT INTO t VALUES (1, 'first')", &[])
         .expect("first write should succeed (applies schema)");
 
     // Now both nodes should see the data via fresh read
@@ -705,10 +705,10 @@ async fn test_write_after_lease_release() {
     let db_b = build_shared(&tmp_b, "release", &prefix, lease_store.clone(), manifest_store.clone(), "node-b").await;
 
     // Node A writes (lease should be acquired and released within execute)
-    db_a.execute("INSERT INTO t VALUES (1, 'from-a')", &[]).await.unwrap();
+    db_a.execute("INSERT INTO t VALUES (1, 'from-a')", &[]).unwrap();
 
     // Node B should immediately be able to write (no contention)
-    db_b.execute("INSERT INTO t VALUES (2, 'from-b')", &[]).await
+    db_b.execute("INSERT INTO t VALUES (2, 'from-b')", &[])
         .expect("node B should write without contention after A released lease");
 
     let count: i64 = db_b.query_row_fresh("SELECT COUNT(*) FROM t", &[], |r| r.get(0)).await.unwrap();
@@ -797,7 +797,7 @@ async fn test_write_empty_params() {
 
     let mut db = build_shared(&tmp, "empty_params", &prefix, lease_store, manifest_store.clone(), "node-1").await;
 
-    let rows = db.execute("INSERT INTO t VALUES (1, 'no_params')", &[]).await.unwrap();
+    let rows = db.execute("INSERT INTO t VALUES (1, 'no_params')", &[]).unwrap();
     assert_eq!(rows, 1);
 
     let val: String = db.query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0)).unwrap();
