@@ -17,7 +17,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -687,14 +688,11 @@ impl HaQLiteInner {
     }
 
     fn leader_addr(&self) -> std::result::Result<String, HaQLiteError> {
-        self.leader_address.read()
-            .map(|g| g.clone())
-            .map_err(|_| HaQLiteError::DatabaseError("leader_address lock poisoned".into()))
+        Ok(self.leader_address.read().clone())
     }
 
     fn set_leader_addr(&self, addr: String) {
-        *self.leader_address.write()
-            .expect("leader_address write lock poisoned") = addr;
+        *self.leader_address.write() = addr;
     }
 
     fn set_conn(&self, conn: Option<Arc<Mutex<rusqlite::Connection>>>) {
@@ -705,7 +703,7 @@ impl HaQLiteInner {
     /// Called on demotion/fencing. The connection stays open for reads.
     fn fence_connection(&self) {
         if let Ok(Some(conn_arc)) = self.get_conn() {
-            if let Ok(conn) = conn_arc.lock() {
+            let conn = conn_arc.lock();
                 if let Some(ref factory) = self.authorizer {
                     conn.authorizer(Some(factory(true)));
                 } else {
@@ -722,21 +720,19 @@ impl HaQLiteInner {
                     }));
                 }
                 tracing::info!("HaQLite: connection fenced (writes blocked)");
-            }
         }
     }
 
     /// Apply unfenced authorizer (or clear authorizer). Called on promotion.
     fn unfence_connection(&self) {
         if let Ok(Some(conn_arc)) = self.get_conn() {
-            if let Ok(conn) = conn_arc.lock() {
-                if let Some(ref factory) = self.authorizer {
-                    conn.authorizer(Some(factory(false)));
-                } else {
-                    conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>);
-                }
-                tracing::info!("HaQLite: connection unfenced (writes allowed)");
+            let conn = conn_arc.lock();
+            if let Some(ref factory) = self.authorizer {
+                conn.authorizer(Some(factory(false)));
+            } else {
+                conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>);
             }
+            tracing::info!("HaQLite: connection unfenced (writes allowed)");
         }
     }
 
@@ -853,9 +849,8 @@ impl HaQLite {
 
         // Apply custom authorizer (unfenced) on initial connection.
         if let Ok(Some(conn_arc)) = inner.get_conn() {
-            if let Ok(c) = conn_arc.lock() {
-                inner.apply_initial_authorizer(&c);
-            }
+            let c = conn_arc.lock();
+            inner.apply_initial_authorizer(&c);
         }
 
         // No forwarding server or role listener in local mode.
@@ -982,8 +977,7 @@ impl HaQLite {
                     self.inner.get_conn()?
                         .ok_or(HaQLiteError::DatabaseError("No connection available".into()))?
                 };
-                let conn = conn_arc.lock()
-                    .map_err(|_| HaQLiteError::DatabaseError("connection lock poisoned".into()))?;
+                let conn = conn_arc.lock();
                 conn.query_row(sql, params, f)
                     .map_err(|e| HaQLiteError::DatabaseError(format!("query_row failed: {e}")))
             }
@@ -1083,8 +1077,7 @@ impl HaQLite {
                     self.inner.get_conn()?
                         .ok_or(HaQLiteError::DatabaseError("No connection available".into()))?
                 };
-                let conn = conn_arc.lock()
-                    .map_err(|_| HaQLiteError::DatabaseError("connection lock poisoned".into()))?;
+                let conn = conn_arc.lock();
                 query_with(&conn)
             }
             Some(Role::Follower) => {
@@ -1372,7 +1365,7 @@ impl HaQLite {
                 let conn = self.inner.ensure_turbolite_conn()?;
                 if !self.inner.schema_applied.load(Ordering::SeqCst) {
                     if let Some(ref schema) = self.inner.schema_sql {
-                        let c = conn.lock().map_err(|_| HaQLiteError::DatabaseError("lock".into()))?;
+                        let c = conn.lock();
                         c.execute_batch(schema)
                             .map_err(|e| HaQLiteError::DatabaseError(format!("schema: {}", e)))?;
                     }
@@ -1520,8 +1513,7 @@ impl HaQLite {
             // Turbolite path needs ensure_turbolite_conn which may create the connection.
             drop(self.inner.conn.load()); // drop guard before potential store
             let conn_arc = self.inner.ensure_turbolite_conn()?;
-            let conn = conn_arc.lock()
-                .map_err(|_| HaQLiteError::DatabaseError("write connection lock poisoned".into()))?;
+            let conn = conn_arc.lock();
             let rows = conn.execute(sql, params)
                 .map_err(|e| HaQLiteError::DatabaseError(format!("execute failed: {e}")))?;
             return Ok(rows as u64);
@@ -1530,8 +1522,7 @@ impl HaQLite {
         };
         let conn_arc = guard.as_ref()
             .ok_or(HaQLiteError::DatabaseError("No write connection available (not leader?)".into()))?;
-        let conn = conn_arc.lock()
-            .map_err(|_| HaQLiteError::DatabaseError("write connection lock poisoned".into()))?;
+        let conn = conn_arc.lock();
         let rows = conn.execute(sql, params)
             .map_err(|e| HaQLiteError::DatabaseError(format!("execute failed: {e}")))?;
         Ok(rows as u64)
@@ -1735,8 +1726,7 @@ async fn open_with_coordinator(
             // Apply schema through turbolite connection.
             let conn_arc = inner.get_conn()?
                 .expect("ensure_turbolite_conn should have set conn");
-            let conn = conn_arc.lock()
-                .map_err(|_| anyhow::anyhow!("conn lock poisoned"))?;
+            let conn = conn_arc.lock();
             conn.execute_batch(schema)
                 .map_err(|e| anyhow::anyhow!("schema via turbolite: {}", e))?;
             inner.apply_initial_authorizer(&conn);
@@ -1807,9 +1797,8 @@ async fn run_role_listener(
                     match inner.ensure_turbolite_conn() {
                         Ok(_) => {
                             if let Ok(Some(conn_arc)) = inner.get_conn() {
-                                if let Ok(c) = conn_arc.lock() {
-                                    inner.apply_initial_authorizer(&c);
-                                }
+                                let c = conn_arc.lock();
+                                inner.apply_initial_authorizer(&c);
                             }
                             tracing::info!("HaQLite: opened turbolite connection on promotion");
                         }

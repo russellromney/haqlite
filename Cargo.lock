@@ -1630,6 +1630,7 @@ dependencies = [
  "hrana-server",
  "http 1.4.0",
  "http-body-util",
+ "parking_lot",
  "proptest",
  "proptest-derive",
  "rand 0.8.5",

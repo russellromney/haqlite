@@ -119,8 +119,7 @@ pub(crate) async fn handle_forwarded_execute(
         .get_conn()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let conn = conn_arc.lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let conn = conn_arc.lock();
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         req.params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
@@ -164,8 +163,7 @@ pub(crate) async fn handle_forwarded_query(
         .get_conn()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let conn = conn_arc.lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let conn = conn_arc.lock();
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         req.params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
