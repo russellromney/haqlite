@@ -425,7 +425,7 @@ impl HaQLiteBuilder {
                         .unwrap_or_else(|| std::path::Path::new("/tmp"))
                         .join(".haqlite_cache");
                     std::fs::create_dir_all(&cache_dir)?;
-                    let tl_prefix = format!("{}tl/", self.prefix);
+                    let tl_prefix = format!("{}tl", self.prefix);
                     let storage_backend = if let (Some(ref ep), Some(ref tok)) = (&self.cinch_endpoint, &self.cinch_token) {
                         turbolite::tiered::StorageBackend::Http {
                             endpoint: ep.clone(),
@@ -528,7 +528,7 @@ impl HaQLiteBuilder {
                         std::fs::create_dir_all(&cache_dir)?;
                         // turbolite gets its own sub-prefix to avoid key collisions
                         // with haqlite lease/manifest keys.
-                        let tl_prefix = format!("{}tl/", self.prefix);
+                        let tl_prefix = format!("{}tl", self.prefix);
                         let storage_backend = if let (Some(ref ep), Some(ref tok)) = (&self.cinch_endpoint, &self.cinch_token) {
                             turbolite::tiered::StorageBackend::Http {
                                 endpoint: ep.clone(),
@@ -944,6 +944,49 @@ impl HaQLite {
                 }
             }
         }
+    }
+
+    /// Execute SQL with raw rusqlite params (zero-copy, no SqlValue conversion).
+    /// Only works on the leader in Dedicated mode. Does not support forwarding.
+    pub fn execute_raw(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::types::ToSql],
+    ) -> std::result::Result<u64, HaQLiteError> {
+        let conn_arc = if self.inner.shared_turbolite_vfs.is_some() {
+            self.inner.ensure_turbolite_conn()?
+        } else {
+            self.inner.get_conn()?
+                .ok_or(HaQLiteError::DatabaseError("No write connection available".into()))?
+        };
+        let conn = conn_arc.lock()
+            .map_err(|_| HaQLiteError::DatabaseError("write connection lock poisoned".into()))?;
+        let rows = conn.execute(sql, params)
+            .map_err(|e| HaQLiteError::DatabaseError(format!("execute_raw failed: {e}")))?;
+        Ok(rows as u64)
+    }
+
+    /// Query with raw rusqlite params, returning results via a closure (zero-copy).
+    /// Only reads from local state. Does not support forwarding.
+    pub fn query_row_raw<T, F>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::types::ToSql],
+        f: F,
+    ) -> std::result::Result<T, HaQLiteError>
+    where
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        let conn_arc = if self.inner.shared_turbolite_vfs.is_some() {
+            self.inner.ensure_turbolite_conn()?
+        } else {
+            self.inner.get_conn()?
+                .ok_or(HaQLiteError::DatabaseError("No connection available".into()))?
+        };
+        let conn = conn_arc.lock()
+            .map_err(|_| HaQLiteError::DatabaseError("connection lock poisoned".into()))?;
+        conn.query_row(sql, params, f)
+            .map_err(|e| HaQLiteError::DatabaseError(format!("query_row_raw failed: {e}")))
     }
 
     /// Query a single row from local state. Does NOT catch up from manifest.
