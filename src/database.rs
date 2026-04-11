@@ -947,46 +947,14 @@ impl HaQLite {
     }
 
     /// Execute SQL with raw rusqlite params (zero-copy, no SqlValue conversion).
-    /// Only works on the leader in Dedicated mode. Does not support forwarding.
+    /// Synchronous. Only works on the leader in Dedicated mode.
+    /// For follower/shared, use `execute()` which handles forwarding.
     pub fn execute_raw(
         &self,
         sql: &str,
         params: &[&dyn rusqlite::types::ToSql],
     ) -> std::result::Result<u64, HaQLiteError> {
-        let conn_arc = if self.inner.shared_turbolite_vfs.is_some() {
-            self.inner.ensure_turbolite_conn()?
-        } else {
-            self.inner.get_conn()?
-                .ok_or(HaQLiteError::DatabaseError("No write connection available".into()))?
-        };
-        let conn = conn_arc.lock()
-            .map_err(|_| HaQLiteError::DatabaseError("write connection lock poisoned".into()))?;
-        let rows = conn.execute(sql, params)
-            .map_err(|e| HaQLiteError::DatabaseError(format!("execute_raw failed: {e}")))?;
-        Ok(rows as u64)
-    }
-
-    /// Query with raw rusqlite params, returning results via a closure (zero-copy).
-    /// Only reads from local state. Does not support forwarding.
-    pub fn query_row_raw<T, F>(
-        &self,
-        sql: &str,
-        params: &[&dyn rusqlite::types::ToSql],
-        f: F,
-    ) -> std::result::Result<T, HaQLiteError>
-    where
-        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    {
-        let conn_arc = if self.inner.shared_turbolite_vfs.is_some() {
-            self.inner.ensure_turbolite_conn()?
-        } else {
-            self.inner.get_conn()?
-                .ok_or(HaQLiteError::DatabaseError("No connection available".into()))?
-        };
-        let conn = conn_arc.lock()
-            .map_err(|_| HaQLiteError::DatabaseError("connection lock poisoned".into()))?;
-        conn.query_row(sql, params, f)
-            .map_err(|e| HaQLiteError::DatabaseError(format!("query_row_raw failed: {e}")))
+        self.execute_local_raw(sql, params)
     }
 
     /// Query a single row from local state. Does NOT catch up from manifest.
@@ -1552,9 +1520,7 @@ impl HaQLite {
         }
     }
 
-    fn execute_local(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
-        // Use ensure_turbolite_conn for lazy connection open (Synchronous durability),
-        // fall back to get_conn for non-turbolite paths.
+    fn execute_local_raw(&self, sql: &str, params: &[&dyn rusqlite::types::ToSql]) -> std::result::Result<u64, HaQLiteError> {
         let conn_arc = if self.inner.shared_turbolite_vfs.is_some() {
             self.inner.ensure_turbolite_conn()?
         } else {
@@ -1564,15 +1530,18 @@ impl HaQLite {
         let conn = conn_arc.lock()
             .map_err(|_| HaQLiteError::DatabaseError("write connection lock poisoned".into()))?;
 
-        let values: Vec<rusqlite::types::Value> = params.iter().map(|p| p.to_rusqlite()).collect();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            values.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-
         let rows = conn
-            .execute(sql, param_refs.as_slice())
+            .execute(sql, params)
             .map_err(|e| HaQLiteError::DatabaseError(format!("execute failed: {e}")))?;
 
         Ok(rows as u64)
+    }
+
+    fn execute_local(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
+        let values: Vec<rusqlite::types::Value> = params.iter().map(|p| p.to_rusqlite()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            values.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        self.execute_local_raw(sql, &param_refs)
     }
 
     /// Refresh leader address from the Coordinator (which tracks lease changes).
