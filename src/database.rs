@@ -776,11 +776,18 @@ impl HaQLiteInner {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap_or_else(|_| "unknown".to_string());
         if current_mode == "off" {
-            new_conn.execute_batch("PRAGMA journal_mode=DELETE;")
+            // S3Primary: use DELETE mode so xSync fires on every commit.
+            // synchronous=FULL ensures data is flushed before xSync uploads to S3.
+            new_conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;")
                 .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma DELETE: {}", e)))?;
         } else if current_mode != "wal" && current_mode != "delete" && current_mode != "memory" {
+            // WAL mode (Replicated/Eventual): NORMAL is safe because walrust provides durability.
             new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")
                 .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma WAL: {}", e)))?;
+        } else if current_mode == "delete" {
+            // Already in DELETE mode (S3Primary reopened): ensure FULL sync.
+            new_conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;")
+                .map_err(|e| HaQLiteError::DatabaseError(format!("pragma sync FULL: {}", e)))?;
         }
 
         let arc = Arc::new(Mutex::new(new_conn));
