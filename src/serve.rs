@@ -75,12 +75,14 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
         ..Default::default()
     };
 
-    // Parse mode from env or config.
+    // Parse mode from env or config. Reject invalid values (no silent fallbacks).
     let mode_str = std::env::var("HAQLITE_MODE")
-        .unwrap_or_else(|_| serve.mode.clone());
+        .unwrap_or_else(|_| serve.mode.clone())
+        .to_lowercase();
     let ha_mode = match mode_str.as_str() {
+        "dedicated" => HaMode::Dedicated,
         "shared" => HaMode::Shared,
-        _ => HaMode::Dedicated,
+        other => anyhow::bail!("invalid HAQLITE_MODE '{other}' (expected 'dedicated' or 'shared')"),
     };
 
     // Build HaQLite.

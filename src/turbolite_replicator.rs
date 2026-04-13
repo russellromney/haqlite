@@ -103,6 +103,7 @@ pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> StorageManifest {
                     .map(|e| HaFrameEntry {
                         offset: e.offset,
                         len: e.len,
+                        page_count: 0,
                     })
                     .collect()
             })
@@ -145,6 +146,7 @@ pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> StorageManifest {
                                 entry: HaFrameEntry {
                                     offset: v.entry.offset,
                                     len: v.entry.len,
+                                    page_count: 0,
                                 },
                             },
                         )
@@ -171,7 +173,7 @@ pub fn turbolite_walrust_to_ha_storage(
         strategy: format!("{:?}", m.strategy),
         page_group_keys: m.page_group_keys.clone(),
         frame_tables: m.frame_tables.iter().map(|ft| {
-            ft.iter().map(|e| HaFrameEntry { offset: e.offset, len: e.len }).collect()
+            ft.iter().map(|e| HaFrameEntry { offset: e.offset, len: e.len, page_count: 0 }).collect()
         }).collect(),
         group_pages: m.group_pages.clone(),
         btrees: m.btrees.iter().map(|(k, v)| {
@@ -181,7 +183,7 @@ pub fn turbolite_walrust_to_ha_storage(
         index_chunk_keys: m.index_chunk_keys.iter().map(|(k, v)| (*k, v.clone())).collect(),
         subframe_overrides: m.subframe_overrides.iter().map(|ovs| {
             ovs.iter().map(|(k, v)| {
-                (*k, HaSubframeOverride { key: v.key.clone(), entry: HaFrameEntry { offset: v.entry.offset, len: v.entry.len } })
+                (*k, HaSubframeOverride { key: v.key.clone(), entry: HaFrameEntry { offset: v.entry.offset, len: v.entry.len, page_count: 0 } })
             }).collect()
         }).collect(),
         db_header: m.db_header.clone(),

@@ -56,32 +56,9 @@ const DEFAULT_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 const ROLE_LEADER: u8 = 0;
 const ROLE_FOLLOWER: u8 = 1;
 
-/// Topology: how nodes coordinate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HaMode {
-    /// Single persistent leader. Followers replay WAL. Write forwarding.
-    #[default]
-    Dedicated,
-    /// Multiple writers, lease-serialized. No forwarding.
-    /// For Lambda, Fly scale-to-zero, and other ephemeral compute.
-    Shared,
-}
-
-/// Durability: how writes become durable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Durability {
-    /// Plain SQLite + walrust WAL shipping. No durable sync VFS.
-    /// Valid with Dedicated topology only.
-    #[default]
-    Replicated,
-    /// turbolite S3Primary. Every write uploaded to S3 atomically.
-    /// Valid with both Dedicated and Shared topology.
-    Synchronous,
-    /// turbolite S3 + walrust WAL shipping between checkpoints.
-    /// Periodic checkpoint flushes page groups; WAL frames fill the gap.
-    /// Valid with both Dedicated and Shared topology.
-    Eventual,
-}
+// Re-export canonical mode/durability types from hadb.
+// Shared across haqlite and hakuzu for consistent validation.
+pub use hadb::{Durability, HaMode, validate_mode_durability};
 
 /// Builder for creating an HA SQLite instance.
 ///
@@ -444,7 +421,7 @@ impl HaQLiteBuilder {
                         cache_dir,
                         endpoint_url: self.endpoint.clone(),
                         region: Some(std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string())),
-                        sync_mode: turbolite::tiered::SyncMode::S3Primary,
+                        sync_mode: turbolite::tiered::SyncMode::Durable,
                         eager_index_load: false,
                         #[cfg(feature = "cloud")]
                         runtime_handle: Some(tokio::runtime::Handle::current()),
