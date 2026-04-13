@@ -17,14 +17,14 @@ async fn connection_basic_usage() {
 
     let conn = db.connection().expect("connection");
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard
             .execute("INSERT INTO users (name) VALUES (?1)", rusqlite::params!["Alice"])
             .expect("insert");
     }
 
     let count: i64 = {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard
             .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
             .expect("query")
@@ -39,7 +39,7 @@ async fn connection_transaction() {
 
     let conn = db.connection().expect("connection");
     {
-        let mut guard = conn.lock().unwrap();
+        let mut guard = conn.lock();
         let tx = guard.transaction().expect("begin");
         tx.execute("INSERT INTO users (name) VALUES (?1)", rusqlite::params!["Bob"])
             .expect("insert 1");
@@ -49,7 +49,7 @@ async fn connection_transaction() {
     }
 
     let count: i64 = {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard
             .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
             .expect("query")
@@ -65,14 +65,14 @@ async fn connection_transaction_rollback() {
     let conn = db.connection().expect("connection");
 
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard
             .execute("INSERT INTO users (name) VALUES (?1)", rusqlite::params!["Dave"])
             .expect("insert");
     }
 
     {
-        let mut guard = conn.lock().unwrap();
+        let mut guard = conn.lock();
         let tx = guard.transaction().expect("begin");
         tx.execute("INSERT INTO users (name) VALUES (?1)", rusqlite::params!["Eve"])
             .expect("insert in tx");
@@ -80,7 +80,7 @@ async fn connection_transaction_rollback() {
     }
 
     let count: i64 = {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard
             .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
             .expect("query")
@@ -104,7 +104,7 @@ async fn connection_prepared_statement_and_column_metadata() {
     let db = HaQLite::local(&path, SCHEMA).expect("local");
 
     let conn = db.connection().expect("connection");
-    let guard = conn.lock().unwrap();
+    let guard = conn.lock();
 
     guard
         .execute("INSERT INTO users (name) VALUES (?1)", rusqlite::params!["Frank"])
@@ -130,7 +130,7 @@ async fn connection_empty_table() {
     let db = HaQLite::local(&path, SCHEMA).expect("local");
 
     let conn = db.connection().expect("connection");
-    let guard = conn.lock().unwrap();
+    let guard = conn.lock();
     let count: i64 = guard
         .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
         .expect("query");
@@ -150,7 +150,7 @@ async fn fence_blocks_writes() {
 
     // Insert works before fencing
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard
             .execute("INSERT INTO users (name) VALUES (?1)", rusqlite::params!["Alice"])
             .expect("insert should succeed before fence");
@@ -161,14 +161,14 @@ async fn fence_blocks_writes() {
 
     // Writes should fail
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         let result = guard.execute("INSERT INTO users (name) VALUES (?1)", rusqlite::params!["Bob"]);
         assert!(result.is_err(), "insert should fail after fence");
     }
 
     // Reads should still work
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         let count: i64 = guard
             .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
             .expect("read should succeed after fence");
@@ -187,7 +187,7 @@ async fn unfence_allows_writes_again() {
 
     // Writes blocked
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         assert!(guard.execute("INSERT INTO users (name) VALUES (?1)", rusqlite::params!["Alice"]).is_err());
     }
 
@@ -195,14 +195,14 @@ async fn unfence_allows_writes_again() {
 
     // Writes allowed again
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard
             .execute("INSERT INTO users (name) VALUES (?1)", rusqlite::params!["Bob"])
             .expect("insert should succeed after unfence");
     }
 
     let count: i64 = {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).expect("count")
     };
     assert_eq!(count, 1); // only Bob (Alice's insert was denied)
@@ -216,7 +216,7 @@ async fn fence_blocks_ddl() {
     let conn = db.connection().expect("connection");
     db.fence();
 
-    let guard = conn.lock().unwrap();
+    let guard = conn.lock();
 
     // CREATE TABLE blocked
     assert!(guard.execute_batch("CREATE TABLE other (id INTEGER)").is_err());
@@ -240,7 +240,7 @@ async fn fence_blocks_transactions() {
 
     // Insert a row first
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard.execute("INSERT INTO users (name) VALUES (?1)", rusqlite::params!["Alice"]).expect("insert");
     }
 
@@ -248,7 +248,7 @@ async fn fence_blocks_transactions() {
 
     // Transaction with write should fail
     {
-        let mut guard = conn.lock().unwrap();
+        let mut guard = conn.lock();
         // BEGIN itself might succeed (it's a savepoint), but the INSERT inside should fail
         let tx = guard.transaction();
         match tx {
@@ -264,7 +264,7 @@ async fn fence_blocks_transactions() {
 
     // Data unchanged
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         let count: i64 = guard.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).expect("count");
         assert_eq!(count, 1); // only Alice
     }
@@ -277,14 +277,14 @@ async fn fence_blocks_update() {
     let conn = db.connection().expect("connection");
 
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard.execute("INSERT INTO users (name) VALUES (?1)", rusqlite::params!["Alice"]).expect("insert");
     }
 
     db.fence();
 
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         let result = guard.execute("UPDATE users SET name = ?1 WHERE id = 1", rusqlite::params!["Bob"]);
         assert!(result.is_err(), "UPDATE should be blocked when fenced");
 
@@ -300,14 +300,14 @@ async fn fence_blocks_delete() {
     let conn = db.connection().expect("connection");
 
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard.execute("INSERT INTO users (name) VALUES (?1)", rusqlite::params!["Alice"]).expect("insert");
     }
 
     db.fence();
 
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         let result = guard.execute("DELETE FROM users WHERE id = 1", []);
         assert!(result.is_err(), "DELETE should be blocked when fenced");
 
@@ -324,7 +324,7 @@ async fn fence_blocks_pragma_writes() {
 
     db.fence();
 
-    let guard = conn.lock().unwrap();
+    let guard = conn.lock();
     assert!(guard.execute_batch("PRAGMA user_version = 42").is_err(), "PRAGMA write should be blocked");
 }
 
@@ -336,7 +336,7 @@ async fn fence_blocks_attach() {
 
     db.fence();
 
-    let guard = conn.lock().unwrap();
+    let guard = conn.lock();
     assert!(guard.execute_batch("ATTACH DATABASE ':memory:' AS other").is_err(), "ATTACH should be blocked");
 }
 
@@ -347,13 +347,13 @@ async fn fence_blocks_replace() {
     let conn = db.connection().expect("connection");
 
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')", []).expect("insert");
     }
 
     db.fence();
 
-    let guard = conn.lock().unwrap();
+    let guard = conn.lock();
     assert!(guard.execute("REPLACE INTO users (id, name) VALUES (1, 'Bob')", []).is_err(), "REPLACE should be blocked");
 }
 
@@ -364,13 +364,13 @@ async fn fence_allows_selects() {
     let conn = db.connection().expect("connection");
 
     {
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard.execute("INSERT INTO users (name) VALUES (?1)", rusqlite::params!["Alice"]).expect("insert");
     }
 
     db.fence();
 
-    let guard = conn.lock().unwrap();
+    let guard = conn.lock();
     let count: i64 = guard.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).expect("select");
     assert_eq!(count, 1);
 

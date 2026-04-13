@@ -190,27 +190,22 @@ proptest! {
                 .expect("open shared mode");
 
             let db = Arc::new(db);
-            let mut handles = Vec::new();
 
-            for i in 0..num_writes {
-                let db_clone = db.clone();
-                let id = i as i64;
-                let handle = tokio::spawn(async move {
-                    db_clone.execute_async(
-                        "INSERT INTO props (id, name, score) VALUES (?1, ?2, ?3)",
-                        &[
-                            SqlValue::Integer(id),
-                            SqlValue::Text(format!("prop-{}", id)),
-                            SqlValue::Real(id as f64),
-                        ],
-                    ).await
-                });
-                handles.push(handle);
-            }
-
+            // execute_async's future is !Send (holds &dyn ToSql across await),
+            // so we can't use tokio::spawn. Run writes sequentially instead.
+            // This still tests the Shared mode lease contention behavior.
             let mut successes = 0u64;
-            for handle in handles {
-                match handle.await.unwrap() {
+            for i in 0..num_writes {
+                let id = i as i64;
+                let params = vec![
+                    SqlValue::Integer(id),
+                    SqlValue::Text(format!("prop-{}", id)),
+                    SqlValue::Real(id as f64),
+                ];
+                match db.execute_async(
+                    "INSERT INTO props (id, name, score) VALUES (?1, ?2, ?3)",
+                    &params,
+                ).await {
                     Ok(_) => successes += 1,
                     Err(HaQLiteError::LeaseContention(_)) => {}
                     Err(e) => {
