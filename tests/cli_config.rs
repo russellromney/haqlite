@@ -134,14 +134,14 @@ async fn test_query_values_method() {
     let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema)
         .expect("local should open");
 
-    db.execute(
+    db.execute_async(
         "INSERT INTO test (id, name) VALUES (?1, ?2)",
         &[SqlValue::Integer(1), SqlValue::Text("Alice".to_string())],
     )
     .await
     .expect("insert should work");
 
-    db.execute(
+    db.execute_async(
         "INSERT INTO test (id, name) VALUES (?1, ?2)",
         &[SqlValue::Integer(2), SqlValue::Text("Bob".to_string())],
     )
@@ -286,7 +286,7 @@ async fn test_query_values_multi_row() {
         .expect("local should open");
 
     for i in 1..=5 {
-        db.execute(
+        db.execute_async(
             "INSERT INTO test (id, name) VALUES (?1, ?2)",
             &[SqlValue::Integer(i), SqlValue::Text(format!("user_{i}"))],
         )
@@ -343,7 +343,7 @@ async fn test_query_values_null_values() {
         .expect("local should open");
 
     // Insert row with NULL name
-    db.execute(
+    db.execute_async(
         "INSERT INTO test (id, name) VALUES (?1, ?2)",
         &[SqlValue::Integer(1), SqlValue::Null],
     )
@@ -368,7 +368,7 @@ async fn test_query_values_all_types() {
     let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema)
         .expect("local should open");
 
-    db.execute(
+    db.execute_async(
         "INSERT INTO types (i, r, t, b) VALUES (?1, ?2, ?3, ?4)",
         &[
             SqlValue::Integer(42),

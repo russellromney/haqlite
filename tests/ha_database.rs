@@ -69,7 +69,7 @@ async fn single_node_local_mode() {
 
     // Execute a write.
     let rows = db
-        .execute(
+        .execute_async(
             "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
             &[SqlValue::Integer(1), SqlValue::Text("hello".into())],
         )
@@ -130,7 +130,7 @@ async fn single_node_execute_and_query() {
 
     // Execute writes.
     for i in 1..=5 {
-        db.execute(
+        db.execute_async(
             "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
             &[
                 SqlValue::Integer(i),
@@ -208,7 +208,7 @@ async fn two_node_forwarded_write() {
 
     // Write through leader directly.
     leader
-        .execute(
+        .execute_async(
             "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
             &[SqlValue::Integer(1), SqlValue::Text("direct".into())],
         )
@@ -217,7 +217,7 @@ async fn two_node_forwarded_write() {
 
     // Write through follower — should forward to leader.
     follower
-        .execute(
+        .execute_async(
             "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
             &[SqlValue::Integer(2), SqlValue::Text("forwarded".into())],
         )
@@ -281,7 +281,7 @@ async fn forwarding_error_no_leader() {
 
     // Follower should get an error when trying to forward, not hang.
     let result = follower
-        .execute(
+        .execute_async(
             "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
             &[SqlValue::Integer(1), SqlValue::Text("test".into())],
         )
@@ -299,7 +299,7 @@ async fn close_is_clean() {
 
     let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
-    db.execute(
+    db.execute_async(
         "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
         &[SqlValue::Integer(1), SqlValue::Text("test".into())],
     )
@@ -376,7 +376,7 @@ async fn auth_rejects_wrong_secret() {
 
     // Forwarded write should be rejected by the leader.
     let result = follower
-        .execute(
+        .execute_async(
             "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
             &[SqlValue::Integer(1), SqlValue::Text("should-fail".into())],
         )
@@ -447,7 +447,7 @@ async fn auth_accepts_correct_secret() {
 
     // Forwarded write should succeed.
     follower
-        .execute(
+        .execute_async(
             "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
             &[SqlValue::Integer(1), SqlValue::Text("authed".into())],
         )
@@ -631,7 +631,7 @@ async fn error_execute_on_follower_with_dead_leader_returns_leader_unavailable()
     assert_eq!(db.role(), Some(Role::Follower));
 
     let result = db
-        .execute("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
+        .execute_async("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
         .await;
 
     // Must be a leader connection/server error, not a generic error.
@@ -670,7 +670,7 @@ async fn error_execute_bad_sql_returns_database_error() {
     let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     let result = db
-        .execute("INSERT INTO nonexistent (x) VALUES (1)", &[])
+        .execute_async("INSERT INTO nonexistent (x) VALUES (1)", &[])
         .await;
 
     match result {
@@ -735,7 +735,7 @@ async fn retry_forwarding_does_not_retry_4xx() {
 
     let start = std::time::Instant::now();
     let result = follower
-        .execute("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
+        .execute_async("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
         .await;
     let elapsed = start.elapsed();
 
@@ -787,7 +787,7 @@ async fn retry_forwarding_succeeds_on_first_attempt() {
 
     let start = std::time::Instant::now();
     follower
-        .execute(
+        .execute_async(
             "INSERT INTO test_data (id, value) VALUES (1, 'fast')",
             &[],
         )
@@ -839,7 +839,7 @@ async fn retry_forwarding_retries_on_connection_error() {
 
     let start = std::time::Instant::now();
     let result = db
-        .execute("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
+        .execute_async("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
         .await;
     let elapsed = start.elapsed();
 
@@ -868,7 +868,7 @@ async fn semaphore_does_not_block_leader_reads() {
     let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     // Leader reads should work regardless of semaphore state.
-    db.execute("INSERT INTO test_data (id, value) VALUES (1, 'a')", &[])
+    db.execute_async("INSERT INTO test_data (id, value) VALUES (1, 'a')", &[])
         .await
         .unwrap();
 
@@ -887,7 +887,7 @@ async fn semaphore_query_values_also_bounded() {
     let db_path = tmp.path().join("sem.db");
     let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
-    db.execute("INSERT INTO test_data (id, value) VALUES (1, 'a')", &[])
+    db.execute_async("INSERT INTO test_data (id, value) VALUES (1, 'a')", &[])
         .await
         .unwrap();
 
@@ -909,7 +909,7 @@ async fn close_then_reopen_preserves_data() {
 
     let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
     for i in 1..=10 {
-        db.execute(
+        db.execute_async(
             "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
             &[SqlValue::Integer(i), SqlValue::Text(format!("row-{i}"))],
         )
@@ -942,7 +942,7 @@ async fn close_ha_node_is_clean() {
     .await
     .unwrap();
 
-    db.execute("INSERT INTO test_data (id, value) VALUES (1, 'a')", &[])
+    db.execute_async("INSERT INTO test_data (id, value) VALUES (1, 'a')", &[])
         .await
         .unwrap();
 
@@ -964,7 +964,7 @@ async fn execute_empty_params() {
     let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
     // Execute with no params.
-    db.execute("INSERT INTO test_data (id, value) VALUES (1, 'bare')", &[])
+    db.execute_async("INSERT INTO test_data (id, value) VALUES (1, 'bare')", &[])
         .await
         .unwrap();
 
@@ -1019,7 +1019,7 @@ async fn error_not_leader_when_no_address() {
     assert_eq!(db.role(), Some(Role::Follower));
 
     let result = db
-        .execute("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
+        .execute_async("INSERT INTO test_data (id, value) VALUES (1, 'x')", &[])
         .await;
 
     // Should be NotLeader (empty address), not LeaderConnectionError (connection failed).
@@ -1173,7 +1173,7 @@ async fn regression_close_completes_fully() {
     .await
     .unwrap();
 
-    db.execute("INSERT INTO test_data (id, value) VALUES (1, 'test')", &[])
+    db.execute_async("INSERT INTO test_data (id, value) VALUES (1, 'test')", &[])
         .await
         .unwrap();
 
@@ -1223,7 +1223,7 @@ async fn handoff_ha_leader_succeeds() {
     assert_eq!(db.role(), Some(Role::Leader));
 
     // Write some data first.
-    db.execute("INSERT INTO test_data (id, value) VALUES (1, 'before-handoff')", &[])
+    db.execute_async("INSERT INTO test_data (id, value) VALUES (1, 'before-handoff')", &[])
         .await
         .unwrap();
 
@@ -1253,7 +1253,7 @@ async fn handoff_preserves_data() {
 
     // Write data, handoff, verify data still readable locally.
     for i in 1..=5 {
-        db.execute(
+        db.execute_async(
             "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
             &[SqlValue::Integer(i), SqlValue::Text(format!("row-{i}"))],
         )

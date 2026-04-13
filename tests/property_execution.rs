@@ -55,7 +55,7 @@ proptest! {
             let db_path = tmp.path().join("leader_prop.db");
             let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
-            let result = db.execute(
+            let result = db.execute_async(
                 "INSERT INTO props (id, name, score) VALUES (?1, ?2, ?3)",
                 &[
                     SqlValue::Integer(id),
@@ -104,7 +104,7 @@ proptest! {
             let mut db = HaQLite::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
 
             for i in 0..initial_rows as i64 {
-                db.execute(
+                db.execute_async(
                     "INSERT INTO props (id, name, score) VALUES (?1, ?2, ?3)",
                     &[
                         SqlValue::Integer(i),
@@ -196,7 +196,7 @@ proptest! {
                 let db_clone = db.clone();
                 let id = i as i64;
                 let handle = tokio::spawn(async move {
-                    db_clone.execute(
+                    db_clone.execute_async(
                         "INSERT INTO props (id, name, score) VALUES (?1, ?2, ?3)",
                         &[
                             SqlValue::Integer(id),
