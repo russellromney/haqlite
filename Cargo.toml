@@ -1,6 +1,6 @@
 [package]
 name = "haqlite"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "HA SQLite with one line of code. Leader election, WAL replication, write forwarding — just your app + an S3 bucket."
 authors = ["Russell Romney <russellromney@gmail.com>"]
@@ -57,7 +57,7 @@ hadb-manifest-nats = { path = "../hadb/hadb-manifest-nats", version = "0.4.0", o
 hadb-manifest-s3 = { path = "../hadb/hadb-manifest-s3", version = "0.4.0", optional = true }
 
 # Turbolite VFS (optional storage engine)
-turbolite = { path = "../turbolite", version = "0.3.0", features = ["tiered", "zstd"] }
+turbolite = { path = "../turbolite", version = "0.4.0", features = ["tiered", "zstd"] }
 
 # Shared CLI framework
 hadb-cli = { path = "../hadb/hadb-cli", version = "0.4.0" }
