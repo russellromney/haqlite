@@ -99,8 +99,10 @@ pub struct HaQLiteBuilder {
     walrust_storage: Option<Arc<dyn walrust::StorageBackend>>,
     lease_ttl: Option<u64>,
     turbolite_vfs: Option<(turbolite::tiered::SharedTurboliteVfs, String)>,
-    cinch_endpoint: Option<String>,
-    cinch_token: Option<String>,
+    /// HTTP endpoint + token for turbolite page storage through a proxy.
+    /// The proxy handles S3 tiering and fence enforcement.
+    /// Haqlite adds the fence token (from the Coordinator lease) internally.
+    turbolite_http: Option<(String, String)>,
     authorizer: Option<AuthorizerFactory>,
 }
 
@@ -126,8 +128,7 @@ impl HaQLiteBuilder {
             walrust_storage: None,
             lease_ttl: None,
             turbolite_vfs: None,
-            cinch_endpoint: std::env::var("CINCH_ENDPOINT").ok(),
-            cinch_token: std::env::var("CINCH_TOKEN").ok(),
+            turbolite_http: None,
             authorizer: None,
         }
     }
@@ -238,6 +239,19 @@ impl HaQLiteBuilder {
         ))
     }
 
+    /// Route turbolite page storage through an HTTP proxy.
+    ///
+    /// The proxy handles S3 tiering and fence enforcement. Haqlite adds the
+    /// fence token (from the Coordinator lease) to the turbolite StorageBackend
+    /// internally, since it's not available until the Coordinator is created.
+    ///
+    /// For lease, manifest, and walrust storage, use the dedicated builder
+    /// methods: `.lease_endpoint()`, `.manifest_endpoint()`, `.walrust_storage()`.
+    pub fn turbolite_http(mut self, endpoint: &str, token: &str) -> Self {
+        self.turbolite_http = Some((endpoint.to_string(), token.to_string()));
+        self
+    }
+
     /// Manifest polling interval for Shared mode. Default: 1s.
     pub fn manifest_poll_interval(mut self, interval: Duration) -> Self {
         self.manifest_poll_interval = Some(interval);
@@ -311,16 +325,6 @@ impl HaQLiteBuilder {
             detect_address(&instance_id, self.forwarding_port)
         });
 
-        // Validate CINCH_ENDPOINT and CINCH_TOKEN: both or neither.
-        if self.cinch_endpoint.is_some() != self.cinch_token.is_some() {
-            return Err(anyhow::anyhow!(
-                "CINCH_ENDPOINT and CINCH_TOKEN must both be set or both be unset. \
-                 Got CINCH_ENDPOINT={}, CINCH_TOKEN={}",
-                if self.cinch_endpoint.is_some() { "set" } else { "unset" },
-                if self.cinch_token.is_some() { "set" } else { "unset" },
-            ));
-        }
-
         // Validate topology + durability combination.
         // Shared mode only supports Synchronous durability. Multiple concurrent
         // writers need every write to go through S3 so each writer always sees
@@ -345,15 +349,9 @@ impl HaQLiteBuilder {
             Some(storage) => Some(storage),
             None => {
                 if self.mode == HaMode::Dedicated {
-                    if let (Some(ref endpoint), Some(ref token)) = (&self.cinch_endpoint, &self.cinch_token) {
-                        Some(Arc::new(
-                            hadb_io::HttpObjectStore::new(endpoint, token, "wal", fence_token.clone()),
-                        ))
-                    } else {
-                        Some(Arc::new(
-                            walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
-                        ))
-                    }
+                    Some(Arc::new(
+                        walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
+                    ))
                 } else {
                     None
                 }
@@ -369,8 +367,9 @@ impl HaQLiteBuilder {
         // Build coordinator config.
         let mut config = self.coordinator_config.unwrap_or_default();
         config.lease = Some(LeaseConfig::new(instance_id.clone(), address.clone()));
-        // Pass the fence token so DbLease updates it on acquire/renew.
-        if self.cinch_endpoint.is_some() {
+        // Pass the fence token so DbLease updates it on acquire/renew
+        // when using HTTP storage (proxy enforces fence on writes).
+        if self.turbolite_http.is_some() {
             config.fence_token = Some(fence_token.clone());
         }
 
@@ -404,20 +403,23 @@ impl HaQLiteBuilder {
                         .join(".haqlite_cache");
                     std::fs::create_dir_all(&cache_dir)?;
                     let tl_prefix = format!("{}tl", self.prefix);
-                    let storage_backend = if let (Some(ref ep), Some(ref tok)) = (&self.cinch_endpoint, &self.cinch_token) {
-                        turbolite::tiered::StorageBackend::Http {
+                    let (storage_backend, tl_config_prefix) = if let Some((ref ep, ref tok)) = self.turbolite_http {
+                        // Http mode: prefix is just "tl" because the HTTP proxy
+                        // scopes by database_id automatically (prepends database_id/).
+                        (turbolite::tiered::StorageBackend::Http {
                             endpoint: ep.clone(),
                             token: tok.clone(),
-                            prefix: tl_prefix.clone(),
+                            prefix: "tl".to_string(),
                             fence_token: fence_token.clone(),
-                        }
+                        }, tl_prefix.clone())
                     } else {
-                        turbolite::tiered::StorageBackend::default() // auto-upgrades to S3 if bucket is set
+                        // S3-direct mode: prefix includes database_id for scoping.
+                        (turbolite::tiered::StorageBackend::default(), tl_prefix.clone())
                     };
                     let tl_config = turbolite::tiered::TurboliteConfig {
                         storage_backend,
                         bucket: self.bucket.clone(),
-                        prefix: tl_prefix,
+                        prefix: tl_config_prefix,
                         cache_dir,
                         endpoint_url: self.endpoint.clone(),
                         region: Some(std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string())),
@@ -507,20 +509,20 @@ impl HaQLiteBuilder {
                         // turbolite gets its own sub-prefix to avoid key collisions
                         // with haqlite lease/manifest keys.
                         let tl_prefix = format!("{}tl", self.prefix);
-                        let storage_backend = if let (Some(ref ep), Some(ref tok)) = (&self.cinch_endpoint, &self.cinch_token) {
-                            turbolite::tiered::StorageBackend::Http {
+                        let (storage_backend, tl_config_prefix) = if let Some((ref ep, ref tok)) = self.turbolite_http {
+                            (turbolite::tiered::StorageBackend::Http {
                                 endpoint: ep.clone(),
                                 token: tok.clone(),
-                                prefix: tl_prefix.clone(),
+                                prefix: "tl".to_string(),
                                 fence_token: fence_token.clone(),
-                            }
+                            }, tl_prefix.clone())
                         } else {
-                            turbolite::tiered::StorageBackend::default()
+                            (turbolite::tiered::StorageBackend::default(), tl_prefix.clone())
                         };
                         let config = turbolite::tiered::TurboliteConfig {
                             storage_backend,
                             bucket: self.bucket.clone(),
-                            prefix: tl_prefix,
+                            prefix: tl_config_prefix,
                             cache_dir,
                             endpoint_url: self.endpoint.clone(),
                             region: Some(std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string())),
@@ -910,9 +912,11 @@ impl HaQLite {
         match self.inner.mode {
             HaMode::Shared => {
                 // Shared mode requires async (lease acquisition). Use the tokio handle.
+                // block_in_place moves the task off the async worker thread so block_on
+                // doesn't panic. Safe from both async and spawn_blocking contexts.
                 let handle = tokio::runtime::Handle::try_current()
                     .map_err(|_| HaQLiteError::DatabaseError("execute in Shared mode requires tokio runtime".into()))?;
-                handle.block_on(self.execute_shared(sql, params))
+                tokio::task::block_in_place(|| handle.block_on(self.execute_shared(sql, params)))
             }
             HaMode::Dedicated => {
                 let role = self.inner.current_role();
@@ -923,7 +927,7 @@ impl HaQLite {
                     Some(Role::Follower) => {
                         let handle = tokio::runtime::Handle::try_current()
                             .map_err(|_| HaQLiteError::DatabaseError("execute forwarding requires tokio runtime".into()))?;
-                        handle.block_on(self.execute_forwarded(sql, params))
+                        tokio::task::block_in_place(|| handle.block_on(self.execute_forwarded(sql, params)))
                     }
                 }
             }
@@ -1158,6 +1162,17 @@ impl HaQLite {
     /// Allow writes again. Called automatically on promotion.
     pub fn unfence(&self) {
         self.inner.unfence_connection();
+    }
+
+    /// Get the turbolite VFS name (if using Synchronous durability).
+    /// Callers can open their own read-only connections on this VFS for lock-free reads.
+    pub fn vfs_name(&self) -> Option<&str> {
+        self.inner.shared_turbolite_vfs_name.as_deref()
+    }
+
+    /// Get the database file path.
+    pub fn db_path(&self) -> &Path {
+        &self.inner.db_path
     }
 
     /// Subscribe to role change events.
