@@ -164,7 +164,7 @@ async fn custom_lease_store_is_used() {
 
     // Execute a write to make sure the DB works with this lease store.
     let rows = db
-        .execute(
+        .execute_async(
             "INSERT INTO lease_test (id, value) VALUES (?1, ?2)",
             &[SqlValue::Integer(1), SqlValue::Text("custom".into())],
         )
@@ -329,7 +329,7 @@ async fn two_nodes_custom_lease_store() {
 
     // Write on leader.
     leader
-        .execute(
+        .execute_async(
             "INSERT INTO lease_test (id, value) VALUES (?1, ?2)",
             &[SqlValue::Integer(1), SqlValue::Text("shared".into())],
         )
@@ -375,7 +375,7 @@ async fn default_lease_store_still_works() {
 
     assert_eq!(db.role(), Some(haqlite::Role::Leader));
 
-    db.execute(
+    db.execute_async(
         "INSERT INTO lease_test (id, value) VALUES (?1, ?2)",
         &[SqlValue::Integer(1), SqlValue::Text("default".into())],
     )
@@ -451,7 +451,7 @@ async fn nats_lease_store_integration() {
 
     assert_eq!(db.role(), Some(haqlite::Role::Leader));
 
-    db.execute(
+    db.execute_async(
         "INSERT INTO lease_test (id, value) VALUES (?1, ?2)",
         &[SqlValue::Integer(1), SqlValue::Text("nats".into())],
     )

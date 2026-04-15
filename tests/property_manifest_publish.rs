@@ -84,7 +84,7 @@ proptest! {
                 let success_count = success_count.clone();
                 let key = idx as i64;
                 let handle = tokio::spawn(async move {
-                    let result = db.execute(
+                    let result = db.execute_async(
                         "INSERT INTO kv (k, v) VALUES (?1, ?2)",
                         &[
                             SqlValue::Integer(key),
@@ -108,8 +108,8 @@ proptest! {
             // Check turbolite VFS manifest version from the last writer that succeeded.
             // Each successful write bumps the VFS manifest version via xSync.
             let max_vfs_version = dbs.iter()
-                .map(|(db, _)| db.connection().unwrap().lock().unwrap()
-                    .query_row("SELECT COUNT(*) FROM kv", [], |r| r.get::<_, i64>(0))
+                .map(|(db, _)| db.connection().unwrap().lock()
+                    .query_row("SELECT COUNT(*) FROM kv", [], |r: &rusqlite::Row| r.get::<_, i64>(0))
                     .unwrap_or(0) as u64)
                 .max()
                 .unwrap_or(0);

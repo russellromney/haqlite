@@ -80,7 +80,7 @@ async fn turbolite_shared_single_write_read() {
 
     // Write
     let rows = db
-        .execute(
+        .execute_async(
             "INSERT INTO t (id, val) VALUES (?1, ?2)",
             &[SqlValue::Integer(1), SqlValue::Text("hello".into())],
         )
@@ -112,7 +112,7 @@ async fn turbolite_shared_manifest_published_after_write() {
     )
     .await;
 
-    db.execute(
+    db.execute_async(
         "INSERT INTO t (id, val) VALUES (?1, ?2)",
         &[SqlValue::Integer(1), SqlValue::Text("world".into())],
     )
@@ -158,7 +158,7 @@ async fn turbolite_shared_sequential_writes_increment_manifest() {
     .await;
 
     for i in 0..3 {
-        db.execute(
+        db.execute_async(
             "INSERT INTO t (id, val) VALUES (?1, ?2)",
             &[SqlValue::Integer(i), SqlValue::Text(format!("v{}", i))],
         )
@@ -200,7 +200,7 @@ async fn turbolite_shared_manifest_has_turbolite_fields() {
     )
     .await;
 
-    db.execute(
+    db.execute_async(
         "INSERT INTO t (id, val) VALUES (?1, ?2)",
         &[SqlValue::Integer(1), SqlValue::Text("data".into())],
     )
@@ -348,7 +348,7 @@ async fn turbolite_shared_manifest_writer_id_set() {
     )
     .await;
 
-    db.execute(
+    db.execute_async(
         "INSERT INTO t (id, val) VALUES (1, 'x')",
         &[],
     )

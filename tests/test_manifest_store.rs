@@ -97,7 +97,7 @@ async fn dedicated_mode_with_manifest_store() {
         .await
         .expect("open dedicated mode with manifest store");
 
-    db.execute(
+    db.execute_async(
         "INSERT INTO manifest_test (id, value) VALUES (?1, ?2)",
         &[SqlValue::Integer(1), SqlValue::Text("hello".into())],
     )
@@ -130,7 +130,7 @@ async fn dedicated_mode_without_manifest_store_still_works() {
         .await
         .expect("open dedicated mode without manifest store");
 
-    db.execute(
+    db.execute_async(
         "INSERT INTO manifest_test (id, value) VALUES (?1, ?2)",
         &[SqlValue::Integer(1), SqlValue::Text("works".into())],
     )
@@ -180,7 +180,7 @@ async fn shared_mode_manifest_published_on_write() {
     assert!(meta.is_none(), "no manifest before first write");
 
     // Write triggers manifest publish
-    db.execute(
+    db.execute_async(
         "INSERT INTO manifest_test (id, value) VALUES (?1, ?2)",
         &[SqlValue::Integer(1), SqlValue::Text("shared".into())],
     )
@@ -221,7 +221,7 @@ async fn shared_mode_sequential_writes_increment_manifest_version() {
         .expect("open");
 
     for i in 0..3 {
-        db.execute(
+        db.execute_async(
             "INSERT INTO manifest_test (id, value) VALUES (?1, ?2)",
             &[SqlValue::Integer(i), SqlValue::Text(format!("v{}", i))],
         )
@@ -271,7 +271,7 @@ async fn shared_mode_two_writers_see_each_others_data() {
         .expect("open db1");
 
     // Writer 1 writes
-    db1.execute(
+    db1.execute_async(
         "INSERT INTO manifest_test (id, value) VALUES (?1, ?2)",
         &[SqlValue::Integer(1), SqlValue::Text("from_writer_1".into())],
     )
@@ -297,7 +297,7 @@ async fn shared_mode_two_writers_see_each_others_data() {
         .await
         .expect("open db2");
 
-    db2.execute(
+    db2.execute_async(
         "INSERT INTO manifest_test (id, value) VALUES (?1, ?2)",
         &[SqlValue::Integer(2), SqlValue::Text("from_writer_2".into())],
     )

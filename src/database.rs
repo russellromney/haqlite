@@ -1204,7 +1204,7 @@ impl HaQLite {
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = haqlite::HaQLite::builder("bucket").open("/data/my.db", "").await?;
     /// let conn = db.connection()?;
-    /// let guard = conn.lock().unwrap();
+    /// let guard = conn.lock();
     /// guard.execute("INSERT INTO users (name) VALUES (?1)", ["Alice"])?;
     /// let count: i64 = guard.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
     /// # Ok(())

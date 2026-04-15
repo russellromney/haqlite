@@ -307,7 +307,7 @@ async fn test_follower_hrana_read() {
 
     // Write data directly through leader's native API (bypasses hrana)
     leader
-        .execute(
+        .execute_async(
             "INSERT INTO t (id, name) VALUES (?1, ?2)",
             &[
                 haqlite::SqlValue::Integer(1),
@@ -1272,7 +1272,7 @@ async fn test_hrana_and_haqlite_share_database_state() {
     }
 
     // Write through HaQLite native API
-    db.execute(
+    db.execute_async(
         "INSERT INTO t (id, name) VALUES (?1, ?2)",
         &[
             haqlite::SqlValue::Integer(2),
