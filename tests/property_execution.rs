@@ -191,9 +191,8 @@ proptest! {
 
             let db = Arc::new(db);
 
-            // execute_async's future is !Send (holds &dyn ToSql across await),
-            // so we can't use tokio::spawn. Run writes sequentially instead.
-            // This still tests the Shared mode lease contention behavior.
+            // execute_async's future is Send (param_refs scoped to sync branch).
+            // Run writes sequentially to test Shared mode lease contention.
             let mut successes = 0u64;
             for i in 0..num_writes {
                 let id = i as i64;

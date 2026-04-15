@@ -392,15 +392,16 @@ impl HaQLiteBuilder {
                 // both the follower (for manifest polling) and the leader/inner
                 // (for reads, writes, and manifest publishing). S3Primary uses
                 // journal_mode=OFF, so walrust has no WAL to ship.
-                let (follower_behavior, tl_state) = if self.durability == Durability::Synchronous {
+                let (follower_behavior, tl_state, manifest_wakeup) = if self.durability == Durability::Synchronous {
                     let ms: Arc<dyn hadb::ManifestStore> = match self.manifest_store.clone() {
                         Some(ms) => ms,
                         None => resolve_manifest_store_from_env(&self.bucket, self.endpoint.as_deref()).await?,
                     };
                     let vfs_name = format!("haqlite_ded_sync_{}", uuid::Uuid::new_v4());
+                    // Per-database cache dir so turbolite page caches don't collide.
                     let cache_dir = db_path.parent()
                         .unwrap_or_else(|| std::path::Path::new("/tmp"))
-                        .join(".haqlite_cache");
+                        .join(format!(".tl_cache_{}", db_name));
                     std::fs::create_dir_all(&cache_dir)?;
                     let tl_prefix = format!("{}tl", self.prefix);
                     let (storage_backend, tl_config_prefix) = if let Some((ref ep, ref tok)) = self.turbolite_http {
@@ -435,9 +436,11 @@ impl HaQLiteBuilder {
                     turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone())
                         .map_err(|e| anyhow::anyhow!("register VFS: {}", e))?;
 
+                    let manifest_wakeup = Arc::new(tokio::sync::Notify::new());
                     let fb: Arc<dyn hadb::FollowerBehavior> = Arc::new(
                         SqliteFollowerBehavior::new(walrust_storage.clone())
                             .with_turbolite_catchup(shared_vfs.clone())
+                            .with_wakeup(manifest_wakeup.clone())
                     );
                     let ts = Some(DedicatedTurboliteState {
                         manifest_store: ms,
@@ -445,12 +448,12 @@ impl HaQLiteBuilder {
                         vfs_name,
                         prefix: self.prefix.clone(),
                     });
-                    (fb, ts)
+                    (fb, ts, Some(manifest_wakeup))
                 } else {
                     let fb: Arc<dyn hadb::FollowerBehavior> = Arc::new(
                         SqliteFollowerBehavior::new(walrust_storage.clone())
                     );
-                    (fb, None)
+                    (fb, None, None)
                 };
 
                 // Build hadb Coordinator.
@@ -476,6 +479,7 @@ impl HaQLiteBuilder {
                     self.read_concurrency,
                     tl_state,
                     self.authorizer,
+                    manifest_wakeup,
                 )
                 .await
             }
@@ -504,7 +508,7 @@ impl HaQLiteBuilder {
                         let vfs_name = format!("haqlite_auto_{}", uuid::Uuid::new_v4());
                         let cache_dir = db_path.parent()
                             .unwrap_or_else(|| std::path::Path::new("/tmp"))
-                            .join(".haqlite_cache");
+                            .join(format!(".tl_cache_{}", db_name));
                         std::fs::create_dir_all(&cache_dir)?;
                         // turbolite gets its own sub-prefix to avoid key collisions
                         // with haqlite lease/manifest keys.
@@ -566,7 +570,6 @@ impl HaQLiteBuilder {
 /// or `HaQLite::local(path, schema)?` for single-node mode.
 pub struct HaQLite {
     inner: Arc<HaQLiteInner>,
-    _fwd_handle: tokio::task::JoinHandle<()>,
     _role_handle: tokio::task::JoinHandle<()>,
     closed: bool,
 }
@@ -576,7 +579,7 @@ impl Drop for HaQLite {
         if !self.closed {
             // Abort background tasks so they don't leak.
             // Note: this does NOT cleanly release the lease. Call close().await for that.
-            self._fwd_handle.abort();
+            // Forwarding server is managed by inner (stopped via stop_forwarding_server).
             self._role_handle.abort();
             self.inner.read_semaphore.close();
             tracing::warn!(
@@ -641,11 +644,60 @@ pub(crate) struct HaQLiteInner {
     schema_sql: Option<String>,
     /// Whether schema has been applied on this node.
     schema_applied: AtomicBool,
+    /// Port for the write-forwarding HTTP server.
+    forwarding_port: u16,
+    /// Running forwarding server task. Started when leader, stopped on demotion.
+    fwd_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Custom authorizer factory. If set, used instead of built-in fence/unfence authorizer.
     authorizer: Option<AuthorizerFactory>,
 }
 
 impl HaQLiteInner {
+    /// Start the write-forwarding HTTP server. Only leaders need this.
+    /// Followers send writes to the leader; they don't listen.
+    async fn start_forwarding_server(self: &Arc<Self>) {
+        let mut handle = self.fwd_handle.lock().await;
+        if handle.is_some() {
+            return; // Already running
+        }
+        let fwd_state = Arc::new(ForwardingState {
+            inner: self.clone(),
+        });
+        let fwd_app = axum::Router::new()
+            .route(
+                "/haqlite/execute",
+                axum::routing::post(forwarding::handle_forwarded_execute),
+            )
+            .route(
+                "/haqlite/query",
+                axum::routing::post(forwarding::handle_forwarded_query),
+            )
+            .with_state(fwd_state);
+        match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", self.forwarding_port)).await {
+            Ok(listener) => {
+                let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+                tracing::debug!(db = %self.db_name, port, "Forwarding server started");
+                *handle = Some(tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, fwd_app).await {
+                        tracing::error!("Forwarding server error: {}", e);
+                    }
+                }));
+            }
+            Err(e) => {
+                tracing::error!(db = %self.db_name, "Failed to bind forwarding server: {}", e);
+            }
+        }
+    }
+
+    /// Stop the write-forwarding server (on demotion to follower).
+    async fn stop_forwarding_server(&self) {
+        let mut handle = self.fwd_handle.lock().await;
+        if let Some(h) = handle.take() {
+            h.abort();
+            tracing::debug!(db = %self.db_name, "Forwarding server stopped");
+        }
+    }
+
     /// Get current role (lock-free atomic read).
     pub(crate) fn current_role(&self) -> Option<Role> {
         match self.role.load(Ordering::SeqCst) {
@@ -738,7 +790,12 @@ impl HaQLiteInner {
 
         let vfs_name = self.shared_turbolite_vfs_name.as_ref()
             .ok_or(HaQLiteError::ConfigurationError("VFS name required for turbolite conn".into()))?;
-        let vfs_uri = format!("file:{}?vfs={}", self.db_path.display(), vfs_name);
+        // Use just the filename for the VFS URI. Turbolite's xOpen joins it with
+        // the cache_dir, so passing a full path would create a broken nested path.
+        let db_filename = self.db_path.file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.db_name.clone());
+        let vfs_uri = format!("file:{}?vfs={}", db_filename, vfs_name);
         let new_conn = rusqlite::Connection::open_with_flags(
             &vfs_uri,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -831,6 +888,8 @@ impl HaQLite {
             schema_sql: None,
             schema_applied: AtomicBool::new(true),
             authorizer,
+            forwarding_port: 0,
+            fwd_handle: tokio::sync::Mutex::new(None),
         });
 
         // Apply custom authorizer (unfenced) on initial connection.
@@ -840,12 +899,10 @@ impl HaQLite {
         }
 
         // No forwarding server or role listener in local mode.
-        let fwd_handle = tokio::spawn(async {});
         let role_handle = tokio::spawn(async {});
 
         Ok(HaQLite {
             inner,
-            _fwd_handle: fwd_handle,
             _role_handle: role_handle,
             closed: false,
         })
@@ -897,6 +954,7 @@ impl HaQLite {
             DEFAULT_READ_CONCURRENCY,
             None, // no turbolite state for from_coordinator
             None, // no custom authorizer for from_coordinator
+            None, // no manifest wakeup for from_coordinator
         )
         .await
     }
@@ -936,15 +994,19 @@ impl HaQLite {
 
     /// Async execute for callers already in an async context.
     /// Equivalent to `execute()` but avoids the `block_on` for follower/shared paths.
+    ///
+    /// The returned future is Send, so it can be used with `tokio::spawn`.
     pub async fn execute_async(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
         match self.inner.mode {
             HaMode::Shared => self.execute_shared(sql, params).await,
             HaMode::Dedicated => {
                 let role = self.inner.current_role();
                 match role {
                     Some(Role::Leader) | None => {
+                        // param_refs scoped to this synchronous branch only.
+                        // Keeping it out of the async scope makes the future Send.
+                        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
                         self.execute_local_raw(sql, &param_refs)
                     }
                     Some(Role::Follower) => self.execute_forwarded(sql, params).await,
@@ -997,7 +1059,10 @@ impl HaQLite {
                 // For walrust: open fresh plain SQLite connections (walrust applies
                 // LTX files externally, pooled connections hold stale snapshots).
                 let conn = if let Some(ref vfs_name) = self.inner.shared_turbolite_vfs_name {
-                    let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
+                    let db_filename = self.inner.db_path.file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| self.inner.db_name.clone());
+                    let vfs_uri = format!("file:{}?vfs={}", db_filename, vfs_name);
                     rusqlite::Connection::open_with_flags(
                         &vfs_uri,
                         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -1092,7 +1157,10 @@ impl HaQLite {
                         ),
                     })?;
                 let conn = if let Some(ref vfs_name) = self.inner.shared_turbolite_vfs_name {
-                    let vfs_uri = format!("file:{}?vfs={}", self.inner.db_path.display(), vfs_name);
+                    let db_filename = self.inner.db_path.file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| self.inner.db_name.clone());
+                    let vfs_uri = format!("file:{}?vfs={}", db_filename, vfs_name);
                     rusqlite::Connection::open_with_flags(
                         &vfs_uri,
                         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -1272,8 +1340,8 @@ impl HaQLite {
                 .map_err(|e| HaQLiteError::CoordinatorError(e.to_string()))?;
         }
 
-        // 4. Abort background tasks.
-        self._fwd_handle.abort();
+        // 4. Stop forwarding server and abort background tasks.
+        self.inner.stop_forwarding_server().await;
         self._role_handle.abort();
 
         Ok(())
@@ -1670,6 +1738,7 @@ async fn open_with_coordinator(
     read_concurrency: usize,
     turbolite_state: Option<DedicatedTurboliteState>,
     authorizer: Option<AuthorizerFactory>,
+    manifest_wakeup: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<HaQLite> {
     ensure_schema(&db_path, schema)?;
 
@@ -1729,6 +1798,8 @@ async fn open_with_coordinator(
         schema_sql: None,
         schema_applied: AtomicBool::new(true),
         authorizer,
+        forwarding_port,
+        fwd_handle: tokio::sync::Mutex::new(None),
     });
 
     // If leader, open rw connection.
@@ -1751,38 +1822,21 @@ async fn open_with_coordinator(
         }
     }
 
-    // Spawn forwarding server.
-    let fwd_state = Arc::new(ForwardingState {
-        inner: inner.clone(),
-    });
-    let fwd_app = axum::Router::new()
-        .route(
-            "/haqlite/execute",
-            post(forwarding::handle_forwarded_execute),
-        )
-        .route(
-            "/haqlite/query",
-            post(forwarding::handle_forwarded_query),
-        )
-        .with_state(fwd_state);
-    let fwd_listener =
-        tokio::net::TcpListener::bind(format!("0.0.0.0:{}", forwarding_port)).await?;
-    let fwd_handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(fwd_listener, fwd_app).await {
-            tracing::error!("Forwarding server error: {}", e);
-        }
-    });
+    // Start forwarding server only if we're the leader.
+    // On promotion, the role listener will start it.
+    if initial_role == Role::Leader {
+        inner.start_forwarding_server().await;
+    }
 
     // Spawn role event listener.
     let role_inner = inner.clone();
     let role_address = address.to_string();
     let role_handle = tokio::spawn(async move {
-        run_role_listener(role_rx, role_inner, role_address).await;
+        run_role_listener(role_rx, role_inner, role_address, manifest_wakeup).await;
     });
 
     Ok(HaQLite {
         inner,
-        _fwd_handle: fwd_handle,
         _role_handle: role_handle,
         closed: false,
     })
@@ -1796,6 +1850,7 @@ async fn run_role_listener(
     mut role_rx: tokio::sync::broadcast::Receiver<RoleEvent>,
     inner: Arc<HaQLiteInner>,
     self_address: String,
+    manifest_wakeup: Option<Arc<tokio::sync::Notify>>,
 ) {
     loop {
         match role_rx.recv().await {
@@ -1803,6 +1858,7 @@ async fn run_role_listener(
                 tracing::info!("HaQLite: promoted to leader for '{}'", db_name);
                 inner.set_leader_addr(self_address.clone());
                 inner.set_role(Role::Leader);
+                inner.start_forwarding_server().await;
 
                 if inner.shared_turbolite_vfs.is_some() {
                     // Dedicated+Synchronous: open through turbolite VFS.
@@ -1844,11 +1900,13 @@ async fn run_role_listener(
             }
             Ok(RoleEvent::Demoted { db_name }) => {
                 tracing::error!("HaQLite: demoted from leader for '{}'", db_name);
+                inner.stop_forwarding_server().await;
                 inner.set_role(Role::Follower);
                 inner.fence_connection();
             }
             Ok(RoleEvent::Fenced { db_name }) => {
-                tracing::error!("HaQLite: fenced for '{}' — stopping writes", db_name);
+                tracing::error!("HaQLite: fenced for '{}' -- stopping writes", db_name);
+                inner.stop_forwarding_server().await;
                 inner.set_role(Role::Follower);
                 inner.fence_connection();
             }
@@ -1858,7 +1916,15 @@ async fn run_role_listener(
             }
             Ok(RoleEvent::Joined { .. }) => {}
             Ok(RoleEvent::ManifestChanged { db_name, version }) => {
-                tracing::debug!("manifest changed for '{}' to v{}", db_name, version);
+                if let Some(ref notify) = manifest_wakeup {
+                    tracing::info!(
+                        "HaQLite: manifest changed for '{}' v{}, waking follower loop",
+                        db_name, version
+                    );
+                    notify.notify_one();
+                } else {
+                    tracing::debug!("manifest changed for '{}' to v{}", db_name, version);
+                }
             }
             Err(_) => {
                 tracing::error!("HaQLite: role event channel closed");
@@ -1979,6 +2045,8 @@ async fn open_shared_turbolite(
         schema_sql: Some(schema.to_string()),
         schema_applied: AtomicBool::new(false),
         authorizer: None, // Shared mode doesn't support custom authorizer (no fencing)
+        forwarding_port: 0, // Shared mode: no forwarding server
+        fwd_handle: tokio::sync::Mutex::new(None),
     });
 
     // Use standard manifest poller (walrust-based, not turbolite-based)
@@ -1989,9 +2057,6 @@ async fn open_shared_turbolite(
         run_manifest_poller(poller_inner, poller_db_name, poller_manifest_key, manifest_poll_interval).await;
     });
 
-    // No forwarding server in Shared mode
-    let fwd_handle = tokio::spawn(async {});
-
     tracing::info!(
         "HaQLite opened in Shared+Synchronous mode: db='{}', manifest_poll={}ms",
         db_name, manifest_poll_interval.as_millis(),
@@ -1999,7 +2064,6 @@ async fn open_shared_turbolite(
 
     Ok(HaQLite {
         inner,
-        _fwd_handle: fwd_handle,
         _role_handle: role_handle,
         closed: false,
     })
@@ -2061,21 +2125,18 @@ async fn resolve_lease_store_from_env(
             let parsed = parse_url_params(&url[5..]);
             (parsed.host, parsed.params.get("endpoint").cloned())
         };
-        let s3_config = match s3_endpoint {
-            Some(ep) => {
-                aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .endpoint_url(&ep)
-                    .load()
-                    .await
-            }
-            None => {
-                aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .load()
-                    .await
-            }
-        };
-        let client = aws_sdk_s3::Client::new(&s3_config);
-        tracing::info!("Using S3 lease store: bucket={}", s3_bucket);
+        // Build the S3 client with explicit endpoint, bypassing AWS_ENDPOINT_URL_S3
+        // env var which may point to a different service (e.g., Grabby).
+        let base_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .load()
+            .await;
+        let mut s3_builder = aws_sdk_s3::config::Builder::from(&base_config)
+            .force_path_style(true);
+        if let Some(ref ep) = s3_endpoint {
+            s3_builder = s3_builder.endpoint_url(ep);
+        }
+        let client = aws_sdk_s3::Client::from_conf(s3_builder.build());
+        tracing::info!("Using S3 lease store: bucket={} endpoint={:?}", s3_bucket, s3_endpoint);
         return Ok(Arc::new(S3LeaseStore::new(client, s3_bucket)));
     }
 
@@ -2141,21 +2202,16 @@ async fn resolve_manifest_store_from_env(
                 let parsed = parse_url_params(&url[5..]);
                 (parsed.host, parsed.params.get("endpoint").cloned())
             };
-            let s3_config = match s3_endpoint {
-                Some(ep) => {
-                    aws_config::defaults(aws_config::BehaviorVersion::latest())
-                        .endpoint_url(&ep)
-                        .load()
-                        .await
-                }
-                None => {
-                    aws_config::defaults(aws_config::BehaviorVersion::latest())
-                        .load()
-                        .await
-                }
-            };
-            let client = aws_sdk_s3::Client::new(&s3_config);
-            tracing::info!("Using S3 manifest store: bucket={}", s3_bucket);
+            let base_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .load()
+                .await;
+            let mut s3_builder = aws_sdk_s3::config::Builder::from(&base_config)
+                .force_path_style(true);
+            if let Some(ref ep) = s3_endpoint {
+                s3_builder = s3_builder.endpoint_url(ep);
+            }
+            let client = aws_sdk_s3::Client::from_conf(s3_builder.build());
+            tracing::info!("Using S3 manifest store: bucket={} endpoint={:?}", s3_bucket, s3_endpoint);
             return Ok(Arc::new(hadb_manifest_s3::S3ManifestStore::new(
                 client, s3_bucket,
             )));
@@ -2244,6 +2300,25 @@ fn parse_url_params(url: &str) -> ParsedUrl {
         base: base.to_string(),
         host,
         params,
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+
+    /// Compile-time proof that execute_async returns a Send future.
+    /// This test doesn't run anything; it just verifies the type constraint.
+    /// If param_refs leaks across an await point, this fails to compile.
+    #[allow(dead_code)]
+    fn execute_async_future_is_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("db");
+        let db = HaQLite::local(path.to_str().expect("path"), "").expect("open");
+        let params = vec![SqlValue::Integer(1)];
+        let fut = db.execute_async("SELECT 1", &params);
+        assert_send(&fut);
     }
 }
 

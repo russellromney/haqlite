@@ -101,13 +101,12 @@ async fn leader_fenced_on_lease_loss() {
     // Insert some data while we're leader
     leader
         .execute("INSERT INTO t (val) VALUES (?1)", &[SqlValue::Text("before".into())])
-        .await
         .expect("insert as leader");
 
     // Verify connection() works for writes
     {
         let conn = leader.connection().expect("conn");
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         guard
             .execute("INSERT INTO t (val) VALUES (?1)", rusqlite::params!["also-before"])
             .expect("direct insert should work as leader");
@@ -128,7 +127,7 @@ async fn leader_fenced_on_lease_loss() {
     // Writes through connection() should be blocked
     {
         let conn = leader.connection().expect("conn should still be available");
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         let result = guard.execute("INSERT INTO t (val) VALUES (?1)", rusqlite::params!["after-fence"]);
         assert!(result.is_err(), "writes should be blocked after lease loss");
     }
@@ -136,7 +135,7 @@ async fn leader_fenced_on_lease_loss() {
     // Reads through connection() should still work
     {
         let conn = leader.connection().expect("conn");
-        let guard = conn.lock().unwrap();
+        let guard = conn.lock();
         let count: i64 = guard
             .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
             .expect("reads should work after lease loss");
