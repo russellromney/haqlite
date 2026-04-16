@@ -413,12 +413,13 @@ impl HaQLiteBuilder {
                     std::fs::create_dir_all(&cache_dir)?;
                     let tl_prefix = format!("{}tl", self.prefix);
                     let (storage_backend, tl_config_prefix) = if let Some((ref ep, ref tok)) = self.turbolite_http {
-                        // Http mode: prefix is just "tl" because the HTTP proxy
-                        // scopes by database_id automatically (prepends database_id/).
+                        // Http mode: use full prefix so the URL contains the complete S3 path.
+                        // Admin-key auth: proxy passes through the path as-is.
+                        // Token auth: proxy still prepends database_id (handled by the proxy).
                         (turbolite::tiered::StorageBackend::Http {
                             endpoint: ep.clone(),
                             token: tok.clone(),
-                            prefix: "tl".to_string(),
+                            prefix: tl_prefix.clone(),
                             fence_token: fence_token.clone(),
                         }, tl_prefix.clone())
                     } else {
@@ -525,7 +526,7 @@ impl HaQLiteBuilder {
                             (turbolite::tiered::StorageBackend::Http {
                                 endpoint: ep.clone(),
                                 token: tok.clone(),
-                                prefix: "tl".to_string(),
+                                prefix: tl_prefix.clone(),
                                 fence_token: fence_token.clone(),
                             }, tl_prefix.clone())
                         } else {
