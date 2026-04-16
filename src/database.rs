@@ -1241,6 +1241,16 @@ impl HaQLite {
         self.inner.unfence_connection();
     }
 
+    /// Flush turbolite staging logs to S3 (or HTTP storage API).
+    /// Call after WAL checkpoint to ensure pages are durably stored.
+    /// No-op if turbolite VFS is not active.
+    pub fn flush_turbolite(&self) -> std::io::Result<()> {
+        if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
+            vfs.vfs().flush_to_s3()?;
+        }
+        Ok(())
+    }
+
     /// Get the turbolite VFS name (if using Synchronous durability).
     /// Callers can open their own read-only connections on this VFS for lock-free reads.
     pub fn vfs_name(&self) -> Option<&str> {
