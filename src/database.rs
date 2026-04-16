@@ -349,9 +349,17 @@ impl HaQLiteBuilder {
             Some(storage) => Some(storage),
             None => {
                 if self.mode == HaMode::Dedicated {
-                    Some(Arc::new(
-                        walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
-                    ))
+                    if let Some((ref ep, ref tok)) = self.turbolite_http {
+                        // HTTP mode: route WAL shipping through the storage API
+                        Some(Arc::new(
+                            hadb_io::HttpObjectStore::new(ep, tok, "wal", fence_token.clone()),
+                        ))
+                    } else {
+                        // S3-direct mode: use AWS SDK
+                        Some(Arc::new(
+                            walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
+                        ))
+                    }
                 } else {
                     None
                 }
