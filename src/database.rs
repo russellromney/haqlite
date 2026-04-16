@@ -375,10 +375,12 @@ impl HaQLiteBuilder {
         // Build coordinator config.
         let mut config = self.coordinator_config.unwrap_or_default();
         config.lease = Some(LeaseConfig::new(instance_id.clone(), address.clone()));
-        // Pass the fence token so DbLease updates it on acquire/renew
-        // when using HTTP storage (proxy enforces fence on writes).
+        // HTTP-backed storage: the token already scopes by database, so the
+        // lease key is just the semantic name "writer". The fence token is
+        // enforced by the proxy on writes.
         if self.turbolite_http.is_some() {
             config.fence_token = Some(fence_token.clone());
+            config.lease_key = Some("writer".to_string());
         }
 
         match self.mode {
@@ -412,22 +414,14 @@ impl HaQLiteBuilder {
                         .join(format!(".tl_cache_{}", db_name));
                     std::fs::create_dir_all(&cache_dir)?;
                     let tl_prefix = format!("{}tl", self.prefix);
-                    let (storage_backend, tl_config_prefix) = if let Some((ref ep, ref tok)) = self.turbolite_http {
-                        // Http mode: use full prefix so the URL contains the complete S3 path.
-                        // Admin-key auth: proxy passes through the path as-is.
-                        // Token auth: proxy still prepends database_id (handled by the proxy).
-                        (turbolite::tiered::StorageBackend::Http {
-                            endpoint: ep.clone(),
-                            token: tok.clone(),
-                            prefix: tl_prefix.clone(),
-                            fence_token: fence_token.clone(),
-                        }, tl_prefix.clone())
+                    let tl_config_prefix = if self.turbolite_http.is_some() {
+                        // HTTP mode: server scopes keys by token, no client-side prefix.
+                        String::new()
                     } else {
-                        // S3-direct mode: prefix includes database_id for scoping.
-                        (turbolite::tiered::StorageBackend::default(), tl_prefix.clone())
+                        tl_prefix.clone()
                     };
                     let tl_config = turbolite::tiered::TurboliteConfig {
-                        storage_backend,
+                        storage_backend: turbolite::tiered::StorageBackend::default(),
                         bucket: self.bucket.clone(),
                         prefix: tl_config_prefix,
                         cache_dir,
@@ -435,12 +429,29 @@ impl HaQLiteBuilder {
                         region: Some(std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string())),
                         sync_mode: turbolite::tiered::SyncMode::Durable,
                         eager_index_load: false,
+                        // Disable inline GC: old page group versions must survive
+                        // until explicit gc() runs (which checks snapshot manifests).
+                        gc_enabled: false,
                         #[cfg(feature = "cloud")]
                         runtime_handle: Some(tokio::runtime::Handle::current()),
                         ..Default::default()
                     };
-                    let vfs = turbolite::tiered::TurboliteVfs::new(tl_config)
-                        .map_err(|e| anyhow::anyhow!("turbolite VFS for Dedicated+Sync: {}", e))?;
+                    let vfs = if let Some((ref ep, ref tok)) = self.turbolite_http {
+                        // HTTP mode: supply our own PageStorage adapter that
+                        // knows about fence tokens and Bearer auth. turbolite
+                        // stays free of HA concerns.
+                        let storage = Arc::new(crate::HttpPageStorage::new(
+                            ep,
+                            tok,
+                            tokio::runtime::Handle::current(),
+                            fence_token.clone(),
+                        ));
+                        turbolite::tiered::TurboliteVfs::new_with_storage(tl_config, storage)
+                            .map_err(|e| anyhow::anyhow!("turbolite VFS (HTTP) for Dedicated+Sync: {}", e))?
+                    } else {
+                        turbolite::tiered::TurboliteVfs::new(tl_config)
+                            .map_err(|e| anyhow::anyhow!("turbolite VFS for Dedicated+Sync: {}", e))?
+                    };
                     let shared_vfs = turbolite::tiered::SharedTurboliteVfs::new(vfs);
                     turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone())
                         .map_err(|e| anyhow::anyhow!("register VFS: {}", e))?;
@@ -522,18 +533,13 @@ impl HaQLiteBuilder {
                         // turbolite gets its own sub-prefix to avoid key collisions
                         // with haqlite lease/manifest keys.
                         let tl_prefix = format!("{}tl", self.prefix);
-                        let (storage_backend, tl_config_prefix) = if let Some((ref ep, ref tok)) = self.turbolite_http {
-                            (turbolite::tiered::StorageBackend::Http {
-                                endpoint: ep.clone(),
-                                token: tok.clone(),
-                                prefix: tl_prefix.clone(),
-                                fence_token: fence_token.clone(),
-                            }, tl_prefix.clone())
+                        let tl_config_prefix = if self.turbolite_http.is_some() {
+                            String::new()
                         } else {
-                            (turbolite::tiered::StorageBackend::default(), tl_prefix.clone())
+                            tl_prefix.clone()
                         };
                         let config = turbolite::tiered::TurboliteConfig {
-                            storage_backend,
+                            storage_backend: turbolite::tiered::StorageBackend::default(),
                             bucket: self.bucket.clone(),
                             prefix: tl_config_prefix,
                             cache_dir,
@@ -541,12 +547,24 @@ impl HaQLiteBuilder {
                             region: Some(std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string())),
                             sync_mode,
                             eager_index_load: false,
+                            gc_enabled: false,
                             #[cfg(feature = "cloud")]
                             runtime_handle: Some(tokio::runtime::Handle::current()),
                             ..Default::default()
                         };
-                        let vfs = turbolite::tiered::TurboliteVfs::new(config)
-                            .map_err(|e| anyhow::anyhow!("auto-create turbolite VFS: {}", e))?;
+                        let vfs = if let Some((ref ep, ref tok)) = self.turbolite_http {
+                            let storage = Arc::new(crate::HttpPageStorage::new(
+                                ep,
+                                tok,
+                                tokio::runtime::Handle::current(),
+                                fence_token.clone(),
+                            ));
+                            turbolite::tiered::TurboliteVfs::new_with_storage(config, storage)
+                                .map_err(|e| anyhow::anyhow!("auto-create turbolite VFS (HTTP): {}", e))?
+                        } else {
+                            turbolite::tiered::TurboliteVfs::new(config)
+                                .map_err(|e| anyhow::anyhow!("auto-create turbolite VFS: {}", e))?
+                        };
                         let shared = turbolite::tiered::SharedTurboliteVfs::new(vfs);
                         turbolite::tiered::register_shared(&vfs_name, shared.clone())
                             .map_err(|e| anyhow::anyhow!("register VFS: {}", e))?;
@@ -623,7 +641,7 @@ pub(crate) struct HaQLiteInner {
     follower_caught_up: Arc<AtomicBool>,
     /// Current follower replay position (TXID).
     follower_replay_position: Arc<AtomicU64>,
-    // --- Phase Crest: Shared mode fields ---
+    // Shared mode fields
     mode: HaMode,
     /// Direct lease store access (Shared mode, bypasses Coordinator).
     shared_lease_store: Option<Arc<dyn hadb::LeaseStore>>,
@@ -1241,12 +1259,12 @@ impl HaQLite {
         self.inner.unfence_connection();
     }
 
-    /// Flush turbolite staging logs to S3 (or HTTP storage API).
+    /// Flush turbolite staging logs to storage (S3 or HTTP storage API).
     /// Call after WAL checkpoint to ensure pages are durably stored.
     /// No-op if turbolite VFS is not active.
     pub fn flush_turbolite(&self) -> std::io::Result<()> {
         if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
-            vfs.vfs().flush_to_s3()?;
+            vfs.vfs().flush_to_storage()?;
         }
         Ok(())
     }
@@ -1351,7 +1369,17 @@ impl HaQLite {
         // 2. Close connection (drains in-flight writes via the Mutex).
         self.inner.set_conn(None);
 
-        // 3. Leave the cluster (releases lease).
+        // 3. Flush turbolite staging logs to remote storage BEFORE releasing the
+        //    lease. The lease fences writes, so once it's gone, pending pages
+        //    cannot be uploaded. Must happen after connection close (no more
+        //    writes) and before coordinator.leave() (still holds the lease).
+        if let Some(ref vfs) = self.inner.shared_turbolite_vfs {
+            if let Err(e) = vfs.vfs().flush_to_storage() {
+                tracing::error!("turbolite flush on close failed: {}", e);
+            }
+        }
+
+        // 4. Leave the cluster (releases lease).
         if let Some(ref coordinator) = self.inner.coordinator {
             coordinator
                 .leave(&self.inner.db_name)
@@ -1359,7 +1387,7 @@ impl HaQLite {
                 .map_err(|e| HaQLiteError::CoordinatorError(e.to_string()))?;
         }
 
-        // 4. Stop forwarding server and abort background tasks.
+        // 5. Stop forwarding server and abort background tasks.
         self.inner.stop_forwarding_server().await;
         self._role_handle.abort();
 

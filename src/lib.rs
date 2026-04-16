@@ -28,11 +28,16 @@ pub mod error;
 pub mod follower_behavior;
 pub mod forwarding;
 pub mod hrana;
+pub mod http_page_storage;
 pub mod ops;
 pub mod replicator;
 pub mod serve;
 
 pub mod turbolite_replicator;
+
+// HTTP page-storage adapter: implements turbolite's PageStorage trait,
+// layering fence tokens and Bearer auth on top.
+pub use http_page_storage::HttpPageStorage;
 
 // Re-export HaQLite as the primary API.
 pub use database::{AuthorizerFactory, HaQLite, HaQLiteBuilder};

@@ -72,11 +72,11 @@ impl Replicator for TurboliteReplicator {
     }
 
     async fn sync(&self, _name: &str) -> Result<()> {
-        // In cloud mode, flush pending uploads to S3.
+        // Flush pending uploads to storage (S3 or HTTP API).
         // In local mode, sync happens via the VFS xSync callback during checkpoint.
         self.vfs
-            .flush_to_s3()
-            .map_err(|e| anyhow::anyhow!("turbolite flush_to_s3 failed: {}", e))?;
+            .flush_to_storage()
+            .map_err(|e| anyhow::anyhow!("turbolite flush_to_storage failed: {}", e))?;
         Ok(())
     }
 }
