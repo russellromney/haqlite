@@ -60,8 +60,9 @@ pub use hadb::{
 // Re-export hadb-lease-s3 implementations.
 pub use hadb_lease_s3::{S3LeaseStore, S3NodeRegistry, S3StorageBackend};
 
-// Re-export HTTP store implementations.
-pub use hadb_lease_http::HttpLeaseStore;
+// Re-export Cinch-protocol lease store + fence primitives.
+pub use hadb_lease_cinch::{AtomicFence, AtomicFenceWriter, CinchLeaseStore};
+// Re-export generic HTTP manifest store.
 pub use hadb_manifest_http::HttpManifestStore;
 
 // Re-export SQLite-specific implementations.

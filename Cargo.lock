@@ -1570,6 +1570,8 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "hadb-lease",
+ "hadb-lease-mem",
  "reqwest",
  "rmp-serde",
  "serde",
@@ -1630,18 +1632,37 @@ dependencies = [
 ]
 
 [[package]]
-name = "hadb-lease-http"
+name = "hadb-lease"
 version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "hadb-storage",
+]
+
+[[package]]
+name = "hadb-lease-cinch"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
  "base64",
- "hadb",
+ "hadb-lease",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "hadb-lease-mem"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hadb-lease",
 ]
 
 [[package]]
@@ -1652,7 +1673,7 @@ dependencies = [
  "async-nats",
  "async-trait",
  "bytes",
- "hadb",
+ "hadb-lease",
  "tokio",
 ]
 
@@ -1667,6 +1688,7 @@ dependencies = [
  "aws-smithy-types",
  "chrono",
  "hadb",
+ "hadb-lease",
  "serde",
  "serde_json",
  "tokio",
@@ -1716,6 +1738,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hadb-storage"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+]
+
+[[package]]
 name = "haqlite"
 version = "0.4.0"
 dependencies = [
@@ -1733,7 +1764,7 @@ dependencies = [
  "hadb",
  "hadb-cli",
  "hadb-io",
- "hadb-lease-http",
+ "hadb-lease-cinch",
  "hadb-lease-nats",
  "hadb-lease-s3",
  "hadb-manifest-http",

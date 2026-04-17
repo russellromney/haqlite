@@ -199,12 +199,13 @@ impl HaQLiteBuilder {
         self
     }
 
-    /// Use an HTTP-based LeaseStore (for embedded replicas via a proxy).
+    /// Use the Cinch-protocol HTTP LeaseStore (for embedded replicas via
+    /// Grabby or the engine's embedded lease API).
     ///
-    /// Shorthand for `.lease_store(Arc::new(HttpLeaseStore::new(endpoint, token)))`.
+    /// Shorthand for `.lease_store(Arc::new(CinchLeaseStore::new(endpoint, token)))`.
     pub fn lease_endpoint(self, endpoint: &str, token: &str) -> Self {
         self.lease_store(Arc::new(
-            hadb_lease_http::HttpLeaseStore::new(endpoint, token),
+            hadb_lease_cinch::CinchLeaseStore::new(endpoint, token),
         ))
     }
 
@@ -2142,8 +2143,8 @@ fn open_leader_connection(db_path: &Path) -> Result<rusqlite::Connection> {
 /// Resolve lease store from HAQLITE_LEASE_URL env var.
 ///
 /// Supported schemes:
-///   http://host:port?token=...   -> HttpLeaseStore
-///   https://host:port?token=...  -> HttpLeaseStore
+///   http://host:port?token=...   -> CinchLeaseStore
+///   https://host:port?token=...  -> CinchLeaseStore
 ///   nats://host:port?bucket=...  -> NatsLeaseStore (requires nats-lease feature)
 ///   s3://bucket?endpoint=...     -> S3LeaseStore
 ///
@@ -2191,8 +2192,8 @@ async fn resolve_lease_store_from_env(
         let parsed = parse_url_params(&url);
         let token = parsed.params.get("token").cloned().unwrap_or_default();
         let endpoint = parsed.base;
-        tracing::info!("Using HTTP lease store: {}", endpoint);
-        return Ok(Arc::new(hadb_lease_http::HttpLeaseStore::new(
+        tracing::info!("Using Cinch HTTP lease store: {}", endpoint);
+        return Ok(Arc::new(hadb_lease_cinch::CinchLeaseStore::new(
             &endpoint, &token,
         )));
     }
