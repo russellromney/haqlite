@@ -444,43 +444,40 @@ impl HaQLiteBuilder {
                         .join(format!(".tl_cache_{}", db_name));
                     std::fs::create_dir_all(&cache_dir)?;
                     let tl_prefix = format!("{}tl", self.prefix);
-                    let tl_config_prefix = if self.turbolite_http.is_some() {
-                        // HTTP mode: server scopes keys by token, no client-side prefix.
-                        String::new()
-                    } else {
-                        tl_prefix.clone()
-                    };
                     let tl_config = turbolite::tiered::TurboliteConfig {
-                        storage_backend: turbolite::tiered::StorageBackend::default(),
-                        bucket: self.bucket.clone(),
-                        prefix: tl_config_prefix,
                         cache_dir,
-                        endpoint_url: self.endpoint.clone(),
-                        region: Some(std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string())),
                         sync_mode: turbolite::tiered::SyncMode::Durable,
                         eager_index_load: false,
                         // Disable inline GC: old page group versions must survive
                         // until explicit gc() runs (which checks snapshot manifests).
                         gc_enabled: false,
-                        #[cfg(feature = "cloud")]
-                        runtime_handle: Some(tokio::runtime::Handle::current()),
                         ..Default::default()
                     };
+                    let rt_handle = tokio::runtime::Handle::current();
                     let vfs = if let Some((ref ep, ref tok)) = self.turbolite_http {
-                        // HTTP mode: supply our own PageStorage adapter that
+                        // HTTP mode: supply our own StorageBackend adapter that
                         // knows about fence tokens and Bearer auth. turbolite
                         // stays free of HA concerns.
-                        let storage = Arc::new(crate::HttpPageStorage::new(
-                            ep,
-                            tok,
-                            tokio::runtime::Handle::current(),
-                            fence_token.clone(),
-                        ));
-                        turbolite::tiered::TurboliteVfs::new_with_storage(tl_config, storage)
-                            .map_err(|e| anyhow::anyhow!("turbolite VFS (HTTP) for Dedicated+Sync: {}", e))?
+                        let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(
+                            crate::HttpPageStorage::new(ep, tok, fence_token.clone()),
+                        );
+                        turbolite::tiered::TurboliteVfs::new_with_storage(tl_config, storage, rt_handle)
+                            .map_err(|e| anyhow::anyhow!("turbolite VFS (HTTP) for Dedicated+Sync: {e}"))?
                     } else {
-                        turbolite::tiered::TurboliteVfs::new(tl_config)
-                            .map_err(|e| anyhow::anyhow!("turbolite VFS for Dedicated+Sync: {}", e))?
+                        // S3 mode: construct hadb-storage-s3 directly.
+                        let tl_prefix_for_s3 = tl_prefix.clone();
+                        let bucket = self.bucket.clone();
+                        let endpoint = self.endpoint.clone();
+                        let s3 = rt_handle
+                            .block_on(async move {
+                                hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref())
+                                    .await
+                                    .map(|s| s.with_prefix(tl_prefix_for_s3))
+                            })
+                            .map_err(|e| anyhow::anyhow!("build S3Storage for turbolite: {e}"))?;
+                        let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(s3);
+                        turbolite::tiered::TurboliteVfs::new_with_storage(tl_config, storage, rt_handle.clone())
+                            .map_err(|e| anyhow::anyhow!("turbolite VFS for Dedicated+Sync: {e}"))?
                     };
                     let shared_vfs = turbolite::tiered::SharedTurboliteVfs::new(vfs);
                     turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone())
@@ -552,7 +549,7 @@ impl HaQLiteBuilder {
                     Some(v) => v,
                     None => {
                         let sync_mode = match self.durability {
-                            Durability::Synchronous => turbolite::tiered::SyncMode::S3Primary,
+                            Durability::Synchronous => turbolite::tiered::SyncMode::RemotePrimary,
                             _ => turbolite::tiered::SyncMode::default(),
                         };
                         let vfs_name = format!("haqlite_auto_{}", uuid::Uuid::new_v4());
@@ -563,37 +560,34 @@ impl HaQLiteBuilder {
                         // turbolite gets its own sub-prefix to avoid key collisions
                         // with haqlite lease/manifest keys.
                         let tl_prefix = format!("{}tl", self.prefix);
-                        let tl_config_prefix = if self.turbolite_http.is_some() {
-                            String::new()
-                        } else {
-                            tl_prefix.clone()
-                        };
                         let config = turbolite::tiered::TurboliteConfig {
-                            storage_backend: turbolite::tiered::StorageBackend::default(),
-                            bucket: self.bucket.clone(),
-                            prefix: tl_config_prefix,
                             cache_dir,
-                            endpoint_url: self.endpoint.clone(),
-                            region: Some(std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string())),
                             sync_mode,
                             eager_index_load: false,
                             gc_enabled: false,
-                            #[cfg(feature = "cloud")]
-                            runtime_handle: Some(tokio::runtime::Handle::current()),
                             ..Default::default()
                         };
+                        let rt_handle = tokio::runtime::Handle::current();
                         let vfs = if let Some((ref ep, ref tok)) = self.turbolite_http {
-                            let storage = Arc::new(crate::HttpPageStorage::new(
-                                ep,
-                                tok,
-                                tokio::runtime::Handle::current(),
-                                fence_token.clone(),
-                            ));
-                            turbolite::tiered::TurboliteVfs::new_with_storage(config, storage)
-                                .map_err(|e| anyhow::anyhow!("auto-create turbolite VFS (HTTP): {}", e))?
+                            let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(
+                                crate::HttpPageStorage::new(ep, tok, fence_token.clone()),
+                            );
+                            turbolite::tiered::TurboliteVfs::new_with_storage(config, storage, rt_handle)
+                                .map_err(|e| anyhow::anyhow!("auto-create turbolite VFS (HTTP): {e}"))?
                         } else {
-                            turbolite::tiered::TurboliteVfs::new(config)
-                                .map_err(|e| anyhow::anyhow!("auto-create turbolite VFS: {}", e))?
+                            let tl_prefix_for_s3 = tl_prefix.clone();
+                            let bucket = self.bucket.clone();
+                            let endpoint = self.endpoint.clone();
+                            let s3 = rt_handle
+                                .block_on(async move {
+                                    hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref())
+                                        .await
+                                        .map(|s| s.with_prefix(tl_prefix_for_s3))
+                                })
+                                .map_err(|e| anyhow::anyhow!("build S3Storage for turbolite: {e}"))?;
+                            let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(s3);
+                            turbolite::tiered::TurboliteVfs::new_with_storage(config, storage, rt_handle.clone())
+                                .map_err(|e| anyhow::anyhow!("auto-create turbolite VFS: {e}"))?
                         };
                         let shared = turbolite::tiered::SharedTurboliteVfs::new(vfs);
                         turbolite::tiered::register_shared(&vfs_name, shared.clone())

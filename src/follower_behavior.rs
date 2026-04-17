@@ -101,7 +101,7 @@ impl FollowerBehavior for SqliteFollowerBehavior {
                     let current_version = position.load(Ordering::SeqCst);
                     let vfs_clone = vfs.clone();
                     let fetch_result = tokio::task::spawn_blocking(move || {
-                        vfs_clone.fetch_and_apply_s3_manifest()
+                        vfs_clone.fetch_and_apply_remote_manifest()
                     }).await;
 
                     match fetch_result {
@@ -213,7 +213,7 @@ impl FollowerBehavior for SqliteFollowerBehavior {
                 .expect("turbolite_vfs required");
             let vfs_clone = vfs.clone();
             let result = tokio::task::spawn_blocking(move || {
-                vfs_clone.fetch_and_apply_s3_manifest()
+                vfs_clone.fetch_and_apply_remote_manifest()
             }).await.map_err(|e| anyhow::anyhow!("manifest fetch task panicked: {}", e))?;
 
             match result {

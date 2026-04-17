@@ -1,6 +1,6 @@
 //! Phase Zenith-e: Turbolite + Shared mode integration tests.
 //!
-//! Uses turbolite with StorageBackend::Local (no cloud/S3 needed).
+//! Uses turbolite local storage (no cloud/S3 needed).
 //! Tests the per-write lease cycle with turbolite as the storage engine.
 
 
@@ -13,7 +13,7 @@ use tempfile::TempDir;
 
 use hadb::InMemoryLeaseStore;
 use haqlite::{HaMode, HaQLite, InMemoryManifestStore, ManifestStore, SqlValue, StorageManifest};
-use turbolite::tiered::{SharedTurboliteVfs, StorageBackend, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT);";
 
@@ -27,7 +27,6 @@ async fn build_turbolite_shared(
     vfs_name: &str,
 ) -> HaQLite {
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: cache_dir.to_path_buf(),
         compression_level: 1,
         pages_per_group: 4, // small for testing
