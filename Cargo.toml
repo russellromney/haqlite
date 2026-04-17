@@ -12,7 +12,6 @@ categories = ["database", "network-programming"]
 [dependencies]
 # HA coordination framework
 hadb = { path = "../hadb/hadb", version = "0.4.0" }
-hadb-io = { path = "../hadb/hadb-io", version = "0.4.0" }
 hadb-lease-s3 = { path = "../hadb/hadb-lease-s3", version = "0.4.0" }
 
 # WAL sync primitives

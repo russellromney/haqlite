@@ -56,24 +56,6 @@ const DEFAULT_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 const ROLE_LEADER: u8 = 0;
 const ROLE_FOLLOWER: u8 = 1;
 
-/// Temporary bridge: reads the legacy `Arc<AtomicU64>` fence token that
-/// `DbLease::with_fence_token` populates today, and exposes it through the
-/// new `FenceSource` trait that `hadb-storage-cinch` expects. 0 maps to
-/// `None` (no active lease), any other value maps to `Some(rev)`.
-///
-/// Phase Anvil i migrates `DbLease` to `AtomicFenceWriter` directly and
-/// this shim goes away.
-struct LegacyAtomicFence(Arc<std::sync::atomic::AtomicU64>);
-
-impl hadb_lease::FenceSource for LegacyAtomicFence {
-    fn current(&self) -> Option<u64> {
-        match self.0.load(std::sync::atomic::Ordering::SeqCst) {
-            0 => None,
-            v => Some(v),
-        }
-    }
-}
-
 // Re-export canonical mode/durability types from hadb.
 // Shared across haqlite and hakuzu for consistent validation.
 pub use hadb::{Durability, HaMode, validate_mode_durability};
@@ -357,12 +339,11 @@ impl HaQLiteBuilder {
             ));
         }
 
-        // Build walrust storage backend.
-        // Dedicated mode always needs walrust for follower replication.
-        // Shared mode (Synchronous only) uses turbolite manifest for catch-up.
-        // Shared fence token: updated by DbLease on acquire/renew, read by
-        // HttpObjectStore and turbolite HttpClient on every write.
-        let fence_token = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Shared fence: the `AtomicFenceWriter` half goes to `DbLease`
+        // (via the coordinator config), the `AtomicFence` reader half is
+        // cloned into every storage adapter that performs fenced writes.
+        let (atomic_fence, atomic_fence_writer) = hadb_lease::AtomicFence::new();
+        let fence_writer = Arc::new(atomic_fence_writer);
 
         let walrust_storage_opt: Option<Arc<dyn walrust::StorageBackend>> = match self.walrust_storage {
             Some(storage) => Some(storage),
@@ -371,12 +352,10 @@ impl HaQLiteBuilder {
                     if let Some((ref ep, ref tok)) = self.turbolite_http {
                         // Cinch HTTP mode: WAL segments flow through /v1/sync/wal
                         // on the Cinch lease/sync server (Grabby or engine-embedded).
-                        // The FenceSource bridges DbLease's legacy Arc<AtomicU64>
-                        // fence into the trait the new storage substrate expects;
-                        // Phase Anvil i will migrate DbLease to AtomicFenceWriter
-                        // and delete this shim.
+                        // Storage adapter reads the fence on every write and refuses
+                        // when no lease is held.
                         let fence: Arc<dyn hadb_lease::FenceSource> =
-                            Arc::new(LegacyAtomicFence(fence_token.clone()));
+                            Arc::new(atomic_fence.clone());
                         Some(Arc::new(
                             hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "wal")
                                 .with_fence(fence),
@@ -406,10 +385,10 @@ impl HaQLiteBuilder {
         let mut config = self.coordinator_config.unwrap_or_default();
         config.lease = Some(LeaseConfig::new(instance_id.clone(), address.clone()));
         // HTTP-backed storage: the token already scopes by database, so the
-        // lease key is just the semantic name "writer". The fence token is
+        // lease key is just the semantic name "writer". The fence is
         // enforced by the proxy on writes.
         if self.turbolite_http.is_some() {
-            config.fence_token = Some(fence_token.clone());
+            config.fence_writer = Some(fence_writer.clone());
             config.lease_key = Some("writer".to_string());
         }
 
@@ -455,11 +434,14 @@ impl HaQLiteBuilder {
                     };
                     let rt_handle = tokio::runtime::Handle::current();
                     let vfs = if let Some((ref ep, ref tok)) = self.turbolite_http {
-                        // HTTP mode: supply our own StorageBackend adapter that
-                        // knows about fence tokens and Bearer auth. turbolite
-                        // stays free of HA concerns.
+                        // HTTP mode: page storage speaks the Cinch /v1/sync/pages
+                        // contract. Reader half of the shared AtomicFence is cloned
+                        // in so fenced writes refuse when no lease is held.
+                        let fence: Arc<dyn hadb_lease::FenceSource> =
+                            Arc::new(atomic_fence.clone());
                         let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(
-                            crate::HttpPageStorage::new(ep, tok, fence_token.clone()),
+                            hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "pages")
+                                .with_fence(fence),
                         );
                         turbolite::tiered::TurboliteVfs::new_with_storage(tl_config, storage, rt_handle)
                             .map_err(|e| anyhow::anyhow!("turbolite VFS (HTTP) for Dedicated+Sync: {e}"))?
@@ -569,8 +551,11 @@ impl HaQLiteBuilder {
                         };
                         let rt_handle = tokio::runtime::Handle::current();
                         let vfs = if let Some((ref ep, ref tok)) = self.turbolite_http {
+                            let fence: Arc<dyn hadb_lease::FenceSource> =
+                                Arc::new(atomic_fence.clone());
                             let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(
-                                crate::HttpPageStorage::new(ep, tok, fence_token.clone()),
+                                hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "pages")
+                                    .with_fence(fence),
                             );
                             turbolite::tiered::TurboliteVfs::new_with_storage(config, storage, rt_handle)
                                 .map_err(|e| anyhow::anyhow!("auto-create turbolite VFS (HTTP): {e}"))?
