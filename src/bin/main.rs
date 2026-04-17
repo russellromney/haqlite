@@ -60,7 +60,7 @@ impl CliBackend for HaqliteBackend {
 
     async fn restore(&self, _shared: &SharedConfig, args: &RestoreArgs) -> Result<()> {
         let prefix = resolve_prefix(&args.s3);
-        let storage = walrust::S3Backend::from_env(
+        let storage = hadb_storage_s3::S3Storage::from_env(
             args.s3.bucket.clone(),
             args.s3.endpoint.as_deref(),
         )
@@ -81,7 +81,7 @@ impl CliBackend for HaqliteBackend {
     async fn list(&self, _shared: &SharedConfig, args: &ListArgs) -> Result<()> {
         let prefix = resolve_prefix(&args.s3);
         let storage =
-            walrust::S3Backend::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
+            hadb_storage_s3::S3Storage::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
                 .await?;
         let dbs = ops::list_databases(&storage, prefix).await?;
         if dbs.is_empty() {
@@ -105,7 +105,7 @@ impl CliBackend for HaqliteBackend {
     async fn verify(&self, _shared: &SharedConfig, args: &VerifyArgs) -> Result<()> {
         let prefix = resolve_prefix(&args.s3);
         let storage =
-            walrust::S3Backend::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
+            hadb_storage_s3::S3Storage::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
                 .await?;
         let result = ops::verify_database(&storage, prefix, &args.name).await?;
 
@@ -163,7 +163,7 @@ impl CliBackend for HaqliteBackend {
     async fn compact(&self, _shared: &SharedConfig, args: &CompactArgs) -> Result<()> {
         let prefix = resolve_prefix(&args.s3);
         let storage =
-            walrust::S3Backend::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
+            hadb_storage_s3::S3Storage::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
                 .await?;
         let plan = ops::plan_compact(&storage, prefix, &args.name, args.keep).await?;
 
@@ -220,7 +220,7 @@ impl CliBackend for HaqliteBackend {
     async fn replicate(&self, _shared: &SharedConfig, args: &ReplicateArgs) -> Result<()> {
         let prefix = resolve_prefix(&args.s3);
         let storage =
-            walrust::S3Backend::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
+            hadb_storage_s3::S3Storage::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
                 .await?;
         println!(
             "Replicating '{}' -> {} (interval: {}s)",
@@ -243,7 +243,7 @@ impl CliBackend for HaqliteBackend {
     async fn snapshot(&self, _shared: &SharedConfig, args: &SnapshotArgs) -> Result<()> {
         let prefix = resolve_prefix(&args.s3);
         let storage =
-            walrust::S3Backend::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
+            hadb_storage_s3::S3Storage::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
                 .await?;
         let result = ops::snapshot_database(&storage, prefix, &args.database).await?;
         println!(

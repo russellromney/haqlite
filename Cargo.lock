@@ -1587,7 +1587,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "hadb-io",
+ "hadb-storage",
  "sha2",
  "thiserror 2.0.18",
  "tokio",
@@ -1747,6 +1747,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "hadb-storage-cinch"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hadb-lease",
+ "hadb-storage",
+ "percent-encoding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "hadb-storage-s3"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "aws-smithy-types",
+ "hadb-storage",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "haqlite"
 version = "0.4.0"
 dependencies = [
@@ -1764,12 +1794,16 @@ dependencies = [
  "hadb",
  "hadb-cli",
  "hadb-io",
+ "hadb-lease",
  "hadb-lease-cinch",
  "hadb-lease-nats",
  "hadb-lease-s3",
  "hadb-manifest-http",
  "hadb-manifest-nats",
  "hadb-manifest-s3",
+ "hadb-storage",
+ "hadb-storage-cinch",
+ "hadb-storage-s3",
  "hostname",
  "hrana-server",
  "http 1.4.0",
@@ -4358,6 +4392,7 @@ dependencies = [
  "futures",
  "hadb-changeset",
  "hadb-io",
+ "hadb-storage",
  "rusqlite",
  "serde",
  "serde_json",

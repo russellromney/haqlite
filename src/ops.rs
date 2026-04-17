@@ -55,7 +55,7 @@ pub async fn discover_ltx_files(
 ) -> Result<Vec<DiscoveredLtx>> {
     let prefix = normalize_prefix(prefix);
     let db_prefix = format!("{}{}/", prefix, db_name);
-    let keys = storage.list_objects(&db_prefix).await?;
+    let keys = storage.list(&db_prefix, None).await?;
     let mut files = Vec::new();
     for key in &keys {
         let relative = match key.strip_prefix(&db_prefix) {
@@ -97,7 +97,7 @@ pub async fn discover_databases(
     prefix: &str,
 ) -> Result<Vec<String>> {
     let prefix = normalize_prefix(prefix);
-    let keys = storage.list_objects(&prefix).await?;
+    let keys = storage.list(&prefix, None).await?;
     let mut dbs = std::collections::BTreeSet::new();
     for key in &keys {
         if let Some(relative) = key.strip_prefix(&prefix) {
@@ -228,7 +228,9 @@ pub async fn verify_database(
             .next_back()
             .unwrap_or(&file.key)
             .to_string();
-        match storage.download_bytes(&file.key).await {
+        match storage.get(&file.key).await.and_then(|opt| {
+            opt.ok_or_else(|| anyhow::anyhow!("key {} not found", file.key))
+        }) {
             Ok(data) => {
                 match walrust::hadb_changeset::physical::decode(&data) {
                     Ok(changeset) => {
@@ -376,7 +378,7 @@ pub async fn execute_compact(
     if keys.is_empty() {
         return Ok(0);
     }
-    storage.delete_objects(&keys).await
+    storage.delete_many(&keys).await
 }
 
 // ============================================================================

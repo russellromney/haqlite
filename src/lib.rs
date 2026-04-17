@@ -70,6 +70,5 @@ pub use follower_behavior::SqliteFollowerBehavior;
 pub use replicator::SqliteReplicator;
 
 // Re-export walrust types so downstream crates don't need a direct walrust dependency.
-pub use walrust::S3Backend as WalrustS3Backend;
 pub use walrust::StorageBackend as WalrustStorageBackend;
 pub use walrust::ReplicationConfig;

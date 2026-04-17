@@ -56,6 +56,24 @@ const DEFAULT_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 const ROLE_LEADER: u8 = 0;
 const ROLE_FOLLOWER: u8 = 1;
 
+/// Temporary bridge: reads the legacy `Arc<AtomicU64>` fence token that
+/// `DbLease::with_fence_token` populates today, and exposes it through the
+/// new `FenceSource` trait that `hadb-storage-cinch` expects. 0 maps to
+/// `None` (no active lease), any other value maps to `Some(rev)`.
+///
+/// Phase Anvil i migrates `DbLease` to `AtomicFenceWriter` directly and
+/// this shim goes away.
+struct LegacyAtomicFence(Arc<std::sync::atomic::AtomicU64>);
+
+impl hadb_lease::FenceSource for LegacyAtomicFence {
+    fn current(&self) -> Option<u64> {
+        match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => None,
+            v => Some(v),
+        }
+    }
+}
+
 // Re-export canonical mode/durability types from hadb.
 // Shared across haqlite and hakuzu for consistent validation.
 pub use hadb::{Durability, HaMode, validate_mode_durability};
@@ -351,15 +369,26 @@ impl HaQLiteBuilder {
             None => {
                 if self.mode == HaMode::Dedicated {
                     if let Some((ref ep, ref tok)) = self.turbolite_http {
-                        // HTTP mode: route WAL shipping through the storage API
+                        // Cinch HTTP mode: WAL segments flow through /v1/sync/wal
+                        // on the Cinch lease/sync server (Grabby or engine-embedded).
+                        // The FenceSource bridges DbLease's legacy Arc<AtomicU64>
+                        // fence into the trait the new storage substrate expects;
+                        // Phase Anvil i will migrate DbLease to AtomicFenceWriter
+                        // and delete this shim.
+                        let fence: Arc<dyn hadb_lease::FenceSource> =
+                            Arc::new(LegacyAtomicFence(fence_token.clone()));
                         Some(Arc::new(
-                            hadb_io::HttpObjectStore::new(ep, tok, "wal", fence_token.clone()),
+                            hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "wal")
+                                .with_fence(fence),
                         ))
                     } else {
-                        // S3-direct mode: use AWS SDK
-                        Some(Arc::new(
-                            walrust::S3Backend::from_env(self.bucket.clone(), self.endpoint.as_deref()).await?,
-                        ))
+                        // S3-direct mode: build an S3Storage from env.
+                        let s3 = hadb_storage_s3::S3Storage::from_env(
+                            self.bucket.clone(),
+                            self.endpoint.as_deref(),
+                        )
+                        .await?;
+                        Some(Arc::new(s3))
                     }
                 } else {
                     None

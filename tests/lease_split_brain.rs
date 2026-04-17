@@ -63,70 +63,49 @@ impl SlowStorage {
 
 #[async_trait]
 impl walrust::StorageBackend for SlowStorage {
-    fn bucket_name(&self) -> &str { "test-bucket" }
-
-    async fn upload_bytes(&self, key: &str, data: Vec<u8>) -> anyhow::Result<()> {
+    async fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
         let delay = *self.upload_delay.lock().await;
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        self.inner.upload_bytes(key, data).await
+        self.inner.put(key, data).await
     }
 
-    async fn upload_bytes_with_checksum(&self, key: &str, data: Vec<u8>, checksum: &str) -> anyhow::Result<()> {
-        let delay = *self.upload_delay.lock().await;
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        self.inner.upload_bytes_with_checksum(key, data, checksum).await
+    async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
     }
 
-    async fn upload_file(&self, key: &str, path: &std::path::Path) -> anyhow::Result<()> {
-        let delay = *self.upload_delay.lock().await;
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        self.inner.upload_file(key, path).await
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete(key).await
     }
 
-    async fn upload_file_with_checksum(&self, key: &str, path: &std::path::Path, checksum: &str) -> anyhow::Result<()> {
-        let delay = *self.upload_delay.lock().await;
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        self.inner.upload_file_with_checksum(key, path, checksum).await
-    }
-
-    async fn download_bytes(&self, key: &str) -> anyhow::Result<Vec<u8>> {
-        self.inner.download_bytes(key).await
-    }
-
-    async fn download_file(&self, key: &str, path: &std::path::Path) -> anyhow::Result<()> {
-        self.inner.download_file(key, path).await
-    }
-
-    async fn list_objects(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
-        self.inner.list_objects(prefix).await
-    }
-
-    async fn list_objects_after(&self, prefix: &str, start_after: &str) -> anyhow::Result<Vec<String>> {
-        self.inner.list_objects_after(prefix, start_after).await
+    async fn list(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.inner.list(prefix, after).await
     }
 
     async fn exists(&self, key: &str) -> anyhow::Result<bool> {
         self.inner.exists(key).await
     }
 
-    async fn get_checksum(&self, key: &str) -> anyhow::Result<Option<String>> {
-        self.inner.get_checksum(key).await
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        data: &[u8],
+    ) -> anyhow::Result<hadb_storage::CasResult> {
+        self.inner.put_if_absent(key, data).await
     }
 
-    async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
-        self.inner.delete_object(key).await
-    }
-
-    async fn delete_objects(&self, keys: &[String]) -> anyhow::Result<usize> {
-        self.inner.delete_objects(keys).await
+    async fn put_if_match(
+        &self,
+        key: &str,
+        data: &[u8],
+        etag: &str,
+    ) -> anyhow::Result<hadb_storage::CasResult> {
+        self.inner.put_if_match(key, data, etag).await
     }
 }
 

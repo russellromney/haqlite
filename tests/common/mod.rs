@@ -1,14 +1,18 @@
 //! Shared test utilities for haqlite integration tests.
+//!
+//! `InMemoryStorage` implements the byte-level `hadb_storage::StorageBackend`
+//! trait (which walrust now consumes). It adds two test-only helpers
+//! `insert()` and `keys()` that let tests seed the store and inspect its
+//! contents directly; production callers use `put` / `list` through the
+//! trait.
 
 use std::collections::HashMap;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use hadb_storage::{CasResult, StorageBackend};
 use tokio::sync::Mutex;
 
-/// In-memory walrust StorageBackend for tests.
-///
-/// Avoids S3 dependencies. All data stored in a HashMap behind a Mutex.
 pub struct InMemoryStorage {
     objects: Mutex<HashMap<String, Vec<u8>>>,
 }
@@ -20,12 +24,12 @@ impl InMemoryStorage {
         }
     }
 
-    /// Insert a key-value pair directly (for test setup).
+    /// Insert a key/value directly (test setup).
     pub async fn insert(&self, key: &str, data: Vec<u8>) {
         self.objects.lock().await.insert(key.to_string(), data);
     }
 
-    /// Get all keys sorted (for test assertions).
+    /// Return all keys sorted (test assertions).
     pub async fn keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = self.objects.lock().await.keys().cloned().collect();
         keys.sort();
@@ -33,78 +37,37 @@ impl InMemoryStorage {
     }
 }
 
+impl Default for InMemoryStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
-impl walrust::StorageBackend for InMemoryStorage {
-    fn bucket_name(&self) -> &str {
-        "test-bucket"
+impl StorageBackend for InMemoryStorage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.objects.lock().await.get(key).cloned())
     }
 
-    async fn upload_bytes(&self, key: &str, data: Vec<u8>) -> Result<()> {
-        self.objects.lock().await.insert(key.to_string(), data);
-        Ok(())
-    }
-
-    async fn upload_bytes_with_checksum(
-        &self,
-        key: &str,
-        data: Vec<u8>,
-        _checksum: &str,
-    ) -> Result<()> {
-        self.upload_bytes(key, data).await
-    }
-
-    async fn upload_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
-        let data = tokio::fs::read(path).await?;
-        self.upload_bytes(key, data).await
-    }
-
-    async fn upload_file_with_checksum(
-        &self,
-        key: &str,
-        path: &std::path::Path,
-        _checksum: &str,
-    ) -> Result<()> {
-        self.upload_file(key, path).await
-    }
-
-    async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.objects
             .lock()
             .await
-            .get(key)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Key not found: {}", key))
-    }
-
-    async fn download_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
-        let data = self.download_bytes(key).await?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(path, data).await?;
+            .insert(key.to_string(), data.to_vec());
         Ok(())
     }
 
-    async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut keys: Vec<String> = self
-            .objects
-            .lock()
-            .await
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        keys.sort();
-        Ok(keys)
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.objects.lock().await.remove(key);
+        Ok(())
     }
 
-    async fn list_objects_after(&self, prefix: &str, start_after: &str) -> Result<Vec<String>> {
-        let mut keys: Vec<String> = self
-            .objects
-            .lock()
-            .await
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        let map = self.objects.lock().await;
+        let mut keys: Vec<String> = map
             .keys()
-            .filter(|k| k.starts_with(prefix) && k.as_str() > start_after)
+            .filter(|k| k.starts_with(prefix))
+            .filter(|k| after.map(|a| k.as_str() > a).unwrap_or(true))
             .cloned()
             .collect();
         keys.sort();
@@ -115,23 +78,21 @@ impl walrust::StorageBackend for InMemoryStorage {
         Ok(self.objects.lock().await.contains_key(key))
     }
 
-    async fn get_checksum(&self, _key: &str) -> Result<Option<String>> {
-        Ok(None)
-    }
-
-    async fn delete_object(&self, key: &str) -> Result<()> {
-        self.objects.lock().await.remove(key);
-        Ok(())
-    }
-
-    async fn delete_objects(&self, keys: &[String]) -> Result<usize> {
-        let mut objects = self.objects.lock().await;
-        let mut deleted = 0;
-        for key in keys {
-            if objects.remove(key).is_some() {
-                deleted += 1;
-            }
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        let mut map = self.objects.lock().await;
+        if map.contains_key(key) {
+            return Ok(CasResult { success: false, etag: None });
         }
-        Ok(deleted)
+        map.insert(key.to_string(), data.to_vec());
+        Ok(CasResult { success: true, etag: Some("mem".into()) })
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], _etag: &str) -> Result<CasResult> {
+        let mut map = self.objects.lock().await;
+        if !map.contains_key(key) {
+            return Ok(CasResult { success: false, etag: None });
+        }
+        map.insert(key.to_string(), data.to_vec());
+        Ok(CasResult { success: true, etag: Some("mem".into()) })
     }
 }

@@ -49,6 +49,15 @@ reqwest = { version = "0.12", features = ["json"] }
 # NATS lease store (optional)
 hadb-lease-nats = { path = "../hadb/hadb-lease-nats", version = "0.4.0", optional = true }
 
+# Lease abstractions (trait crate provides FenceSource used by the
+# Cinch storage adapter for fenced writes).
+hadb-lease = { path = "../hadb/hadb-lease", version = "0.4.0" }
+
+# Storage substrate (trait + impls)
+hadb-storage = { path = "../hadb/hadb-storage", version = "0.4.0" }
+hadb-storage-s3 = { path = "../hadb/hadb-storage-s3", version = "0.4.0" }
+hadb-storage-cinch = { path = "../hadb/hadb-storage-cinch", version = "0.4.0" }
+
 # Cinch-protocol HTTP lease store + generic HTTP manifest store
 # (for embedded replicas via Grabby or engine)
 hadb-lease-cinch = { path = "../hadb/hadb-lease-cinch", version = "0.4.0" }

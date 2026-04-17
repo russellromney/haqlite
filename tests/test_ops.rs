@@ -584,43 +584,20 @@ impl FailingDownloadStorage {
 
 #[async_trait]
 impl walrust::StorageBackend for FailingDownloadStorage {
-    fn bucket_name(&self) -> &str {
-        "test-bucket"
-    }
-    async fn upload_bytes(&self, _key: &str, _data: Vec<u8>) -> Result<()> {
-        Ok(())
-    }
-    async fn upload_bytes_with_checksum(
-        &self,
-        _key: &str,
-        _data: Vec<u8>,
-        _checksum: &str,
-    ) -> Result<()> {
-        Ok(())
-    }
-    async fn upload_file(&self, _key: &str, _path: &Path) -> Result<()> {
-        Ok(())
-    }
-    async fn upload_file_with_checksum(
-        &self,
-        _key: &str,
-        _path: &Path,
-        _checksum: &str,
-    ) -> Result<()> {
-        Ok(())
-    }
-    async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
-        // Succeed for the snapshot, fail for the incremental
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         if key.contains("/0001/") {
-            Ok(self.snapshot_data.clone())
+            Ok(Some(self.snapshot_data.clone()))
         } else {
             Err(anyhow::anyhow!("simulated download failure"))
         }
     }
-    async fn download_file(&self, _key: &str, _path: &Path) -> Result<()> {
+    async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
         Ok(())
     }
-    async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
+    async fn delete(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
         let keys = vec![
             "test/0001/0000000000000001.hadbp".to_string(),
             "test/0000/0000000000000002.hadbp".to_string(),
@@ -628,30 +605,26 @@ impl walrust::StorageBackend for FailingDownloadStorage {
         Ok(keys
             .into_iter()
             .filter(|k| k.starts_with(prefix))
-            .collect())
-    }
-    async fn list_objects_after(
-        &self,
-        prefix: &str,
-        start_after: &str,
-    ) -> Result<Vec<String>> {
-        let all = self.list_objects(prefix).await?;
-        Ok(all
-            .into_iter()
-            .filter(|k| k.as_str() > start_after)
+            .filter(|k| after.map(|a| k.as_str() > a).unwrap_or(true))
             .collect())
     }
     async fn exists(&self, _key: &str) -> Result<bool> {
         Ok(true)
     }
-    async fn get_checksum(&self, _key: &str) -> Result<Option<String>> {
-        Ok(None)
+    async fn put_if_absent(
+        &self,
+        _key: &str,
+        _data: &[u8],
+    ) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult { success: true, etag: Some("test".into()) })
     }
-    async fn delete_object(&self, _key: &str) -> Result<()> {
-        Ok(())
-    }
-    async fn delete_objects(&self, keys: &[String]) -> Result<usize> {
-        Ok(keys.len())
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _data: &[u8],
+        _etag: &str,
+    ) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult { success: true, etag: Some("test".into()) })
     }
 }
 
