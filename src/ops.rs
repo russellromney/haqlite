@@ -10,7 +10,6 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use walrust::StorageBackend;
-use walrust::hadb_changeset::storage::{self as cs_storage, ChangesetKind, DiscoveredChangeset};
 
 // ============================================================================
 // Helpers
