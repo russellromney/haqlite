@@ -356,6 +356,7 @@ mod tests {
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
             db_header: None,
+            epoch: 0,
         };
 
         let ha = turbolite_to_ha_storage(&tl);
@@ -416,6 +417,7 @@ mod tests {
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
             db_header: None,
+            epoch: 0,
         };
 
         let ha = turbolite_to_ha_storage(&tl);

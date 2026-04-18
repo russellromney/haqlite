@@ -1634,6 +1634,7 @@ name = "hadb-lease"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "hadb-storage",
 ]
@@ -1802,7 +1803,6 @@ dependencies = [
  "futures",
  "hadb",
  "hadb-cli",
- "hadb-io",
  "hadb-lease",
  "hadb-lease-cinch",
  "hadb-lease-nats",

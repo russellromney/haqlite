@@ -103,6 +103,11 @@ pub struct HaQLiteBuilder {
     /// The proxy handles S3 tiering and fence enforcement.
     /// Haqlite adds the fence token (from the Coordinator lease) internally.
     turbolite_http: Option<(String, String)>,
+    /// Pre-constructed turbolite page storage backend. Mutually exclusive
+    /// with `turbolite_http` and `turbolite_vfs`. Phase Lucid: callers that
+    /// don't want the Cinch HTTP wiring (e.g. direct S3) construct the
+    /// backend themselves and pass it here.
+    turbolite_storage: Option<Arc<dyn hadb_storage::StorageBackend>>,
     authorizer: Option<AuthorizerFactory>,
 }
 
@@ -129,6 +134,7 @@ impl HaQLiteBuilder {
             lease_ttl: None,
             turbolite_vfs: None,
             turbolite_http: None,
+            turbolite_storage: None,
             authorizer: None,
         }
     }
@@ -253,6 +259,19 @@ impl HaQLiteBuilder {
         self
     }
 
+    /// Use a pre-constructed page storage backend for turbolite (Synchronous
+    /// durability). Caller is responsible for constructing the backend
+    /// (`hadb_storage_s3::S3Storage`, `hadb_storage_cinch::CinchHttpStorage`,
+    /// etc.) and any sub-prefix wiring.
+    ///
+    /// Mutually exclusive with `turbolite_http()` and `turbolite_vfs()`.
+    /// Phase Lucid: replaces the implicit `S3Storage::from_env(bucket, endpoint)`
+    /// fallback that fired when no other turbolite config was set.
+    pub fn turbolite_storage(mut self, storage: Arc<dyn hadb_storage::StorageBackend>) -> Self {
+        self.turbolite_storage = Some(storage);
+        self
+    }
+
     /// Manifest polling interval for Shared mode. Default: 1s.
     pub fn manifest_poll_interval(mut self, interval: Duration) -> Self {
         self.manifest_poll_interval = Some(interval);
@@ -353,7 +372,8 @@ impl HaQLiteBuilder {
                         // Cinch HTTP mode: WAL segments flow through /v1/sync/wal
                         // on the Cinch lease/sync server (Grabby or engine-embedded).
                         // Storage adapter reads the fence on every write and refuses
-                        // when no lease is held.
+                        // when no lease is held. (Convenience for the explicit
+                        // turbolite_http() builder method.)
                         let fence: Arc<dyn hadb_lease::FenceSource> =
                             Arc::new(atomic_fence.clone());
                         Some(Arc::new(
@@ -361,13 +381,15 @@ impl HaQLiteBuilder {
                                 .with_fence(fence),
                         ))
                     } else {
-                        // S3-direct mode: build an S3Storage from env.
-                        let s3 = hadb_storage_s3::S3Storage::from_env(
-                            self.bucket.clone(),
-                            self.endpoint.as_deref(),
-                        )
-                        .await?;
-                        Some(Arc::new(s3))
+                        // Phase Lucid: no implicit S3-from-env fallback. Caller
+                        // must pass walrust_storage() explicitly when not using
+                        // turbolite_http().
+                        return Err(anyhow::anyhow!(
+                            "HaMode::Dedicated requires walrust storage. Either call \
+                             HaQLiteBuilder::walrust_storage(...) with an explicit backend, \
+                             or use HaQLiteBuilder::turbolite_http(endpoint, token) to wire \
+                             both walrust + turbolite via the Cinch HTTP path."
+                        ));
                     }
                 } else {
                     None
@@ -375,11 +397,14 @@ impl HaQLiteBuilder {
             }
         };
 
-        // Resolve lease store: explicit > HAQLITE_LEASE_URL env var > error.
-        let lease_store: Arc<dyn hadb::LeaseStore> = match self.lease_store {
-            Some(store) => store,
-            None => resolve_lease_store_from_env(&self.bucket, self.endpoint.as_deref()).await?,
-        };
+        // Phase Lucid: lease store must be explicit. Use haqlite::env::lease_store_from_env
+        // to opt into env-var resolution.
+        let lease_store: Arc<dyn hadb::LeaseStore> = self.lease_store.ok_or_else(|| {
+            anyhow::anyhow!(
+                "HaQLiteBuilder requires lease_store(). Pass an Arc<dyn hadb::LeaseStore>, \
+                 or call haqlite::env::lease_store_from_env(bucket, endpoint).await?"
+            )
+        })?;
 
         // Build coordinator config.
         let mut config = self.coordinator_config.unwrap_or_default();
@@ -412,17 +437,20 @@ impl HaQLiteBuilder {
                 // (for reads, writes, and manifest publishing). S3Primary uses
                 // journal_mode=OFF, so walrust has no WAL to ship.
                 let (follower_behavior, tl_state, manifest_wakeup) = if self.durability == Durability::Synchronous {
-                    let ms: Arc<dyn hadb::ManifestStore> = match self.manifest_store.clone() {
-                        Some(ms) => ms,
-                        None => resolve_manifest_store_from_env(&self.bucket, self.endpoint.as_deref()).await?,
-                    };
+                    // Phase Lucid: manifest store must be explicit for Synchronous mode.
+                    let ms: Arc<dyn hadb::ManifestStore> = self.manifest_store.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Durability::Synchronous + HaMode::Dedicated requires manifest_store(). \
+                             Pass an Arc<dyn hadb::ManifestStore>, or call \
+                             haqlite::env::manifest_store_from_env(bucket, endpoint).await?"
+                        )
+                    })?;
                     let vfs_name = format!("haqlite_ded_sync_{}", uuid::Uuid::new_v4());
                     // Per-database cache dir so turbolite page caches don't collide.
                     let cache_dir = db_path.parent()
                         .unwrap_or_else(|| std::path::Path::new("/tmp"))
                         .join(format!(".tl_cache_{}", db_name));
                     std::fs::create_dir_all(&cache_dir)?;
-                    let tl_prefix = format!("{}tl", self.prefix);
                     let tl_config = turbolite::tiered::TurboliteConfig {
                         cache_dir,
                         sync_mode: turbolite::tiered::SyncMode::Durable,
@@ -445,21 +473,18 @@ impl HaQLiteBuilder {
                         );
                         turbolite::tiered::TurboliteVfs::new_with_storage(tl_config, storage, rt_handle)
                             .map_err(|e| anyhow::anyhow!("turbolite VFS (HTTP) for Dedicated+Sync: {e}"))?
+                    } else if let Some(ref storage) = self.turbolite_storage {
+                        // Phase Lucid: caller-supplied backend.
+                        turbolite::tiered::TurboliteVfs::new_with_storage(tl_config, storage.clone(), rt_handle)
+                            .map_err(|e| anyhow::anyhow!("turbolite VFS (caller-supplied) for Dedicated+Sync: {e}"))?
                     } else {
-                        // S3 mode: construct hadb-storage-s3 directly.
-                        let tl_prefix_for_s3 = tl_prefix.clone();
-                        let bucket = self.bucket.clone();
-                        let endpoint = self.endpoint.clone();
-                        let s3 = rt_handle
-                            .block_on(async move {
-                                hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref())
-                                    .await
-                                    .map(|s| s.with_prefix(tl_prefix_for_s3))
-                            })
-                            .map_err(|e| anyhow::anyhow!("build S3Storage for turbolite: {e}"))?;
-                        let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(s3);
-                        turbolite::tiered::TurboliteVfs::new_with_storage(tl_config, storage, rt_handle.clone())
-                            .map_err(|e| anyhow::anyhow!("turbolite VFS for Dedicated+Sync: {e}"))?
+                        // Phase Lucid: no implicit S3-from-env fallback.
+                        return Err(anyhow::anyhow!(
+                            "Durability::Synchronous requires turbolite page storage. \
+                             Either call HaQLiteBuilder::turbolite_http(endpoint, token), \
+                             HaQLiteBuilder::turbolite_storage(backend), or \
+                             HaQLiteBuilder::turbolite_vfs(vfs, name)."
+                        ));
                     };
                     let shared_vfs = turbolite::tiered::SharedTurboliteVfs::new(vfs);
                     turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone())
@@ -519,11 +544,13 @@ impl HaQLiteBuilder {
                     .unwrap_or(Duration::from_secs(5));
                 let lease_ttl = self.lease_ttl.unwrap_or(5);
 
-                // Auto-create manifest store from S3 if not provided.
-                let manifest_store: Arc<dyn hadb::ManifestStore> = match self.manifest_store {
-                    Some(ms) => ms,
-                    None => resolve_manifest_store_from_env(&self.bucket, self.endpoint.as_deref()).await?,
-                };
+                // Phase Lucid: manifest store must be explicit for Shared mode.
+                let manifest_store: Arc<dyn hadb::ManifestStore> = self.manifest_store.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "HaMode::Shared requires manifest_store(). Pass an Arc<dyn hadb::ManifestStore>, \
+                         or call haqlite::env::manifest_store_from_env(bucket, endpoint).await?"
+                    )
+                })?;
 
                 // Auto-create turbolite VFS if not provided.
                 // Synchronous = S3Primary, Eventual = default (Durable).
@@ -539,9 +566,6 @@ impl HaQLiteBuilder {
                             .unwrap_or_else(|| std::path::Path::new("/tmp"))
                             .join(format!(".tl_cache_{}", db_name));
                         std::fs::create_dir_all(&cache_dir)?;
-                        // turbolite gets its own sub-prefix to avoid key collisions
-                        // with haqlite lease/manifest keys.
-                        let tl_prefix = format!("{}tl", self.prefix);
                         let config = turbolite::tiered::TurboliteConfig {
                             cache_dir,
                             sync_mode,
@@ -559,20 +583,18 @@ impl HaQLiteBuilder {
                             );
                             turbolite::tiered::TurboliteVfs::new_with_storage(config, storage, rt_handle)
                                 .map_err(|e| anyhow::anyhow!("auto-create turbolite VFS (HTTP): {e}"))?
+                        } else if let Some(ref storage) = self.turbolite_storage {
+                            // Phase Lucid: caller-supplied backend.
+                            turbolite::tiered::TurboliteVfs::new_with_storage(config, storage.clone(), rt_handle)
+                                .map_err(|e| anyhow::anyhow!("auto-create turbolite VFS (caller-supplied): {e}"))?
                         } else {
-                            let tl_prefix_for_s3 = tl_prefix.clone();
-                            let bucket = self.bucket.clone();
-                            let endpoint = self.endpoint.clone();
-                            let s3 = rt_handle
-                                .block_on(async move {
-                                    hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref())
-                                        .await
-                                        .map(|s| s.with_prefix(tl_prefix_for_s3))
-                                })
-                                .map_err(|e| anyhow::anyhow!("build S3Storage for turbolite: {e}"))?;
-                            let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(s3);
-                            turbolite::tiered::TurboliteVfs::new_with_storage(config, storage, rt_handle.clone())
-                                .map_err(|e| anyhow::anyhow!("auto-create turbolite VFS: {e}"))?
+                            // Phase Lucid: no implicit S3-from-env fallback.
+                            return Err(anyhow::anyhow!(
+                                "HaMode::Shared requires turbolite page storage. Either call \
+                                 HaQLiteBuilder::turbolite_http(endpoint, token), \
+                                 HaQLiteBuilder::turbolite_storage(backend), or \
+                                 HaQLiteBuilder::turbolite_vfs(vfs, name)."
+                            ));
                         };
                         let shared = turbolite::tiered::SharedTurboliteVfs::new(vfs);
                         turbolite::tiered::register_shared(&vfs_name, shared.clone())
@@ -2148,171 +2170,6 @@ fn open_leader_connection(db_path: &Path) -> Result<rusqlite::Connection> {
     Ok(conn)
 }
 
-/// Resolve lease store from HAQLITE_LEASE_URL env var.
-///
-/// Supported schemes:
-///   http://host:port?token=...   -> CinchLeaseStore
-///   https://host:port?token=...  -> CinchLeaseStore
-///   nats://host:port?bucket=...  -> NatsLeaseStore (requires nats-lease feature)
-///   s3://bucket?endpoint=...     -> S3LeaseStore
-///
-/// Falls back to S3LeaseStore using the builder's bucket/endpoint if
-/// HAQLITE_LEASE_URL is "s3" (bare keyword, uses builder config).
-async fn resolve_lease_store_from_env(
-    bucket: &str,
-    endpoint: Option<&str>,
-) -> Result<Arc<dyn hadb::LeaseStore>> {
-    let url = std::env::var("HAQLITE_LEASE_URL").map_err(|_| {
-        anyhow::anyhow!(
-            "No lease store configured. Either call .lease_store() / .lease_endpoint() \
-             on the builder, or set HAQLITE_LEASE_URL.\n\
-             Examples:\n  \
-               HAQLITE_LEASE_URL=http://proxy:8080?token=mytoken\n  \
-               HAQLITE_LEASE_URL=nats://localhost:4222?bucket=leases\n  \
-               HAQLITE_LEASE_URL=s3  (uses builder bucket/endpoint)"
-        )
-    })?;
-
-    if url == "s3" || url.starts_with("s3://") {
-        let (s3_bucket, s3_endpoint) = if url == "s3" {
-            (bucket.to_string(), endpoint.map(|s| s.to_string()))
-        } else {
-            // s3://bucket-name?endpoint=https://...
-            let parsed = parse_url_params(&url[5..]);
-            (parsed.host, parsed.params.get("endpoint").cloned())
-        };
-        // Build the S3 client with explicit endpoint, bypassing AWS_ENDPOINT_URL_S3
-        // env var which may point to a different service (e.g., Grabby).
-        let base_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .load()
-            .await;
-        let mut s3_builder = aws_sdk_s3::config::Builder::from(&base_config)
-            .force_path_style(true);
-        if let Some(ref ep) = s3_endpoint {
-            s3_builder = s3_builder.endpoint_url(ep);
-        }
-        let client = aws_sdk_s3::Client::from_conf(s3_builder.build());
-        tracing::info!("Using S3 lease store: bucket={} endpoint={:?}", s3_bucket, s3_endpoint);
-        return Ok(Arc::new(S3LeaseStore::new(client, s3_bucket)));
-    }
-
-    if url.starts_with("http://") || url.starts_with("https://") {
-        let parsed = parse_url_params(&url);
-        let token = parsed.params.get("token").cloned().unwrap_or_default();
-        let endpoint = parsed.base;
-        tracing::info!("Using Cinch HTTP lease store: {}", endpoint);
-        return Ok(Arc::new(hadb_lease_cinch::CinchLeaseStore::new(
-            &endpoint, &token,
-        )));
-    }
-
-    #[cfg(feature = "nats-lease")]
-    if url.starts_with("nats://") {
-        let parsed = parse_url_params(&url);
-        let nats_bucket = parsed
-            .params
-            .get("bucket")
-            .cloned()
-            .unwrap_or_else(|| "haqlite-leases".to_string());
-        tracing::info!("Using NATS lease store: {} bucket={}", parsed.base, nats_bucket);
-        let store = hadb_lease_nats::NatsLeaseStore::connect(&parsed.base, &nats_bucket).await?;
-        return Ok(Arc::new(store));
-    }
-    #[cfg(not(feature = "nats-lease"))]
-    if url.starts_with("nats://") {
-        return Err(anyhow::anyhow!(
-            "HAQLITE_LEASE_URL uses nats:// but haqlite was compiled without the nats-lease feature"
-        ));
-    }
-
-    Err(anyhow::anyhow!(
-        "Unsupported HAQLITE_LEASE_URL scheme: {}. Supported: http://, https://, nats://, s3://, s3",
-        url
-    ))
-}
-
-/// Resolve manifest store from HAQLITE_MANIFEST_URL env var.
-///
-/// Same scheme dispatch as lease store.
-async fn resolve_manifest_store_from_env(
-    bucket: &str,
-    endpoint: Option<&str>,
-) -> Result<Arc<dyn hadb::ManifestStore>> {
-    let url = std::env::var("HAQLITE_MANIFEST_URL").map_err(|_| {
-        anyhow::anyhow!(
-            "No manifest store configured. Either call .manifest_store() / .manifest_endpoint() \
-             on the builder, or set HAQLITE_MANIFEST_URL.\n\
-             Examples:\n  \
-               HAQLITE_MANIFEST_URL=http://proxy:8080?token=mytoken\n  \
-               HAQLITE_MANIFEST_URL=nats://localhost:4222?bucket=manifests\n  \
-               HAQLITE_MANIFEST_URL=s3  (uses builder bucket/endpoint)"
-        )
-    })?;
-
-    if url == "s3" || url.starts_with("s3://") {
-        #[cfg(feature = "s3-manifest")]
-        {
-            let (s3_bucket, s3_endpoint) = if url == "s3" {
-                (bucket.to_string(), endpoint.map(|s| s.to_string()))
-            } else {
-                let parsed = parse_url_params(&url[5..]);
-                (parsed.host, parsed.params.get("endpoint").cloned())
-            };
-            let base_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .load()
-                .await;
-            let mut s3_builder = aws_sdk_s3::config::Builder::from(&base_config)
-                .force_path_style(true);
-            if let Some(ref ep) = s3_endpoint {
-                s3_builder = s3_builder.endpoint_url(ep);
-            }
-            let client = aws_sdk_s3::Client::from_conf(s3_builder.build());
-            tracing::info!("Using S3 manifest store: bucket={} endpoint={:?}", s3_bucket, s3_endpoint);
-            return Ok(Arc::new(hadb_manifest_s3::S3ManifestStore::new(
-                client, s3_bucket,
-            )));
-        }
-        #[cfg(not(feature = "s3-manifest"))]
-        return Err(anyhow::anyhow!(
-            "HAQLITE_MANIFEST_URL uses s3 but haqlite was compiled without the s3-manifest feature"
-        ));
-    }
-
-    if url.starts_with("http://") || url.starts_with("https://") {
-        let parsed = parse_url_params(&url);
-        let token = parsed.params.get("token").cloned().unwrap_or_default();
-        let endpoint = parsed.base;
-        tracing::info!("Using HTTP manifest store: {}", endpoint);
-        return Ok(Arc::new(hadb_manifest_http::HttpManifestStore::new(
-            &endpoint, &token,
-        )));
-    }
-
-    #[cfg(feature = "nats-manifest")]
-    if url.starts_with("nats://") {
-        let parsed = parse_url_params(&url);
-        let nats_bucket = parsed
-            .params
-            .get("bucket")
-            .cloned()
-            .unwrap_or_else(|| "haqlite-manifests".to_string());
-        tracing::info!("Using NATS manifest store: {} bucket={}", parsed.base, nats_bucket);
-        let store =
-            hadb_manifest_nats::NatsManifestStore::connect(&parsed.base, &nats_bucket).await?;
-        return Ok(Arc::new(store));
-    }
-    #[cfg(not(feature = "nats-manifest"))]
-    if url.starts_with("nats://") {
-        return Err(anyhow::anyhow!(
-            "HAQLITE_MANIFEST_URL uses nats:// but haqlite was compiled without the nats-manifest feature"
-        ));
-    }
-
-    Err(anyhow::anyhow!(
-        "Unsupported HAQLITE_MANIFEST_URL scheme: {}. Supported: http://, https://, nats://, s3://, s3",
-        url
-    ))
-}
 
 /// Parse a URL into base (scheme + host + port + path) and query params.
 struct ParsedUrl {

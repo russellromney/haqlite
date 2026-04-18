@@ -103,17 +103,39 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
 
     // If NATS URL is set, try to use NATS for leases (faster than S3).
     // Falls back to S3 leases if NATS connection fails.
+    let mut lease_store_configured = false;
     #[cfg(feature = "nats-lease")]
     if let Ok(nats_url) = std::env::var("WAL_LEASE_NATS_URL") {
         match hadb_lease_nats::NatsLeaseStore::connect(&nats_url, "hadb-leases").await {
             Ok(store) => {
                 info!(url = %nats_url, "using NATS lease store");
                 builder = builder.lease_store(std::sync::Arc::new(store));
+                lease_store_configured = true;
             }
             Err(e) => {
                 error!(url = %nats_url, error = %e, "NATS lease store connection failed, falling back to S3 leases");
             }
         }
+    }
+
+    // Phase Lucid: builder no longer reads HAQLITE_LEASE_URL implicitly.
+    // Default to S3 lease store using the CLI's bucket/endpoint.
+    if !lease_store_configured {
+        let mut s3_cfg = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(ep) = shared.s3.endpoint.as_deref() {
+            s3_cfg = s3_cfg.endpoint_url(ep);
+        }
+        let cfg = s3_cfg.load().await;
+        let mut s3b = aws_sdk_s3::config::Builder::from(&cfg).force_path_style(true);
+        if let Some(ep) = shared.s3.endpoint.as_deref() {
+            s3b = s3b.endpoint_url(ep);
+        }
+        let client = aws_sdk_s3::Client::from_conf(s3b.build());
+        let lease: std::sync::Arc<dyn hadb::LeaseStore> = std::sync::Arc::new(
+            crate::S3LeaseStore::new(client, shared.s3.bucket.clone())
+        );
+        info!("Phase Lucid: using S3 lease store from CLI args (bucket={})", shared.s3.bucket);
+        builder = builder.lease_store(lease);
     }
 
     // If NATS URL is set, try to use NATS for manifests (faster than S3).
@@ -163,6 +185,27 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
 
     // Suppress unused warning when neither manifest feature is enabled.
     let _ = manifest_store_configured;
+
+    // Phase Lucid: explicit walrust + turbolite storage. Builder no longer
+    // falls back to S3Storage::from_env for either.
+    let walrust_storage = std::sync::Arc::new(
+        hadb_storage_s3::S3Storage::from_env(
+            shared.s3.bucket.clone(),
+            shared.s3.endpoint.as_deref(),
+        )
+        .await?,
+    );
+    builder = builder.walrust_storage(walrust_storage);
+
+    let turbolite_storage: std::sync::Arc<dyn hadb_storage::StorageBackend> = std::sync::Arc::new(
+        hadb_storage_s3::S3Storage::from_env(
+            shared.s3.bucket.clone(),
+            shared.s3.endpoint.as_deref(),
+        )
+        .await?
+        .with_prefix(format!("{}tl", serve.prefix)),
+    );
+    builder = builder.turbolite_storage(turbolite_storage);
 
     let db_path_str = db_path
         .to_str()
