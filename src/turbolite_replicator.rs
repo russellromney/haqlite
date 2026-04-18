@@ -212,6 +212,13 @@ pub fn ha_storage_to_turbolite(storage: &StorageManifest) -> TurboliteManifest {
         } => TurboliteManifest {
             version: *turbolite_version,
             change_counter: 0,
+            // hadb::StorageManifest does not carry turbolite's epoch field;
+            // this conversion path (haqlite manifest_store → turbolite) is
+            // used by ha followers catching up from an HA manifest store.
+            // Phase Strata's fork epoch is delivered via the direct
+            // fetch_and_apply_remote_manifest() path (StorageBackend) and
+            // via the engine's pre-wake check — not through here.
+            epoch: 0,
             page_count: *page_count,
             page_size: *page_size,
             pages_per_group: *pages_per_group,
@@ -285,6 +292,7 @@ pub fn ha_storage_to_turbolite(storage: &StorageManifest) -> TurboliteManifest {
             TurboliteManifest {
                 version: 0,
                 change_counter: 0,
+                epoch: 0,
                 page_count: 0,
                 page_size: 0,
                 pages_per_group: 0,
