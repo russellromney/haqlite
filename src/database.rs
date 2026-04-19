@@ -96,7 +96,7 @@ pub struct HaQLiteBuilder {
     manifest_store: Option<Arc<dyn hadb::ManifestStore>>,
     manifest_poll_interval: Option<Duration>,
     write_timeout: Option<Duration>,
-    walrust_storage: Option<Arc<dyn walrust::StorageBackend>>,
+    walrust_storage: Option<Arc<dyn hadb_storage::StorageBackend>>,
     lease_ttl: Option<u64>,
     turbolite_vfs: Option<(turbolite::tiered::SharedTurboliteVfs, String)>,
     /// HTTP endpoint + token for turbolite page storage through a proxy.
@@ -291,9 +291,12 @@ impl HaQLiteBuilder {
         self
     }
 
-    /// Use a custom walrust StorageBackend instead of building from S3 env.
-    /// For testing with in-memory storage.
-    pub fn walrust_storage(mut self, storage: Arc<dyn walrust::StorageBackend>) -> Self {
+    /// Use a custom storage backend for walrust's WAL/snapshot writes.
+    /// Pass any `Arc<dyn hadb_storage::StorageBackend>` (S3, Cinch HTTP,
+    /// in-memory, etc.). For tests this is the in-memory backend; for
+    /// production it's typically `hadb_storage_s3::S3Storage` or
+    /// `hadb_storage_cinch::CinchHttpStorage`.
+    pub fn walrust_storage(mut self, storage: Arc<dyn hadb_storage::StorageBackend>) -> Self {
         self.walrust_storage = Some(storage);
         self
     }
@@ -364,7 +367,7 @@ impl HaQLiteBuilder {
         let (atomic_fence, atomic_fence_writer) = hadb_lease::AtomicFence::new();
         let fence_writer = Arc::new(atomic_fence_writer);
 
-        let walrust_storage_opt: Option<Arc<dyn walrust::StorageBackend>> = match self.walrust_storage {
+        let walrust_storage_opt: Option<Arc<dyn hadb_storage::StorageBackend>> = match self.walrust_storage {
             Some(storage) => Some(storage),
             None => {
                 if self.mode == HaMode::Dedicated {
@@ -681,7 +684,7 @@ pub(crate) struct HaQLiteInner {
     /// Direct replicator access (Shared mode).
     shared_replicator: Option<Arc<SqliteReplicator>>,
     /// Walrust storage backend for pull_incremental.
-    shared_walrust_storage: Option<Arc<dyn walrust::StorageBackend>>,
+    shared_walrust_storage: Option<Arc<dyn hadb_storage::StorageBackend>>,
     /// S3 prefix for lease/manifest keys.
     shared_prefix: String,
     /// Instance ID for this node.

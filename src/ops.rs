@@ -1,7 +1,7 @@
 //! CLI operations for haqlite: list, verify, compact, snapshot, replicate.
 //!
 //! These are the implementations behind `haqlite list`, `haqlite verify`, etc.
-//! They operate on a `walrust::StorageBackend` (S3-compatible object store)
+//! They operate on a `hadb_storage::StorageBackend` (S3-compatible object store)
 //! and parse the HADBP changeset format from S3 key names.
 
 use std::path::Path;
@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use walrust::StorageBackend;
+use hadb_storage::StorageBackend;
 
 // ============================================================================
 // Helpers

@@ -83,7 +83,7 @@ impl hadb::LeaseStore for TrackingLeaseStore {
 // ============================================================================
 
 fn build_coordinator(
-    walrust_storage: Arc<dyn walrust::StorageBackend>,
+    walrust_storage: Arc<dyn hadb_storage::StorageBackend>,
     lease_store: Arc<dyn hadb::LeaseStore>,
     instance_id: &str,
     address: &str,
@@ -131,7 +131,7 @@ async fn custom_lease_store_is_used() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("custom_lease.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> =
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> =
         Arc::new(InMemoryStorage::new());
     let tracking_store = Arc::new(TrackingLeaseStore::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = tracking_store.clone();
@@ -199,7 +199,7 @@ async fn builder_lease_store_method_compiles_and_sets() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("builder_method.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> =
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> =
         Arc::new(InMemoryStorage::new());
     let tracking_store = Arc::new(TrackingLeaseStore::new());
 
@@ -235,7 +235,7 @@ async fn lease_renewal_uses_custom_store() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("renewal.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> =
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> =
         Arc::new(InMemoryStorage::new());
     let tracking_store = Arc::new(TrackingLeaseStore::new());
 
@@ -285,7 +285,7 @@ async fn two_nodes_custom_lease_store() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> =
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> =
         Arc::new(InMemoryStorage::new());
     let shared_lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
@@ -352,7 +352,7 @@ async fn default_lease_store_still_works() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("default_lease.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> =
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> =
         Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
@@ -429,7 +429,7 @@ async fn nats_lease_store_integration() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("nats_lease.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> =
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> =
         Arc::new(InMemoryStorage::new());
 
     let coordinator = build_coordinator(

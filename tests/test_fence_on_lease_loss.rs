@@ -21,7 +21,7 @@ use haqlite::{
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT)";
 
 fn build_coordinator(
-    storage: Arc<dyn walrust::StorageBackend>,
+    storage: Arc<dyn hadb_storage::StorageBackend>,
     lease_store: Arc<dyn hadb::LeaseStore>,
     instance_id: &str,
     address: &str,
@@ -69,7 +69,7 @@ async fn leader_fenced_on_lease_loss() {
     std::fs::create_dir_all(&leader_dir).expect("mkdir");
     std::fs::create_dir_all(&follower_dir).expect("mkdir");
 
-    let storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
 
     // Short TTL and fast renewal so lease loss is detected quickly

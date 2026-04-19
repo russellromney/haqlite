@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use tokio::sync::watch;
 
 use hadb::{FollowerBehavior, HaMetrics, Replicator};
-use walrust::StorageBackend as WalrustStorageBackend;
+use hadb_storage::StorageBackend;
 
 /// SQLite-specific follower behavior.
 ///
@@ -23,7 +23,7 @@ use walrust::StorageBackend as WalrustStorageBackend;
 /// and applies via set_manifest. No WAL exists in S3Primary mode.
 pub struct SqliteFollowerBehavior {
     /// walrust storage backend for WAL-based replication.
-    walrust_storage: Arc<dyn WalrustStorageBackend>,
+    walrust_storage: Arc<dyn StorageBackend>,
     /// Optional turbolite VFS for manifest-based catch-up (Synchronous durability).
     /// When set, the follower polls turbolite's S3 manifest instead of walrust WAL.
     turbolite_vfs: Option<turbolite::tiered::SharedTurboliteVfs>,
@@ -34,7 +34,7 @@ pub struct SqliteFollowerBehavior {
 }
 
 impl SqliteFollowerBehavior {
-    pub fn new(walrust_storage: Arc<dyn WalrustStorageBackend>) -> Self {
+    pub fn new(walrust_storage: Arc<dyn StorageBackend>) -> Self {
         Self {
             walrust_storage,
             turbolite_vfs: None,

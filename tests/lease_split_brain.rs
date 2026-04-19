@@ -62,7 +62,7 @@ impl SlowStorage {
 }
 
 #[async_trait]
-impl walrust::StorageBackend for SlowStorage {
+impl hadb_storage::StorageBackend for SlowStorage {
     async fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
         let delay = *self.upload_delay.lock().await;
         if !delay.is_zero() {

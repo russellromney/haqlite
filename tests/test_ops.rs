@@ -583,7 +583,7 @@ impl FailingDownloadStorage {
 }
 
 #[async_trait]
-impl walrust::StorageBackend for FailingDownloadStorage {
+impl hadb_storage::StorageBackend for FailingDownloadStorage {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         if key.contains("/0001/") {
             Ok(Some(self.snapshot_data.clone()))

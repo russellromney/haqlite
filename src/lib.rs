@@ -65,6 +65,7 @@ pub use hadb_manifest_http::HttpManifestStore;
 pub use follower_behavior::SqliteFollowerBehavior;
 pub use replicator::SqliteReplicator;
 
-// Re-export walrust types so downstream crates don't need a direct walrust dependency.
-pub use walrust::StorageBackend as WalrustStorageBackend;
+// Re-export walrust's WAL replication config so downstream crates don't need
+// a direct walrust dep. The storage trait is *not* re-exported — consumers
+// import `hadb_storage::StorageBackend` directly.
 pub use walrust::ReplicationConfig;

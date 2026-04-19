@@ -26,7 +26,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS test_data (
 // ============================================================================
 
 fn build_coordinator(
-    walrust_storage: Arc<dyn walrust::StorageBackend>,
+    walrust_storage: Arc<dyn hadb_storage::StorageBackend>,
     lease_store: Arc<dyn hadb::LeaseStore>,
     instance_id: &str,
     address: &str,
@@ -105,7 +105,7 @@ async fn single_node_execute_and_query() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let coordinator = build_coordinator(
@@ -164,7 +164,7 @@ async fn two_node_forwarded_write() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     // Start leader.
@@ -239,7 +239,7 @@ async fn forwarding_error_no_leader() {
     let tmp = TempDir::new().unwrap();
     let follower_path = tmp.path().join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     // Write a fake lease directly — points to a port where nothing is listening.
@@ -331,7 +331,7 @@ async fn auth_rejects_wrong_secret() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     // Leader with secret "correct-token".
@@ -403,7 +403,7 @@ async fn auth_accepts_correct_secret() {
     let leader_path = leader_dir.join("ha.db");
     let follower_path = follower_dir.join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     // Both nodes with same secret.
@@ -603,7 +603,7 @@ async fn error_execute_on_follower_with_dead_leader_returns_leader_unavailable()
     let tmp = TempDir::new().unwrap();
     let follower_path = tmp.path().join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     // Fake lease pointing to a dead port.
@@ -712,7 +712,7 @@ async fn retry_forwarding_does_not_retry_4xx() {
     std::fs::create_dir_all(&leader_dir).unwrap();
     std::fs::create_dir_all(&follower_dir).unwrap();
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let mut leader = HaQLite::from_coordinator_with_secret(
@@ -764,7 +764,7 @@ async fn retry_forwarding_succeeds_on_first_attempt() {
     std::fs::create_dir_all(&leader_dir).unwrap();
     std::fs::create_dir_all(&follower_dir).unwrap();
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let mut leader = HaQLite::from_coordinator(
@@ -812,7 +812,7 @@ async fn retry_forwarding_retries_on_connection_error() {
     let tmp = TempDir::new().unwrap();
     let follower_path = tmp.path().join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let fake_lease = serde_json::json!({
@@ -930,7 +930,7 @@ async fn close_ha_node_is_clean() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let coordinator = build_coordinator(
@@ -991,7 +991,7 @@ async fn error_not_leader_when_no_address() {
     let tmp = TempDir::new().unwrap();
     let follower_path = tmp.path().join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     // Fake lease with empty address.
@@ -1064,7 +1064,7 @@ async fn ha_leader_is_caught_up() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let coordinator = build_coordinator(
@@ -1087,7 +1087,7 @@ async fn prometheus_contains_readiness_gauges() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let coordinator = build_coordinator(
@@ -1130,7 +1130,7 @@ async fn regression_hadb_prometheus_has_nonzero_caught_up_for_leader() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let coordinator = build_coordinator(
@@ -1161,7 +1161,7 @@ async fn regression_close_completes_fully() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let coordinator = build_coordinator(
@@ -1209,7 +1209,7 @@ async fn handoff_ha_leader_succeeds() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let coordinator = build_coordinator(
@@ -1239,7 +1239,7 @@ async fn handoff_preserves_data() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("ha.db");
 
-    let walrust_storage: Arc<dyn walrust::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
 
     let coordinator = build_coordinator(
