@@ -417,12 +417,12 @@ impl HaQLiteBuilder {
             instance_id.clone(),
             address.clone(),
         ));
-        // HTTP-backed storage: the token already scopes by database, so the
-        // lease key is just the semantic name "writer". The fence is
-        // enforced by the proxy on writes.
+        // HTTP-backed storage path: the lease store is `CinchLeaseStore`
+        // (or a compatible token-scoped backend). Phase Fjord moved the
+        // "writer"-key default into `CinchLeaseStore::key_for`, so there's
+        // no override to set here — only the fence wiring.
         if self.turbolite_http.is_some() {
             config.fence_writer = Some(fence_writer.clone());
-            config.lease_key = Some("writer".to_string());
         }
 
         match self.mode {
