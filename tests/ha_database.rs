@@ -32,7 +32,11 @@ fn build_coordinator(
     address: &str,
 ) -> Arc<Coordinator> {
     let config = CoordinatorConfig {
-        lease: Some(LeaseConfig::new(instance_id.to_string(), address.to_string())),
+        lease: Some(LeaseConfig::new(
+            lease_store,
+            instance_id.to_string(),
+            address.to_string(),
+        )),
         ..Default::default()
     };
 
@@ -47,7 +51,6 @@ fn build_coordinator(
 
     Coordinator::new(
         replicator,
-        Some(lease_store),
         None, // manifest_store
         None, // node_registry
         follower_behavior,

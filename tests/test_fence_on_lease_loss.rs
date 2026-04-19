@@ -36,7 +36,7 @@ fn build_coordinator(
             follower_poll_interval: follower_poll,
             required_expired_reads: 1,
             max_consecutive_renewal_errors: 1, // fence fast on renewal failure
-            ..LeaseConfig::new(instance_id.to_string(), address.to_string())
+            ..LeaseConfig::new(lease_store, instance_id.to_string(), address.to_string())
         }),
         sync_interval: Duration::from_millis(100),
         ..Default::default()
@@ -52,7 +52,6 @@ fn build_coordinator(
 
     Coordinator::new(
         replicator,
-        Some(lease_store),
         None,
         None,
         follower_behavior,

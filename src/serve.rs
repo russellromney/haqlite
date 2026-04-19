@@ -14,7 +14,7 @@ use axum::routing::get;
 use axum::Json;
 use tracing::{error, info};
 
-use hadb::{CoordinatorConfig, LeaseConfig, Role};
+use hadb::{CoordinatorConfig, Role};
 use hadb_cli::SharedConfig;
 
 use crate::cli_config::ServeConfig;
@@ -63,15 +63,15 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
 
     let address = format!("http://0.0.0.0:{}", serve.forwarding_port);
 
-    let mut lease_config = LeaseConfig::new(instance_id.clone(), address.clone());
-    lease_config.ttl_secs = shared.lease.ttl_secs;
-    lease_config.renew_interval = shared.lease.renew_interval();
-    lease_config.follower_poll_interval = shared.lease.poll_interval();
-
+    // The HaQLite builder constructs the per-database `LeaseConfig` itself
+    // at finalize-time (it owns the lease store, instance id, and address).
+    // Any `LeaseConfig` set here would be overwritten — leave it `None`.
+    // (Pre-Fjord this code path silently lost the timing knobs from
+    // `shared.lease`; tracking that as a separate bug.)
     let coordinator_config = CoordinatorConfig {
         sync_interval: Duration::from_millis(serve.sync_interval_ms),
         follower_pull_interval: Duration::from_millis(serve.follower_pull_ms),
-        lease: Some(lease_config),
+        lease: None,
         ..Default::default()
     };
 

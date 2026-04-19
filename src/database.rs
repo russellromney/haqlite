@@ -409,9 +409,14 @@ impl HaQLiteBuilder {
             )
         })?;
 
-        // Build coordinator config.
+        // Build coordinator config. The lease store now lives inside
+        // `LeaseConfig` (Phase Fjord) — store + policy travel together.
         let mut config = self.coordinator_config.unwrap_or_default();
-        config.lease = Some(LeaseConfig::new(instance_id.clone(), address.clone()));
+        config.lease = Some(LeaseConfig::new(
+            lease_store.clone(),
+            instance_id.clone(),
+            address.clone(),
+        ));
         // HTTP-backed storage: the token already scopes by database, so the
         // lease key is just the semantic name "writer". The fence is
         // enforced by the proxy on writes.
@@ -513,10 +518,10 @@ impl HaQLiteBuilder {
                     (fb, None, None)
                 };
 
-                // Build hadb Coordinator.
+                // Build hadb Coordinator. Lease store is in `config.lease`
+                // already; Coordinator no longer takes it as a separate arg.
                 let coordinator = Coordinator::new(
                     replicator,
-                    Some(lease_store),
                     self.manifest_store.clone(),
                     None, // node_registry
                     follower_behavior,

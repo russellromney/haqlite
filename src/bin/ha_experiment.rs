@@ -26,7 +26,7 @@ use clap::Parser;
 use std::sync::Arc;
 use tracing::{error, info};
 
-use haqlite::{CoordinatorConfig, HaQLite, LeaseConfig, Role, SqlValue};
+use haqlite::{CoordinatorConfig, HaQLite, Role, SqlValue};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS test_data (
     id INTEGER PRIMARY KEY,
@@ -288,15 +288,16 @@ async fn main() -> Result<()> {
     });
     let address = format!("http://localhost:{}", forwarding_port);
 
-    let mut lease_config = LeaseConfig::new(instance_id.clone(), address.clone());
-    lease_config.ttl_secs = args.lease_ttl;
-    lease_config.renew_interval = std::time::Duration::from_millis(args.renew_interval_ms);
-    lease_config.follower_poll_interval = std::time::Duration::from_millis(args.follower_poll_ms);
-
+    // The HaQLite builder constructs the per-database `LeaseConfig` itself
+    // at finalize-time (it owns the lease store, instance id, and address).
+    // Lease timing knobs (--lease-ttl, --renew-interval-ms, etc.) are
+    // currently not threaded into the builder — pre-existing bug, tracked
+    // separately. Phase Fjord just unblocks the build.
+    let _ = (args.lease_ttl, args.renew_interval_ms, args.follower_poll_ms);
     let coordinator_config = CoordinatorConfig {
         sync_interval: std::time::Duration::from_millis(args.sync_interval_ms),
         follower_pull_interval: std::time::Duration::from_millis(args.follower_pull_ms),
-        lease: Some(lease_config),
+        lease: None,
         ..Default::default()
     };
 

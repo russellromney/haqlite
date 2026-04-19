@@ -40,6 +40,7 @@ fn build_coordinator(
 ) -> Arc<Coordinator> {
     let config = CoordinatorConfig {
         lease: Some(LeaseConfig::new(
+            lease_store,
             instance_id.to_string(),
             address.to_string(),
         )),
@@ -58,7 +59,6 @@ fn build_coordinator(
     let follower_behavior = Arc::new(SqliteFollowerBehavior::new(walrust_storage));
     Coordinator::new(
         replicator,
-        Some(lease_store),
         None, // manifest_store
         None, // node_registry
         follower_behavior,
@@ -1395,7 +1395,7 @@ fn build_coordinator_fast(
     instance_id: &str,
     address: &str,
 ) -> Arc<Coordinator> {
-    let mut lease_config = LeaseConfig::new(instance_id.to_string(), address.to_string());
+    let mut lease_config = LeaseConfig::new(lease_store, instance_id.to_string(), address.to_string());
     lease_config.ttl_secs = 3;
     lease_config.renew_interval = Duration::from_millis(500);
     lease_config.follower_poll_interval = Duration::from_millis(200);
@@ -1420,7 +1420,6 @@ fn build_coordinator_fast(
     let follower_behavior = Arc::new(SqliteFollowerBehavior::new(walrust_storage));
     Coordinator::new(
         replicator,
-        Some(lease_store),
         None, // manifest_store
         None, // node_registry
         follower_behavior,
