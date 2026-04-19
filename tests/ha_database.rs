@@ -257,7 +257,7 @@ async fn forwarding_error_no_leader() {
     });
     lease_store
         .write_if_not_exists(
-            "test/ha/_lease.json",
+            "ha",
             serde_json::to_vec(&fake_lease).unwrap(),
         )
         .await
@@ -619,7 +619,7 @@ async fn error_execute_on_follower_with_dead_leader_returns_leader_unavailable()
         "sleeping": false,
     });
     lease_store
-        .write_if_not_exists("test/ha/_lease.json", serde_json::to_vec(&fake_lease).unwrap())
+        .write_if_not_exists("ha", serde_json::to_vec(&fake_lease).unwrap())
         .await
         .unwrap();
 
@@ -827,7 +827,7 @@ async fn retry_forwarding_retries_on_connection_error() {
         "sleeping": false,
     });
     lease_store
-        .write_if_not_exists("test/ha/_lease.json", serde_json::to_vec(&fake_lease).unwrap())
+        .write_if_not_exists("ha", serde_json::to_vec(&fake_lease).unwrap())
         .await
         .unwrap();
 
@@ -1007,7 +1007,7 @@ async fn error_not_leader_when_no_address() {
         "sleeping": false,
     });
     lease_store
-        .write_if_not_exists("test/ha/_lease.json", serde_json::to_vec(&fake_lease).unwrap())
+        .write_if_not_exists("ha", serde_json::to_vec(&fake_lease).unwrap())
         .await
         .unwrap();
 
