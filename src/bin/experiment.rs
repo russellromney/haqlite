@@ -465,14 +465,9 @@ async fn main() -> Result<()> {
 
     match mode {
         HaMode::Dedicated => {
-            // Lease timing knobs (--lease-ttl etc.) are currently dropped on the
-            // floor — the haqlite builder constructs its own LeaseConfig at
-            // finalize-time. Pre-existing bug; tracked separately.
-            let _ = (
-                args.lease_ttl,
-                args.renew_interval_ms,
-                args.follower_poll_ms,
-            );
+            // --lease-ttl is applied above on the builder (covers both modes).
+            // --renew-interval-ms and --follower-poll-ms are Dedicated-only and
+            // flow through the dedicated builder setters.
             let coordinator_config = haqlite::CoordinatorConfig {
                 sync_interval: std::time::Duration::from_millis(args.sync_interval_ms),
                 follower_pull_interval: std::time::Duration::from_millis(args.follower_pull_ms),
@@ -483,7 +478,9 @@ async fn main() -> Result<()> {
             builder = builder
                 .forwarding_port(forwarding_port)
                 .address(&address)
-                .coordinator_config(coordinator_config);
+                .coordinator_config(coordinator_config)
+                .lease_renew_interval(std::time::Duration::from_millis(args.renew_interval_ms))
+                .lease_follower_poll_interval(std::time::Duration::from_millis(args.follower_poll_ms));
         }
         HaMode::Shared => {
             builder = builder.write_timeout(std::time::Duration::from_secs(args.write_timeout));

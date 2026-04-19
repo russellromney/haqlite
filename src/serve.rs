@@ -63,11 +63,12 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
 
     let address = format!("http://0.0.0.0:{}", serve.forwarding_port);
 
-    // The HaQLite builder constructs the per-database `LeaseConfig` itself
-    // at finalize-time (it owns the lease store, instance id, and address).
-    // Any `LeaseConfig` set here would be overwritten — leave it `None`.
-    // (Pre-Fjord this code path silently lost the timing knobs from
-    // `shared.lease`; tracking that as a separate bug.)
+    // The HaQLite builder patches the lease store / instance id / address
+    // into whatever `LeaseConfig` we provide here; it preserves our timing
+    // policy. Lease timing knobs flow through the dedicated builder
+    // setters below (`.lease_ttl()`, `.lease_renew_interval()`,
+    // `.lease_follower_poll_interval()`), so the coordinator config here
+    // just carries non-lease fields.
     let coordinator_config = CoordinatorConfig {
         sync_interval: Duration::from_millis(serve.sync_interval_ms),
         follower_pull_interval: Duration::from_millis(serve.follower_pull_ms),
@@ -92,7 +93,10 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
         .forwarding_port(serve.forwarding_port)
         .instance_id(&instance_id)
         .address(&address)
-        .coordinator_config(coordinator_config);
+        .coordinator_config(coordinator_config)
+        .lease_ttl(shared.lease.ttl_secs)
+        .lease_renew_interval(shared.lease.renew_interval())
+        .lease_follower_poll_interval(shared.lease.poll_interval());
 
     if let Some(ref endpoint) = shared.s3.endpoint {
         builder = builder.endpoint(endpoint);

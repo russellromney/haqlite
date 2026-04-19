@@ -288,12 +288,10 @@ async fn main() -> Result<()> {
     });
     let address = format!("http://localhost:{}", forwarding_port);
 
-    // The HaQLite builder constructs the per-database `LeaseConfig` itself
-    // at finalize-time (it owns the lease store, instance id, and address).
-    // Lease timing knobs (--lease-ttl, --renew-interval-ms, etc.) are
-    // currently not threaded into the builder — pre-existing bug, tracked
-    // separately. Phase Fjord just unblocks the build.
-    let _ = (args.lease_ttl, args.renew_interval_ms, args.follower_poll_ms);
+    // Lease timing knobs (--lease-ttl, --renew-interval-ms,
+    // --follower-poll-ms) flow through the dedicated builder setters below;
+    // the HaQLite builder patches the lease store + instance id + address
+    // into the LeaseConfig at finalize-time without clobbering timing.
     let coordinator_config = CoordinatorConfig {
         sync_interval: std::time::Duration::from_millis(args.sync_interval_ms),
         follower_pull_interval: std::time::Duration::from_millis(args.follower_pull_ms),
@@ -307,7 +305,10 @@ async fn main() -> Result<()> {
         .forwarding_port(forwarding_port)
         .instance_id(&instance_id)
         .address(&address)
-        .coordinator_config(coordinator_config);
+        .coordinator_config(coordinator_config)
+        .lease_ttl(args.lease_ttl)
+        .lease_renew_interval(std::time::Duration::from_millis(args.renew_interval_ms))
+        .lease_follower_poll_interval(std::time::Duration::from_millis(args.follower_poll_ms));
 
     if let Some(ref endpoint) = args.endpoint {
         builder = builder.endpoint(endpoint);
