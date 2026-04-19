@@ -47,7 +47,7 @@ pub use rusqlite;
 
 // Re-export hadb types.
 pub use hadb::{
-    Coordinator, CoordinatorConfig, HaMetrics, HaNode, HaNodeConfig,
+    Coordinator, CoordinatorConfig, HaMetrics,
     InMemoryLeaseStore, JoinResult, LeaseConfig, LeaseData, LeaseStore, MetricsSnapshot,
     NodeRegistration, NodeRegistry, Role, RoleEvent,
     ManifestStore, HaManifest, StorageManifest, InMemoryManifestStore,
