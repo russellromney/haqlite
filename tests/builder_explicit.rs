@@ -14,10 +14,19 @@
 //! Each missing piece produces a loud error from `open()`. No silent
 //! S3-from-env fallback, no silent HAQLITE_LEASE_URL/HAQLITE_MANIFEST_URL
 //! lookup.
+//!
+//! Phase Driftwood also pins the lease-timing plumbing contract: the
+//! builder's `.lease_ttl()` / `.lease_renew_interval()` /
+//! `.lease_follower_poll_interval()` setters reach the Coordinator's
+//! `LeaseConfig` instead of being silently dropped.
 
+mod common;
+
+use common::InMemoryStorage;
 use haqlite::{HaMode, HaQLite, InMemoryManifestStore};
 use hadb::InMemoryLeaseStore;
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// `unwrap_err()` won't compile because `HaQLite` doesn't implement `Debug`.
@@ -131,6 +140,101 @@ async fn shared_without_turbolite_errors_clearly() {
             && err.contains("turbolite_vfs"),
         "expected error to list all three turbolite options, got: {err}"
     );
+}
+
+#[tokio::test]
+async fn lease_timing_setters_reach_coordinator() {
+    // Phase Driftwood: regression guard for the silent-overwrite bug.
+    // Pre-Driftwood, HaQLiteBuilder::open() replaced `config.lease` with
+    // a fresh default LeaseConfig, so builder setters like `.lease_ttl(30)`
+    // were silently dropped before reaching the Coordinator.
+    unset_env();
+    let tmp = TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("t.db");
+    let db_path_str = db_path.to_str().unwrap();
+
+    let lease = Arc::new(InMemoryLeaseStore::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
+
+    let db = HaQLite::builder("test-bucket")
+        .prefix("p/")
+        .instance_id("test-1")
+        .address("http://127.0.0.1:19090")
+        .forwarding_port(19090)
+        .lease_store(lease)
+        .walrust_storage(walrust_storage)
+        .lease_ttl(30)
+        .lease_renew_interval(Duration::from_millis(7_500))
+        .lease_follower_poll_interval(Duration::from_millis(2_500))
+        .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .await
+        .expect("open");
+
+    let coord = db.coordinator().expect("dedicated mode has a coordinator");
+    let cfg = coord.lease_config().expect("LeaseConfig must be present on Dedicated mode");
+    assert_eq!(cfg.ttl_secs, 30, "lease_ttl should reach the Coordinator");
+    assert_eq!(
+        cfg.renew_interval,
+        Duration::from_millis(7_500),
+        "lease_renew_interval should reach the Coordinator"
+    );
+    assert_eq!(
+        cfg.follower_poll_interval,
+        Duration::from_millis(2_500),
+        "lease_follower_poll_interval should reach the Coordinator"
+    );
+}
+
+#[tokio::test]
+async fn caller_lease_config_timing_is_preserved() {
+    // If a caller passes a full LeaseConfig through coordinator_config()
+    // with non-default timing, the builder must preserve it rather than
+    // rebuild a defaults-only LeaseConfig. Builder setters are optional
+    // overrides on top.
+    unset_env();
+    let tmp = TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("t.db");
+    let db_path_str = db_path.to_str().unwrap();
+
+    let lease = Arc::new(InMemoryLeaseStore::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
+
+    // Placeholder store — the builder overwrites `store`/`instance_id`/`address`
+    // with the values from `.lease_store()` / `.instance_id()` / `.address()`.
+    let placeholder: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+    let coordinator_config = haqlite::CoordinatorConfig {
+        lease: Some(hadb::LeaseConfig {
+            ttl_secs: 17,
+            renew_interval: Duration::from_millis(9_000),
+            follower_poll_interval: Duration::from_millis(4_000),
+            required_expired_reads: 2,
+            max_consecutive_renewal_errors: 4,
+            ..hadb::LeaseConfig::new(placeholder, String::new(), String::new())
+        }),
+        ..Default::default()
+    };
+
+    let db = HaQLite::builder("test-bucket")
+        .prefix("p/")
+        .instance_id("caller-instance")
+        .address("http://127.0.0.1:19091")
+        .forwarding_port(19091)
+        .lease_store(lease)
+        .walrust_storage(walrust_storage)
+        .coordinator_config(coordinator_config)
+        .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .await
+        .expect("open");
+
+    let coord = db.coordinator().expect("dedicated mode has a coordinator");
+    let cfg = coord.lease_config().expect("LeaseConfig must be present");
+    assert_eq!(cfg.ttl_secs, 17);
+    assert_eq!(cfg.renew_interval, Duration::from_millis(9_000));
+    assert_eq!(cfg.follower_poll_interval, Duration::from_millis(4_000));
+    assert_eq!(cfg.required_expired_reads, 2);
+    assert_eq!(cfg.max_consecutive_renewal_errors, 4);
+    assert_eq!(cfg.instance_id, "caller-instance", "builder patches in instance_id");
+    assert_eq!(cfg.address, "http://127.0.0.1:19091", "builder patches in address");
 }
 
 #[tokio::test]

@@ -98,6 +98,8 @@ pub struct HaQLiteBuilder {
     write_timeout: Option<Duration>,
     walrust_storage: Option<Arc<dyn hadb_storage::StorageBackend>>,
     lease_ttl: Option<u64>,
+    lease_renew_interval: Option<Duration>,
+    lease_follower_poll_interval: Option<Duration>,
     turbolite_vfs: Option<(turbolite::tiered::SharedTurboliteVfs, String)>,
     /// HTTP endpoint + token for turbolite page storage through a proxy.
     /// The proxy handles S3 tiering and fence enforcement.
@@ -132,6 +134,8 @@ impl HaQLiteBuilder {
             write_timeout: None,
             walrust_storage: None,
             lease_ttl: None,
+            lease_renew_interval: None,
+            lease_follower_poll_interval: None,
             turbolite_vfs: None,
             turbolite_http: None,
             turbolite_storage: None,
@@ -284,10 +288,25 @@ impl HaQLiteBuilder {
         self
     }
 
-    /// Lease TTL in seconds for Shared mode. Default: 5.
-    /// Lower values make lease expiration faster (useful for testing).
+    /// Lease TTL in seconds. Applies to both Dedicated mode (fed into the
+    /// Coordinator's `LeaseConfig`) and Shared mode (used for lease acquisition
+    /// during writes). Default: 5.
     pub fn lease_ttl(mut self, ttl_secs: u64) -> Self {
         self.lease_ttl = Some(ttl_secs);
+        self
+    }
+
+    /// Lease renewal interval (Dedicated mode). How often the leader refreshes
+    /// its lease in the backing store. Default: 2s.
+    pub fn lease_renew_interval(mut self, interval: Duration) -> Self {
+        self.lease_renew_interval = Some(interval);
+        self
+    }
+
+    /// Follower poll interval (Dedicated mode). How often followers check the
+    /// lease for leader death. Default: 1s.
+    pub fn lease_follower_poll_interval(mut self, interval: Duration) -> Self {
+        self.lease_follower_poll_interval = Some(interval);
         self
     }
 
@@ -411,12 +430,37 @@ impl HaQLiteBuilder {
 
         // Build coordinator config. The lease store now lives inside
         // `LeaseConfig` (Phase Fjord) — store + policy travel together.
+        //
+        // Phase Driftwood: preserve caller-provided `config.lease` timing
+        // policy, but patch in the wiring (store, instance_id, address)
+        // from the builder setters. Previously this overwrote the whole
+        // LeaseConfig, silently dropping CLI timing knobs. Builder setters
+        // (`.lease_ttl()`, `.lease_renew_interval()`,
+        // `.lease_follower_poll_interval()`) take precedence when set.
         let mut config = self.coordinator_config.unwrap_or_default();
-        config.lease = Some(LeaseConfig::new(
-            lease_store.clone(),
-            instance_id.clone(),
-            address.clone(),
-        ));
+        let mut lease_cfg = match config.lease.take() {
+            Some(mut existing) => {
+                existing.store = lease_store.clone();
+                existing.instance_id = instance_id.clone();
+                existing.address = address.clone();
+                existing
+            }
+            None => LeaseConfig::new(
+                lease_store.clone(),
+                instance_id.clone(),
+                address.clone(),
+            ),
+        };
+        if let Some(ttl) = self.lease_ttl {
+            lease_cfg.ttl_secs = ttl;
+        }
+        if let Some(d) = self.lease_renew_interval {
+            lease_cfg.renew_interval = d;
+        }
+        if let Some(d) = self.lease_follower_poll_interval {
+            lease_cfg.follower_poll_interval = d;
+        }
+        config.lease = Some(lease_cfg);
         // HTTP-backed storage path: the lease store is `CinchLeaseStore`
         // (or a compatible token-scoped backend). Phase Fjord moved the
         // "writer"-key default into `CinchLeaseStore::key_for`, so there's
