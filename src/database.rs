@@ -505,7 +505,6 @@ impl HaQLiteBuilder {
                     std::fs::create_dir_all(&cache_dir)?;
                     let tl_config = turbolite::tiered::TurboliteConfig {
                         cache_dir,
-                        sync_mode: turbolite::tiered::SyncMode::Durable,
                         // Disable inline GC: old page group versions must survive
                         // until explicit gc() runs (which checks snapshot manifests).
                         cache: turbolite::tiered::CacheConfig {
@@ -607,14 +606,10 @@ impl HaQLiteBuilder {
                 })?;
 
                 // Auto-create turbolite VFS if not provided.
-                // Synchronous = S3Primary, Eventual = default (Durable).
+                // turbolite is always Durable (synchronous upload on checkpoint).
                 let (vfs, vfs_name) = match self.turbolite_vfs {
                     Some(v) => v,
                     None => {
-                        let sync_mode = match self.durability {
-                            Durability::Synchronous => turbolite::tiered::SyncMode::RemotePrimary,
-                            _ => turbolite::tiered::SyncMode::default(),
-                        };
                         let vfs_name = format!("haqlite_auto_{}", uuid::Uuid::new_v4());
                         let cache_dir = db_path.parent()
                             .unwrap_or_else(|| std::path::Path::new("/tmp"))
@@ -622,7 +617,6 @@ impl HaQLiteBuilder {
                         std::fs::create_dir_all(&cache_dir)?;
                         let config = turbolite::tiered::TurboliteConfig {
                             cache_dir,
-                            sync_mode,
                             cache: turbolite::tiered::CacheConfig {
                                 gc_enabled: false,
                                 ..Default::default()

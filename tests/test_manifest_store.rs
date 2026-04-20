@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use common::InMemoryStorage;
 use hadb::{InMemoryLeaseStore, LeaseStore};
 use haqlite::{HaMode, HaQLite, InMemoryManifestStore, ManifestStore, SqlValue};
-use turbolite::tiered::{SharedTurboliteVfs, SyncMode, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
 fn make_local_vfs(cache_dir: &std::path::Path) -> (SharedTurboliteVfs, String) {
@@ -57,7 +57,6 @@ fn make_s3_vfs(cache_dir: &std::path::Path, s3_prefix: &str) -> (SharedTurbolite
         region: Some(std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string())),
         pages_per_group: 4,
         sub_pages_per_frame: 2,
-        sync_mode: SyncMode::S3Primary,
         eager_index_load: false,
         runtime_handle: Some(tokio::runtime::Handle::current()),
         ..Default::default()

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use haqlite::{Durability, HaMode, HaQLite, InMemoryLeaseStore, InMemoryManifestStore, SqlValue};
 use tempfile::TempDir;
-use turbolite::tiered::{SharedTurboliteVfs, SyncMode, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 mod common;
 use common::InMemoryStorage;
@@ -50,7 +50,6 @@ fn unique_prefix(name: &str) -> String {
 async fn build_node(
     cache_dir: &std::path::Path,
     s3_prefix: &str,
-    sync_mode: SyncMode,
     durability: Durability,
     lease_store: Arc<InMemoryLeaseStore>,
     manifest_store: Arc<InMemoryManifestStore>,
@@ -67,7 +66,6 @@ async fn build_node(
         compression_level: 0,
         pages_per_group: 4,
         sub_pages_per_frame: 2,
-        sync_mode,
         eager_index_load: false,
         runtime_handle: Some(tokio::runtime::Handle::current()),
         ..Default::default()
@@ -110,13 +108,13 @@ async fn e2e_synchronous_two_nodes_sequential() {
 
     let tmp_a = TempDir::new().expect("tmp");
     let db_a = build_node(
-        tmp_a.path(), &prefix, SyncMode::S3Primary, Durability::Synchronous,
+        tmp_a.path(), &prefix, Durability::Synchronous,
         lease_store.clone(), manifest_store.clone(), None, "node-a",
     ).await;
 
     let tmp_b = TempDir::new().expect("tmp");
     let db_b = build_node(
-        tmp_b.path(), &prefix, SyncMode::S3Primary, Durability::Synchronous,
+        tmp_b.path(), &prefix, Durability::Synchronous,
         lease_store.clone(), manifest_store.clone(), None, "node-b",
     ).await;
 
@@ -159,7 +157,7 @@ async fn e2e_synchronous_four_nodes_concurrent() {
     for i in 0..4 {
         let tmp = TempDir::new().expect("tmp");
         let db = build_node(
-            tmp.path(), &prefix, SyncMode::S3Primary, Durability::Synchronous,
+            tmp.path(), &prefix, Durability::Synchronous,
             lease_store.clone(), manifest_store.clone(), None, &format!("node-{}", i),
         ).await;
         tmps.push(tmp);
@@ -195,7 +193,7 @@ async fn e2e_synchronous_four_nodes_concurrent() {
     // Fresh reader verifies all successful writes are visible
     let tmp_reader = TempDir::new().expect("tmp");
     let reader = build_node(
-        tmp_reader.path(), &prefix, SyncMode::S3Primary, Durability::Synchronous,
+        tmp_reader.path(), &prefix, Durability::Synchronous,
         lease_store.clone(), manifest_store.clone(), None, "reader",
     ).await;
 
@@ -244,7 +242,6 @@ async fn e2e_write_fails_without_lease() {
         cache_dir: tmp.path().to_path_buf(),
         endpoint_url: endpoint_url(),
         region: Some("auto".to_string()),
-        sync_mode: SyncMode::S3Primary,
         eager_index_load: false,
         runtime_handle: Some(tokio::runtime::Handle::current()),
         ..Default::default()

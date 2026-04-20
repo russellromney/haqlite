@@ -17,7 +17,7 @@ use tempfile::TempDir;
 
 use haqlite::{Durability, HaMode, HaQLite, HaQLiteError, InMemoryManifestStore, ManifestStore, SqlValue};
 use hadb::{InMemoryLeaseStore, LeaseStore};
-use turbolite::tiered::{SharedTurboliteVfs, SyncMode, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT);";
 
@@ -59,7 +59,6 @@ async fn build_shared(
         compression_level: 0,
         pages_per_group: 4,
         sub_pages_per_frame: 2,
-        sync_mode: SyncMode::S3Primary,
         eager_index_load: false,
         runtime_handle: Some(tokio::runtime::Handle::current()),
         ..Default::default()
@@ -571,7 +570,6 @@ async fn test_write_timeout_lease_contention() {
         compression_level: 0,
         pages_per_group: 4,
         sub_pages_per_frame: 2,
-        sync_mode: SyncMode::S3Primary,
         eager_index_load: false,
         runtime_handle: Some(tokio::runtime::Handle::current()),
         ..Default::default()

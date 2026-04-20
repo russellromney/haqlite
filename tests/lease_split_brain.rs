@@ -18,7 +18,7 @@ use common::InMemoryStorage;
 use haqlite::{Durability, HaMode, HaQLite, InMemoryLeaseStore, InMemoryManifestStore, SqlValue};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
-use turbolite::tiered::{SharedTurboliteVfs, SyncMode, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
 fn unique_vfs(prefix: &str) -> String {
@@ -131,7 +131,6 @@ async fn build_node(
         compression_level: 0,
         pages_per_group: 4,
         sub_pages_per_frame: 2,
-        sync_mode: SyncMode::S3Primary,
         eager_index_load: false,
         runtime_handle: Some(tokio::runtime::Handle::current()),
         ..Default::default()

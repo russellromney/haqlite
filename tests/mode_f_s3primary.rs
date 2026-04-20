@@ -18,7 +18,7 @@ use std::time::Duration;
 use hadb::InMemoryLeaseStore;
 use haqlite::{HaMode, HaQLite, InMemoryManifestStore, SqlValue};
 use tempfile::TempDir;
-use turbolite::tiered::{SharedTurboliteVfs, SyncMode, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)";
 
@@ -72,7 +72,6 @@ async fn build_mode_f_node(
         compression_level: 3,
         pages_per_group: 4,
         sub_pages_per_frame: 2,
-        sync_mode: SyncMode::S3Primary,
         eager_index_load: false,
         runtime_handle: Some(tokio::runtime::Handle::current()),
         ..Default::default()
