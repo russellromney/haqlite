@@ -506,10 +506,6 @@ impl HaQLiteBuilder {
                     let tl_config = turbolite::tiered::TurboliteConfig {
                         cache_dir,
                         sync_mode: turbolite::tiered::SyncMode::Durable,
-                        prefetch: turbolite::tiered::PrefetchConfig {
-                            eager_index_load: false,
-                            ..Default::default()
-                        },
                         // Disable inline GC: old page group versions must survive
                         // until explicit gc() runs (which checks snapshot manifests).
                         cache: turbolite::tiered::CacheConfig {
@@ -627,10 +623,6 @@ impl HaQLiteBuilder {
                         let config = turbolite::tiered::TurboliteConfig {
                             cache_dir,
                             sync_mode,
-                            prefetch: turbolite::tiered::PrefetchConfig {
-                                eager_index_load: false,
-                                ..Default::default()
-                            },
                             cache: turbolite::tiered::CacheConfig {
                                 gc_enabled: false,
                                 ..Default::default()
