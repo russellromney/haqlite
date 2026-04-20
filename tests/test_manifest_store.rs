@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use common::InMemoryStorage;
 use hadb::{InMemoryLeaseStore, LeaseStore};
 use haqlite::{HaMode, HaQLite, InMemoryManifestStore, ManifestStore, SqlValue};
-use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{CacheConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
 fn make_local_vfs(cache_dir: &std::path::Path) -> (SharedTurboliteVfs, String) {
@@ -26,12 +26,14 @@ fn make_local_vfs(cache_dir: &std::path::Path) -> (SharedTurboliteVfs, String) {
     let vfs_name = format!("tms_{}", n);
     let config = TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        pages_per_group: 4,
-        sub_pages_per_frame: 2,
-        eager_index_load: false,
+        cache: CacheConfig {
+            pages_per_group: 4,
+            sub_pages_per_frame: 2,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("create VFS");
     let shared_vfs = SharedTurboliteVfs::new(vfs);
     turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
     (shared_vfs, vfs_name)

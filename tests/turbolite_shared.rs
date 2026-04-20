@@ -13,7 +13,9 @@ use tempfile::TempDir;
 
 use hadb::InMemoryLeaseStore;
 use haqlite::{HaMode, HaQLite, InMemoryManifestStore, ManifestStore, SqlValue, StorageManifest};
-use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{
+    CacheConfig, CompressionConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs,
+};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT);";
 
@@ -28,12 +30,15 @@ async fn build_turbolite_shared(
 ) -> HaQLite {
     let config = TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        compression_level: 1,
-        pages_per_group: 4, // small for testing
-        sub_pages_per_frame: 2,
+        compression: CompressionConfig { level: 1, ..Default::default() },
+        cache: CacheConfig {
+            pages_per_group: 4, // small for testing
+            sub_pages_per_frame: 2,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("create turbolite VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("create turbolite VFS");
     let shared_vfs = SharedTurboliteVfs::new(vfs);
     let vfs_for_register = shared_vfs.clone();
 
