@@ -525,11 +525,11 @@ impl HaQLiteBuilder {
                             hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "pages")
                                 .with_fence(fence),
                         );
-                        turbolite::tiered::TurboliteVfs::new_with_storage(tl_config, storage, rt_handle)
+                        turbolite::tiered::TurboliteVfs::with_backend(tl_config, storage, rt_handle)
                             .map_err(|e| anyhow::anyhow!("turbolite VFS (HTTP) for Dedicated+Sync: {e}"))?
                     } else if let Some(ref storage) = self.turbolite_storage {
                         // Phase Lucid: caller-supplied backend.
-                        turbolite::tiered::TurboliteVfs::new_with_storage(tl_config, storage.clone(), rt_handle)
+                        turbolite::tiered::TurboliteVfs::with_backend(tl_config, storage.clone(), rt_handle)
                             .map_err(|e| anyhow::anyhow!("turbolite VFS (caller-supplied) for Dedicated+Sync: {e}"))?
                     } else {
                         // Phase Lucid: no implicit S3-from-env fallback.
@@ -637,11 +637,11 @@ impl HaQLiteBuilder {
                                 hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "pages")
                                     .with_fence(fence),
                             );
-                            turbolite::tiered::TurboliteVfs::new_with_storage(config, storage, rt_handle)
+                            turbolite::tiered::TurboliteVfs::with_backend(config, storage, rt_handle)
                                 .map_err(|e| anyhow::anyhow!("auto-create turbolite VFS (HTTP): {e}"))?
                         } else if let Some(ref storage) = self.turbolite_storage {
                             // Phase Lucid: caller-supplied backend.
-                            turbolite::tiered::TurboliteVfs::new_with_storage(config, storage.clone(), rt_handle)
+                            turbolite::tiered::TurboliteVfs::with_backend(config, storage.clone(), rt_handle)
                                 .map_err(|e| anyhow::anyhow!("auto-create turbolite VFS (caller-supplied): {e}"))?
                         } else {
                             // Phase Lucid: no implicit S3-from-env fallback.
