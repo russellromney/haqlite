@@ -506,10 +506,16 @@ impl HaQLiteBuilder {
                     let tl_config = turbolite::tiered::TurboliteConfig {
                         cache_dir,
                         sync_mode: turbolite::tiered::SyncMode::Durable,
-                        eager_index_load: false,
+                        prefetch: turbolite::tiered::PrefetchConfig {
+                            eager_index_load: false,
+                            ..Default::default()
+                        },
                         // Disable inline GC: old page group versions must survive
                         // until explicit gc() runs (which checks snapshot manifests).
-                        gc_enabled: false,
+                        cache: turbolite::tiered::CacheConfig {
+                            gc_enabled: false,
+                            ..Default::default()
+                        },
                         ..Default::default()
                     };
                     let rt_handle = tokio::runtime::Handle::current();
@@ -621,8 +627,14 @@ impl HaQLiteBuilder {
                         let config = turbolite::tiered::TurboliteConfig {
                             cache_dir,
                             sync_mode,
-                            eager_index_load: false,
-                            gc_enabled: false,
+                            prefetch: turbolite::tiered::PrefetchConfig {
+                                eager_index_load: false,
+                                ..Default::default()
+                            },
+                            cache: turbolite::tiered::CacheConfig {
+                                gc_enabled: false,
+                                ..Default::default()
+                            },
                             ..Default::default()
                         };
                         let rt_handle = tokio::runtime::Handle::current();
