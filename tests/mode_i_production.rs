@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use common::InMemoryStorage;
 use hadb::InMemoryLeaseStore;
-use haqlite::{HaMode, HaQLite, InMemoryManifestStore, SqlValue};
+use haqlite::{HaMode, HaQLite, SqlValue};
+use turbodb_manifest_mem::MemManifestStore;
 use tempfile::TempDir;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
@@ -55,7 +56,7 @@ async fn build_mode_i_node(
     s3_prefix: &str,
     walrust_storage: Arc<InMemoryStorage>,
     lease_store: Arc<InMemoryLeaseStore>,
-    manifest_store: Arc<InMemoryManifestStore>,
+    manifest_store: Arc<MemManifestStore>,
     instance_id: &str,
     lease_ttl: u64,
     write_timeout_secs: u64,
@@ -117,7 +118,7 @@ async fn mode_i_baseline_sequential() {
 
     let walrust_storage = Arc::new(InMemoryStorage::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let mut db_a = build_mode_i_node(
         tmp_a.path(), "mi_seq", &prefix, walrust_storage.clone(),
@@ -160,7 +161,7 @@ async fn mode_i_concurrent_no_data_loss() {
 
     let walrust_storage = Arc::new(InMemoryStorage::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let db_a = Arc::new(tokio::sync::Mutex::new(
         build_mode_i_node(

@@ -17,7 +17,8 @@ use tempfile::TempDir;
 
 use common::InMemoryStorage;
 use hadb::{InMemoryLeaseStore, LeaseStore};
-use haqlite::{HaMode, HaQLite, InMemoryManifestStore, ManifestStore, SqlValue};
+use haqlite::{HaMode, HaQLite, ManifestStore, SqlValue};
+use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{CacheConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -84,7 +85,7 @@ async fn dedicated_mode_with_manifest_store() {
     let db_path = tmp.path().join("dedicated_manifest.db");
     let storage = Arc::new(InMemoryStorage::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let mut db = HaQLite::builder("test-bucket")
         .prefix("test/")
@@ -156,7 +157,7 @@ async fn shared_mode_manifest_published_on_write() {
     let db_path = tmp.path().join("shared_manifest.db");
     let storage = Arc::new(InMemoryStorage::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let (vfs, vfs_name) = make_local_vfs(tmp.path());
     let mut db = HaQLite::builder("test-bucket")
@@ -204,7 +205,7 @@ async fn shared_mode_sequential_writes_increment_manifest_version() {
     let db_path = tmp.path().join("shared_seq.db");
     let storage = Arc::new(InMemoryStorage::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let (vfs, vfs_name) = make_local_vfs(tmp.path());
     let mut db = HaQLite::builder("test-bucket")
@@ -249,7 +250,7 @@ async fn shared_mode_two_writers_see_each_others_data() {
     let tmp2 = TempDir::new().expect("temp dir 2");
     let storage = Arc::new(InMemoryStorage::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let s3_prefix = format!("test/two_writers/{}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).expect("time").as_nanos());

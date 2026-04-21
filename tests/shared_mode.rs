@@ -15,8 +15,9 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
-use haqlite::{Durability, HaMode, HaQLite, HaQLiteError, InMemoryManifestStore, ManifestStore, SqlValue};
+use haqlite::{Durability, HaMode, HaQLite, HaQLiteError, ManifestStore, SqlValue};
 use hadb::{InMemoryLeaseStore, LeaseStore};
+use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT);";
@@ -46,7 +47,7 @@ async fn build_shared(
     db_name: &str,
     s3_prefix: &str,
     lease_store: Arc<InMemoryLeaseStore>,
-    manifest_store: Arc<InMemoryManifestStore>,
+    manifest_store: Arc<MemManifestStore>,
     instance_id: &str,
 ) -> HaQLite {
     let vfs_name = unique_vfs(&format!("sm_{}", instance_id));
@@ -93,7 +94,7 @@ async fn shared_single_node_write_read() {
     let tmp = TempDir::new().unwrap();
     let prefix = unique_prefix("shared_single_node_write_read");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let mut db = build_shared(&tmp, "test", &prefix, lease_store, manifest_store.clone(), "node-1").await;
 
@@ -119,7 +120,7 @@ async fn shared_sequential_writes_increment_manifest() {
     let tmp = TempDir::new().unwrap();
     let prefix = unique_prefix("shared_sequential_writes_increment_manifest");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let mut db = build_shared(&tmp, "test", &prefix, lease_store, manifest_store.clone(), "node-1").await;
 
@@ -144,7 +145,7 @@ async fn shared_mode_no_forwarding_server() {
     let tmp = TempDir::new().unwrap();
     let prefix = unique_prefix("shared_mode_no_forwarding_server");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let mut db = build_shared(&tmp, "test", &prefix, lease_store, manifest_store, "node-1").await;
 
@@ -189,7 +190,7 @@ async fn shared_two_nodes_a_writes_b_reads_fresh() {
     let tmp_b = TempDir::new().unwrap();
     let prefix = unique_prefix("shared_two_nodes_a_writes_b_reads_fresh");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let db_a = build_shared(&tmp_a, "shared", &prefix, lease_store.clone(), manifest_store.clone(), "node-a").await;
     let db_b = build_shared(&tmp_b, "shared", &prefix, lease_store.clone(), manifest_store.clone(), "node-b").await;
@@ -220,7 +221,7 @@ async fn shared_two_nodes_sequential_writes() {
     let tmp_b = TempDir::new().unwrap();
     let prefix = unique_prefix("shared_two_nodes_sequential_writes");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let db_a = build_shared(&tmp_a, "shared", &prefix, lease_store.clone(), manifest_store.clone(), "node-a").await;
 
@@ -259,7 +260,7 @@ async fn shared_failover_lease_expires_other_node_writes() {
     let tmp_b = TempDir::new().unwrap();
     let prefix = unique_prefix("shared_failover_lease_expires_other_node_writes");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     // Node A writes
     {
@@ -283,11 +284,11 @@ async fn shared_failover_lease_expires_other_node_writes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_manifest_version_tracks_writes() {
-    // Verify manifest contains correct StorageManifest::Walrust data
+    // Verify manifest contains correct Backend::Walrust data
     let tmp = TempDir::new().unwrap();
     let prefix = unique_prefix("shared_manifest_version_tracks_writes");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let mut db = build_shared(&tmp, "test", &prefix, lease_store, manifest_store.clone(), "node-1").await;
 
@@ -333,7 +334,7 @@ async fn test_stress_concurrent_write_contention() {
     let tmp_b = TempDir::new().unwrap();
     let prefix = unique_prefix("test_stress_concurrent_write_contention");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let db_a = Arc::new(
         build_shared(&tmp_a, "race", &prefix, lease_store.clone(), manifest_store.clone(), "node-a").await,
@@ -394,7 +395,7 @@ async fn test_stress_alternating_node_writes() {
     let tmp_reader = TempDir::new().unwrap();
     let prefix = unique_prefix("test_stress_alternating_node_writes");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     // Node A writes 20 rows
     let db_a = build_shared(&tmp_a, "alt", &prefix, lease_store.clone(), manifest_store.clone(), "node-a").await;
@@ -434,7 +435,7 @@ async fn test_stress_large_transaction() {
     let tmp_b = TempDir::new().unwrap();
     let prefix = unique_prefix("test_stress_large_transaction");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let db_a = build_shared(&tmp_a, "large", &prefix, lease_store.clone(), manifest_store.clone(), "node-a").await;
 
@@ -465,7 +466,7 @@ async fn test_lease_ttl_expiry_takeover() {
     let tmp_b = TempDir::new().unwrap();
     let prefix = unique_prefix("test_lease_ttl_expiry_takeover");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     // Pre-claim lease with 1-second TTL (using millisecond timestamp, matching execute_shared format)
     let now_ms = std::time::SystemTime::now()
@@ -509,7 +510,7 @@ async fn test_stress_many_sequential_writes() {
     let tmp = TempDir::new().unwrap();
     let prefix = unique_prefix("test_stress_many_sequential_writes");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let mut db = build_shared(&tmp, "seq50", &prefix, lease_store, manifest_store.clone(), "node-1").await;
 
@@ -539,7 +540,7 @@ async fn test_write_timeout_lease_contention() {
     let tmp = TempDir::new().unwrap();
     let prefix = unique_prefix("test_write_timeout_lease_contention");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     // Pre-claim lease with long TTL so it won't expire during the test
     let now_ms = std::time::SystemTime::now()
@@ -611,7 +612,7 @@ async fn test_fresh_read_consistency() {
     let tmp_a = TempDir::new().unwrap();
     let prefix = unique_prefix("test_fresh_read_consistency");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     // Node A writes 5 rows
     let db_a = build_shared(&tmp_a, "fresh", &prefix, lease_store.clone(), manifest_store.clone(), "node-a").await;
@@ -661,7 +662,7 @@ async fn test_fresh_read_empty_database() {
     let tmp_b = TempDir::new().unwrap();
     let prefix = unique_prefix("test_fresh_read_empty_database");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let db_a = build_shared(&tmp_a, "empty", &prefix, lease_store.clone(), manifest_store.clone(), "node-a").await;
     let db_b = build_shared(&tmp_b, "empty", &prefix, lease_store.clone(), manifest_store.clone(), "node-b").await;
@@ -697,7 +698,7 @@ async fn test_write_after_lease_release() {
     let tmp_b = TempDir::new().unwrap();
     let prefix = unique_prefix("test_write_after_lease_release");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let db_a = build_shared(&tmp_a, "release", &prefix, lease_store.clone(), manifest_store.clone(), "node-a").await;
     let db_b = build_shared(&tmp_b, "release", &prefix, lease_store.clone(), manifest_store.clone(), "node-b").await;
@@ -720,7 +721,7 @@ async fn test_manifest_version_monotonicity() {
     let tmp = TempDir::new().unwrap();
     let prefix = unique_prefix("test_manifest_version_monotonicity");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let mut db = build_shared(&tmp, "mono", &prefix, lease_store, manifest_store.clone(), "node-1").await;
 
@@ -749,7 +750,7 @@ async fn test_multiple_databases_shared_stores() {
     let tmp_2 = TempDir::new().unwrap();
     let prefix = unique_prefix("test_multiple_databases_shared_stores");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let prefix_alpha = unique_prefix("test_multi_db_alpha");
     let prefix_beta = unique_prefix("test_multi_db_beta");
@@ -791,7 +792,7 @@ async fn test_write_empty_params() {
     let tmp = TempDir::new().unwrap();
     let prefix = unique_prefix("test_write_empty_params");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let mut db = build_shared(&tmp, "empty_params", &prefix, lease_store, manifest_store.clone(), "node-1").await;
 

@@ -12,7 +12,8 @@ use proptest::prelude::*;
 use tempfile::TempDir;
 
 use common::InMemoryStorage;
-use haqlite::{Durability, HaMode, HaQLite, HaQLiteError, InMemoryLeaseStore, InMemoryManifestStore, SqlValue};
+use haqlite::{Durability, HaMode, HaQLite, HaQLiteError, InMemoryLeaseStore, SqlValue};
+use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{CacheConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -172,7 +173,7 @@ proptest! {
             let tmp = TempDir::new().unwrap();
             let storage = Arc::new(InMemoryStorage::new());
             let lease_store = Arc::new(InMemoryLeaseStore::new());
-            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            let manifest_store = Arc::new(MemManifestStore::new());
 
             let (vfs, vfs_name) = make_local_vfs(tmp.path());
             let db_path = tmp.path().join("shared_serial.db");

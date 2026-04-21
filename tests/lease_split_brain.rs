@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::InMemoryStorage;
-use haqlite::{Durability, HaMode, HaQLite, InMemoryLeaseStore, InMemoryManifestStore, SqlValue};
+use haqlite::{Durability, HaMode, HaQLite, InMemoryLeaseStore, SqlValue};
+use turbodb_manifest_mem::MemManifestStore;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
@@ -116,7 +117,7 @@ async fn build_node(
     name: &str,
     s3_prefix: &str,
     lease_store: Arc<InMemoryLeaseStore>,
-    manifest_store: Arc<InMemoryManifestStore>,
+    manifest_store: Arc<MemManifestStore>,
     instance_id: &str,
     lease_ttl: u64,
     write_timeout_secs: u64,
@@ -179,7 +180,7 @@ async fn baseline_two_nodes_sequential_writes() {
     let prefix = unique_prefix("baseline");
     let storage = Arc::new(SlowStorage::new(Duration::ZERO));
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let db_a = build_node(
         &tmp_a, "split", &prefix, lease_store.clone(),
@@ -215,7 +216,7 @@ async fn concurrent_writes_no_data_loss() {
     let prefix = unique_prefix("conc");
     let storage = Arc::new(SlowStorage::new(Duration::ZERO));
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let db_a = build_node(
         &tmp_a, "conc", &prefix, lease_store.clone(),
@@ -303,7 +304,7 @@ async fn slow_storage_lease_expiration() {
     let prefix = unique_prefix("slow");
     let storage = Arc::new(SlowStorage::new(Duration::from_millis(500)));
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let db_a = build_node(
         &tmp_a, "slow", &prefix, lease_store.clone(),
@@ -383,7 +384,7 @@ async fn many_writers_short_lease_no_corruption() {
     let prefix = unique_prefix("stress");
     let storage = Arc::new(SlowStorage::new(Duration::from_millis(50)));
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let total_successes = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::new();

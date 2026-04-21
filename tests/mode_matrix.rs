@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hadb::InMemoryLeaseStore;
-use haqlite::{Durability, HaMode, HaQLite, InMemoryManifestStore, SqlValue};
+use haqlite::{Durability, HaMode, HaQLite, SqlValue};
+use turbodb_manifest_mem::MemManifestStore;
 use tempfile::TempDir;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
@@ -84,7 +85,7 @@ async fn run_mode_sync(enc: &Encoding) {
     let tmp_b = TempDir::new().expect("tmp");
 
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let shared_prefix = unique_prefix(enc.name);
 

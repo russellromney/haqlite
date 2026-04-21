@@ -10,7 +10,8 @@ use proptest::prelude::*;
 use tempfile::TempDir;
 
 use common::InMemoryStorage;
-use haqlite::{HaMode, HaQLite, InMemoryLeaseStore, InMemoryManifestStore, ManifestStore, SqlValue};
+use haqlite::{HaMode, HaQLite, InMemoryLeaseStore, ManifestStore, SqlValue};
+use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{CacheConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -54,7 +55,7 @@ proptest! {
             let tmp_dir = TempDir::new().unwrap();
             let storage = Arc::new(InMemoryStorage::new());
             let lease_store = Arc::new(InMemoryLeaseStore::new());
-            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            let manifest_store = Arc::new(MemManifestStore::new());
 
             let mut dbs = Vec::new();
             for i in 0..num_writers {

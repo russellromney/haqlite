@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use haqlite::{Durability, HaMode, HaQLite, InMemoryLeaseStore, InMemoryManifestStore, SqlValue};
+use haqlite::{Durability, HaMode, HaQLite, InMemoryLeaseStore, SqlValue};
+use turbodb_manifest_mem::MemManifestStore;
 use tempfile::TempDir;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
@@ -41,7 +42,7 @@ async fn build_tl_node(
     db_name: &str,
     s3_prefix: &str,
     lease_store: Arc<InMemoryLeaseStore>,
-    manifest_store: Arc<InMemoryManifestStore>,
+    manifest_store: Arc<MemManifestStore>,
     instance_id: &str,
     lease_ttl: u64,
     write_timeout_secs: u64,
@@ -101,7 +102,7 @@ async fn turbolite_walrust_baseline_sequential() {
 
     let prefix = unique_prefix("baseline_sequential");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let mut db_a = build_tl_node(
         tmp_a.path(), "tl_seq", &prefix, lease_store.clone(),
@@ -143,7 +144,7 @@ async fn turbolite_walrust_concurrent_no_data_loss() {
 
     let prefix = unique_prefix("concurrent_no_data_loss");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let db_a = Arc::new(tokio::sync::Mutex::new(
         build_tl_node(
@@ -222,7 +223,7 @@ async fn turbolite_walrust_concurrent_no_data_loss() {
 async fn turbolite_walrust_many_writers() {
     let prefix = unique_prefix("many_writers");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     // Open nodes sequentially to avoid races during open.
     // Write loops run concurrently -- the lease serializes actual writes.

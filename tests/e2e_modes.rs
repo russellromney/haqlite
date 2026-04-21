@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use haqlite::{Durability, HaMode, HaQLite, InMemoryLeaseStore, InMemoryManifestStore, SqlValue};
+use haqlite::{Durability, HaMode, HaQLite, InMemoryLeaseStore, SqlValue};
+use turbodb_manifest_mem::MemManifestStore;
 use tempfile::TempDir;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
@@ -52,7 +53,7 @@ async fn build_node(
     s3_prefix: &str,
     durability: Durability,
     lease_store: Arc<InMemoryLeaseStore>,
-    manifest_store: Arc<InMemoryManifestStore>,
+    manifest_store: Arc<MemManifestStore>,
     walrust_storage: Option<Arc<InMemoryStorage>>,
     instance_id: &str,
 ) -> HaQLite {
@@ -104,7 +105,7 @@ async fn build_node(
 async fn e2e_synchronous_two_nodes_sequential() {
     let prefix = unique_prefix("sync_seq");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     let tmp_a = TempDir::new().expect("tmp");
     let db_a = build_node(
@@ -149,7 +150,7 @@ async fn e2e_synchronous_two_nodes_sequential() {
 async fn e2e_synchronous_four_nodes_concurrent() {
     let prefix = unique_prefix("sync_conc");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     // Open nodes sequentially (VFS fetches S3 manifest at creation time)
     let mut tmps = Vec::new();
@@ -219,7 +220,7 @@ async fn e2e_write_fails_without_lease() {
 
     let prefix = unique_prefix("no_lease");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
 
     // Pre-populate a lease that won't expire (held by another node).
     // Key must match what execute_shared constructs: {prefix}{db_name}/_lease

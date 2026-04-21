@@ -23,7 +23,8 @@
 mod common;
 
 use common::InMemoryStorage;
-use haqlite::{HaMode, HaQLite, InMemoryManifestStore};
+use haqlite::{HaMode, HaQLite};
+use turbodb_manifest_mem::MemManifestStore;
 use hadb::InMemoryLeaseStore;
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,7 +122,7 @@ async fn shared_without_turbolite_errors_clearly() {
     let db_path_str = db_path.to_str().unwrap();
 
     let lease = Arc::new(InMemoryLeaseStore::new());
-    let manifest = Arc::new(InMemoryManifestStore::new());
+    let manifest = Arc::new(MemManifestStore::new());
 
     let result = HaQLite::builder("test-bucket")
         .prefix("p/")

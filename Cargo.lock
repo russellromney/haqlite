@@ -1557,6 +1557,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "turbodb",
  "uuid",
 ]
 
@@ -1772,6 +1773,7 @@ dependencies = [
  "tracing-subscriber",
  "turbodb",
  "turbodb-manifest-cinch",
+ "turbodb-manifest-mem",
  "turbodb-manifest-nats",
  "turbodb-manifest-s3",
  "turbolite",
@@ -4082,6 +4084,17 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "turbodb",
+]
+
+[[package]]
+name = "turbodb-manifest-mem"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hadb-storage",
+ "tokio",
  "turbodb",
 ]
 

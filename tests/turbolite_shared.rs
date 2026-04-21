@@ -12,7 +12,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use hadb::InMemoryLeaseStore;
-use haqlite::{HaMode, HaQLite, InMemoryManifestStore, ManifestStore, SqlValue, StorageManifest};
+use haqlite::{HaMode, HaQLite, ManifestStore, SqlValue};
+use turbodb::Backend;
+use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{
     CacheConfig, CompressionConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs,
 };
@@ -24,7 +26,7 @@ async fn build_turbolite_shared(
     cache_dir: &std::path::Path,
     db_name: &str,
     lease_store: Arc<InMemoryLeaseStore>,
-    manifest_store: Arc<InMemoryManifestStore>,
+    manifest_store: Arc<MemManifestStore>,
     instance_id: &str,
     vfs_name: &str,
 ) -> HaQLite {
@@ -69,7 +71,7 @@ async fn build_turbolite_shared(
 async fn turbolite_shared_single_write_read() {
     let tmp = TempDir::new().expect("temp dir");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
     let vfs_name = format!("tl_single_{}", std::process::id());
 
     let mut db = build_turbolite_shared(
@@ -103,7 +105,7 @@ async fn turbolite_shared_single_write_read() {
 async fn turbolite_shared_manifest_published_after_write() {
     let tmp = TempDir::new().expect("temp dir");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
     let vfs_name = format!("tl_manifest_{}", std::process::id());
 
     let mut db = build_turbolite_shared(
@@ -138,7 +140,7 @@ async fn turbolite_shared_manifest_published_after_write() {
         .expect("get call")
         .expect("manifest should exist");
     assert!(
-        matches!(manifest.storage, StorageManifest::Turbolite { .. }),
+        matches!(manifest.storage, Backend::Turbolite { .. }),
         "expected Turbolite storage variant, got {:?}",
         manifest.storage
     );
@@ -148,7 +150,7 @@ async fn turbolite_shared_manifest_published_after_write() {
 async fn turbolite_shared_sequential_writes_increment_manifest() {
     let tmp = TempDir::new().expect("temp dir");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
     let vfs_name = format!("tl_seq_{}", std::process::id());
 
     let mut db = build_turbolite_shared(
@@ -191,7 +193,7 @@ async fn turbolite_shared_sequential_writes_increment_manifest() {
 async fn turbolite_shared_manifest_has_turbolite_fields() {
     let tmp = TempDir::new().expect("temp dir");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
     let vfs_name = format!("tl_fields_{}", std::process::id());
 
     let mut db = build_turbolite_shared(
@@ -218,7 +220,7 @@ async fn turbolite_shared_manifest_has_turbolite_fields() {
         .expect("manifest");
 
     match &manifest.storage {
-        StorageManifest::Turbolite {
+        Backend::Turbolite {
             page_size,
             pages_per_group,
             ..
@@ -312,7 +314,7 @@ async fn turbolite_manifest_conversion_roundtrip() {
 async fn turbolite_shared_empty_table_read() {
     let tmp = TempDir::new().expect("temp dir");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
     let vfs_name = format!("tl_empty_{}", std::process::id());
 
     let mut db = build_turbolite_shared(
@@ -340,7 +342,7 @@ async fn turbolite_shared_empty_table_read() {
 async fn turbolite_shared_manifest_writer_id_set() {
     let tmp = TempDir::new().expect("temp dir");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
-    let manifest_store = Arc::new(InMemoryManifestStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
     let vfs_name = format!("tl_writer_{}", std::process::id());
 
     let mut db = build_turbolite_shared(

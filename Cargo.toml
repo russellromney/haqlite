@@ -132,4 +132,5 @@ http-body-util = "0.1"
 axum = "0.8"
 proptest = "1.5"
 proptest-derive = "0.5"
+turbodb-manifest-mem = { path = "../turbodb/turbodb-manifest-mem", version = "0.1.0" }
 redlite = { path = "../redlite/crates/redlite", version = "0.1.0" }
