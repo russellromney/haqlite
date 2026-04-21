@@ -111,9 +111,18 @@ async fn leader_fenced_on_lease_loss() {
             .expect("direct insert should work as leader");
     }
 
-    // Delete the lease so the coordinator thinks it expired
-    // This simulates network partition or another node stealing the lease
-    lease_store.delete("test/db/_lease.json").await.expect("delete lease");
+    // Delete the lease so the coordinator thinks it expired.
+    // This simulates network partition or another node stealing the lease.
+    //
+    // Pre-2026-04-21 fix: this used the hard-coded key "test/db/_lease.json",
+    // which is the S3LeaseStore key schema ({prefix}{scope}/_lease.json).
+    // InMemoryLeaseStore uses the default key_for (plain scope = "db"), so
+    // the old delete was a no-op and the leader never saw lease loss. Use
+    // the actual store's key_for to stay correct across impls.
+    lease_store
+        .delete(&lease_store.key_for("db"))
+        .await
+        .expect("delete lease");
 
     // Wait for the leader to detect lease loss.
     // With renew_interval=500ms and max_consecutive_renewal_errors=1,
