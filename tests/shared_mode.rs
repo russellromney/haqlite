@@ -298,7 +298,7 @@ async fn shared_manifest_version_tracks_writes() {
     assert_eq!(manifest.writer_id, "node-1");
     assert_eq!(manifest.version, 1, "first write should produce version 1");
     match &manifest.storage {
-        hadb::StorageManifest::Turbolite { turbolite_version, page_count, .. } => {
+        turbodb::Backend::Turbolite { turbolite_version, page_count, .. } => {
             assert!(*turbolite_version > 0, "turbolite version should be > 0 after write");
             assert!(*page_count > 0, "page count should be > 0 after write");
         }
