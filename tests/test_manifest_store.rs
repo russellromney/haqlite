@@ -151,7 +151,7 @@ async fn dedicated_mode_without_manifest_store_still_works() {
 // Shared mode: manifest_store required and actually used
 // ============================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn shared_mode_manifest_published_on_write() {
     let tmp = TempDir::new().expect("temp dir");
     let db_path = tmp.path().join("shared_manifest.db");
@@ -199,7 +199,7 @@ async fn shared_mode_manifest_published_on_write() {
     assert_eq!(meta.writer_id, "writer-1");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn shared_mode_sequential_writes_increment_manifest_version() {
     let tmp = TempDir::new().expect("temp dir");
     let db_path = tmp.path().join("shared_seq.db");
