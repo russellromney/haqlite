@@ -53,7 +53,9 @@ pub use hadb::{
 };
 
 // Re-export turbodb manifest layer (extracted from hadb in Phase Turbogenesis).
-pub use turbodb::{Backend, Manifest, ManifestStore};
+// Manifest is the envelope; payload shape is owned by each consumer
+// (haqlite passes turbolite's bytes through unchanged).
+pub use turbodb::{Manifest, ManifestStore};
 
 // Re-export hadb-lease-s3 implementations.
 pub use hadb_lease_s3::{S3LeaseStore, S3NodeRegistry, S3StorageBackend};

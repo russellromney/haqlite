@@ -13,7 +13,6 @@ use tempfile::TempDir;
 
 use hadb::InMemoryLeaseStore;
 use haqlite::{HaMode, HaQLite, ManifestStore, SqlValue};
-use turbodb::Backend;
 use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{
     CacheConfig, CompressionConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs,
@@ -133,17 +132,14 @@ async fn turbolite_shared_manifest_published_after_write() {
         .expect("manifest should exist");
     assert_eq!(meta.version, 1);
 
-    // Manifest should be Turbolite variant
+    // Payload should be non-empty turbolite wire bytes (the envelope
+    // is opaque here; decoding belongs to turbolite).
     let manifest = manifest_store
         .get("test/test/_manifest")
         .await
         .expect("get call")
         .expect("manifest should exist");
-    assert!(
-        matches!(manifest.storage, Backend::Turbolite { .. }),
-        "expected Turbolite storage variant, got {:?}",
-        manifest.storage
-    );
+    assert!(!manifest.payload.is_empty(), "turbolite payload should be non-empty");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -191,6 +187,10 @@ async fn turbolite_shared_sequential_writes_increment_manifest() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn turbolite_shared_manifest_has_turbolite_fields() {
+    // After Phase Turbogenesis-b haqlite holds only opaque bytes.
+    // Verify the round-trip lands turbolite's view with the expected
+    // page_size / pages_per_group by decoding through the VFS itself —
+    // the only thing that knows the wire format.
     let tmp = TempDir::new().expect("temp dir");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(MemManifestStore::new());
@@ -219,90 +219,106 @@ async fn turbolite_shared_manifest_has_turbolite_fields() {
         .expect("get")
         .expect("manifest");
 
-    match &manifest.storage {
-        Backend::Turbolite {
-            page_size,
-            pages_per_group,
-            ..
-        } => {
-            // SQLite default page size is 4096
-            assert!(*page_size > 0, "page_size should be > 0");
-            assert_eq!(*pages_per_group, 4, "should match config");
-        }
-        other => panic!("expected Turbolite variant, got {:?}", other),
-    }
+    // Feed the payload back through a fresh VFS and read its manifest().
+    let fresh_cache = tmp.path().join("fresh_cache");
+    std::fs::create_dir_all(&fresh_cache).expect("cache dir");
+    let fresh_config = TurboliteConfig {
+        cache_dir: fresh_cache.clone(),
+        cache: CacheConfig { pages_per_group: 4, sub_pages_per_frame: 2, ..Default::default() },
+        ..Default::default()
+    };
+    let rt_handle = tokio::runtime::Handle::current();
+    let backend: Arc<dyn hadb_storage::StorageBackend> =
+        Arc::new(hadb_storage_local::LocalStorage::new(&fresh_cache));
+    let fresh_vfs = TurboliteVfs::with_backend(fresh_config, backend, rt_handle).expect("vfs");
+    let walrust = fresh_vfs
+        .set_manifest_bytes(&manifest.payload)
+        .expect("set_manifest_bytes");
+    assert!(walrust.is_none(), "pure turbolite payload has no walrust fields");
+    let tl = fresh_vfs.manifest();
+    assert!(tl.page_size > 0, "page_size should be > 0");
+    assert_eq!(tl.pages_per_group, 4, "should match config");
 }
 
 // ============================================================================
-// Conversion round-trip
+// Data-fidelity regression: epoch + change_counter survive round-trip
 // ============================================================================
+//
+// Pre-Turbogenesis-b, haqlite's converter layer from turbolite's
+// `Manifest` → hadb's `Backend::Turbolite` silently dropped the
+// `epoch` and `change_counter` fields (they had no home on the
+// Backend variant). This regression guard drives the full payload
+// path and asserts those fields survive.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn turbolite_manifest_conversion_roundtrip() {
-    use haqlite::turbolite_replicator::{backend_to_turbolite, turbolite_to_backend};
+async fn turbolite_manifest_bytes_round_trip_preserves_epoch_and_change_counter() {
     use std::collections::HashMap;
     use turbolite::tiered::{
-        BTreeManifestEntry, FrameEntry, GroupingStrategy, Manifest, SubframeOverride,
+        CacheConfig, GroupingStrategy, Manifest as TlManifest, TurboliteConfig, TurboliteVfs,
     };
 
-    let tl = Manifest {
+    let tmp = TempDir::new().expect("temp dir");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).expect("cache dir");
+    let config = TurboliteConfig {
+        cache_dir: cache_dir.clone(),
+        cache: CacheConfig { pages_per_group: 4, ..Default::default() },
+        ..Default::default()
+    };
+    let rt_handle = tokio::runtime::Handle::current();
+    let backend: Arc<dyn hadb_storage::StorageBackend> =
+        Arc::new(hadb_storage_local::LocalStorage::new(&cache_dir));
+    let vfs = TurboliteVfs::with_backend(config, backend, rt_handle).expect("vfs");
+
+    // Seed the VFS with a manifest whose epoch + change_counter are
+    // non-zero so we can tell whether they round-trip.
+    let mut seed = TlManifest {
         version: 1,
-        change_counter: 10,
-        page_count: 50,
+        change_counter: 4242,
+        page_count: 16,
         page_size: 4096,
         pages_per_group: 4,
-        sub_pages_per_frame: 2,
-        strategy: GroupingStrategy::BTreeAware,
-        page_group_keys: vec!["pg/0_v1".into()],
-        frame_tables: vec![vec![FrameEntry {
-            offset: 0,
-            len: 4096,
-        }]],
-        group_pages: vec![vec![0, 1, 2, 3]],
-        btrees: HashMap::from([(
-            0,
-            BTreeManifestEntry {
-                name: "t".into(),
-                obj_type: "table".into(),
-                group_ids: vec![0],
-            },
-        )]),
-        interior_chunk_keys: HashMap::from([(0, "ic/0".into())]),
+        sub_pages_per_frame: 0,
+        strategy: GroupingStrategy::Positional,
+        page_group_keys: vec!["pg/0_v1".into(), "pg/1_v1".into()],
+        frame_tables: Vec::new(),
+        group_pages: Vec::new(),
+        btrees: HashMap::new(),
+        interior_chunk_keys: HashMap::new(),
         index_chunk_keys: HashMap::new(),
-        subframe_overrides: vec![HashMap::from([(
-            0,
-            SubframeOverride {
-                key: "sf/0".into(),
-                entry: FrameEntry {
-                    offset: 0,
-                    len: 512,
-                },
-            },
-        )])],
+        subframe_overrides: Vec::new(),
         page_index: HashMap::new(),
         btree_groups: HashMap::new(),
         page_to_tree_name: HashMap::new(),
         tree_name_to_groups: HashMap::new(),
         group_to_tree_name: HashMap::new(),
         db_header: None,
-        epoch: 0,
+        epoch: 9,
     };
+    seed.detect_and_normalize_strategy();
+    vfs.set_manifest(seed);
 
-    let backend = turbolite_to_backend(&tl);
-    let back = backend_to_turbolite(&backend);
-
-    assert_eq!(back.page_count, tl.page_count);
-    assert_eq!(back.page_size, tl.page_size);
-    assert_eq!(back.pages_per_group, tl.pages_per_group);
-    assert_eq!(back.sub_pages_per_frame, tl.sub_pages_per_frame);
-    assert_eq!(back.page_group_keys, tl.page_group_keys);
-    assert_eq!(back.frame_tables.len(), tl.frame_tables.len());
-    assert_eq!(back.group_pages, tl.group_pages);
-    assert_eq!(back.btrees.len(), tl.btrees.len());
-    assert_eq!(back.interior_chunk_keys.len(), tl.interior_chunk_keys.len());
+    // Round-trip through the wire: bytes → fresh VFS → manifest().
+    let bytes = vfs.manifest_bytes().expect("manifest_bytes");
+    let tmp_b = TempDir::new().expect("temp dir b");
+    let cache_b = tmp_b.path().join("cache");
+    std::fs::create_dir_all(&cache_b).expect("cache b");
+    let config_b = TurboliteConfig {
+        cache_dir: cache_b.clone(),
+        cache: CacheConfig { pages_per_group: 4, ..Default::default() },
+        ..Default::default()
+    };
+    let rt_handle_b = tokio::runtime::Handle::current();
+    let backend_b: Arc<dyn hadb_storage::StorageBackend> =
+        Arc::new(hadb_storage_local::LocalStorage::new(&cache_b));
+    let vfs_b = TurboliteVfs::with_backend(config_b, backend_b, rt_handle_b).expect("vfs b");
+    let walrust = vfs_b.set_manifest_bytes(&bytes).expect("set_manifest_bytes");
+    assert!(walrust.is_none());
+    let got = vfs_b.manifest();
+    assert_eq!(got.epoch, 9, "epoch must survive manifest round-trip");
     assert_eq!(
-        back.subframe_overrides.len(),
-        tl.subframe_overrides.len()
+        got.change_counter, 4242,
+        "change_counter must survive manifest round-trip"
     );
 }
 

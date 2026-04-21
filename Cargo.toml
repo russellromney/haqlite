@@ -134,4 +134,5 @@ axum = "0.8"
 proptest = "1.5"
 proptest-derive = "0.5"
 turbodb-manifest-mem = { path = "../hadb/turbodb-manifest-mem", version = "0.4.0" }
+hadb-storage-local = { path = "../hadb/hadb-storage-local", version = "0.4.0" }
 redlite = { path = "../redlite/crates/redlite", version = "0.1.0" }

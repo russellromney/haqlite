@@ -284,7 +284,9 @@ async fn shared_failover_lease_expires_other_node_writes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_manifest_version_tracks_writes() {
-    // Verify manifest contains correct Backend::Walrust data
+    // Verify writes advance the manifest envelope and the payload is
+    // non-empty turbolite bytes. After Phase Turbogenesis-b haqlite
+    // carries opaque bytes; decoding belongs to turbolite.
     let tmp = TempDir::new().unwrap();
     let prefix = unique_prefix("shared_manifest_version_tracks_writes");
     let lease_store = Arc::new(InMemoryLeaseStore::new());
@@ -294,17 +296,10 @@ async fn shared_manifest_version_tracks_writes() {
 
     db.execute("INSERT INTO t VALUES (1, 'v1')", &[]).unwrap();
 
-    // Fetch full manifest and verify storage variant
     let manifest = manifest_store.get("test/test/_manifest").await.unwrap().unwrap();
     assert_eq!(manifest.writer_id, "node-1");
     assert_eq!(manifest.version, 1, "first write should produce version 1");
-    match &manifest.storage {
-        turbodb::Backend::Turbolite { turbolite_version, page_count, .. } => {
-            assert!(*turbolite_version > 0, "turbolite version should be > 0 after write");
-            assert!(*page_count > 0, "page count should be > 0 after write");
-        }
-        _ => panic!("expected Turbolite storage variant, got {:?}", manifest.storage),
-    }
+    assert!(!manifest.payload.is_empty(), "turbolite payload should be non-empty after write");
 }
 
 // ============================================================================

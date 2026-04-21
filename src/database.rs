@@ -1516,9 +1516,12 @@ impl HaQLite {
 
         match manifest_store.get(&manifest_key).await {
             Ok(Some(manifest)) if manifest.version > current_version => {
-                // Apply the turbolite manifest from the store.
-                let tl_manifest = crate::turbolite_replicator::backend_to_turbolite(&manifest.storage);
-                vfs.set_manifest(tl_manifest);
+                // Apply the turbolite manifest bytes from the store.
+                // The envelope's payload is opaque to haqlite; turbolite
+                // decodes its own wire format.
+                vfs.set_manifest_bytes(&manifest.payload)
+                    .map_err(|e| HaQLiteError::ReplicationError(
+                        format!("turbolite set_manifest_bytes failed: {}", e)))?;
                 self.inner.cached_manifest_version.store(manifest.version, Ordering::SeqCst);
                 self.inner.set_conn(None); // reopen with new manifest
             }
@@ -1559,8 +1562,9 @@ impl HaQLite {
                 let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
                 match manifest_store.get(&manifest_key).await {
                     Ok(Some(manifest)) if manifest.version > cached => {
-                        let tl_manifest = crate::turbolite_replicator::backend_to_turbolite(&manifest.storage);
-                        vfs.set_manifest(tl_manifest);
+                        vfs.set_manifest_bytes(&manifest.payload)
+                            .map_err(|e| HaQLiteError::ReplicationError(
+                                format!("turbolite set_manifest_bytes failed: {}", e)))?;
                         self.inner.cached_manifest_version.store(manifest.version, Ordering::SeqCst);
                         self.inner.set_conn(None);
                     }
@@ -1589,16 +1593,17 @@ impl HaQLite {
             // version from the store for CAS (not our cached version, which
             // may be stale if another writer published between our reads).
             {
-                let tl_manifest = vfs.manifest();
+                let payload = vfs.manifest_bytes()
+                    .map_err(|e| HaQLiteError::ReplicationError(
+                        format!("turbolite manifest_bytes failed: {}", e)))?;
                 let manifest = turbodb::Manifest {
                     version: 0, // assigned by store
                     writer_id: self.inner.shared_instance_id.clone(),
-                    lease_epoch: 0,
                     timestamp_ms: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64,
-                    storage: crate::turbolite_replicator::turbolite_to_backend(&tl_manifest),
+                    payload,
                 };
                 // Fetch current version from store for correct CAS.
                 let current_version = match manifest_store.meta(&manifest_key).await {
