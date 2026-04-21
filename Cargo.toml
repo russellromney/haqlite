@@ -57,14 +57,18 @@ hadb-storage = { path = "../hadb/hadb-storage", version = "0.4.0" }
 hadb-storage-s3 = { path = "../hadb/hadb-storage-s3", version = "0.4.0" }
 hadb-storage-cinch = { path = "../hadb/hadb-storage-cinch", version = "0.4.0" }
 
-# Cinch-protocol HTTP lease store + generic HTTP manifest store
-# (for embedded replicas via Grabby or engine)
+# Cinch-protocol HTTP lease store
 hadb-lease-cinch = { path = "../hadb/hadb-lease-cinch", version = "0.4.0" }
-hadb-manifest-http = { path = "../hadb/hadb-manifest-http", version = "0.4.0" }
+
+# turbodb manifest layer (extracted from hadb in Phase Turbogenesis):
+# trait crate + cinch-protocol manifest store for embedded replicas via
+# Grabby or engine.
+turbodb = { path = "../turbodb/turbodb", version = "0.1.0" }
+turbodb-manifest-cinch = { path = "../turbodb/turbodb-manifest-cinch", version = "0.1.0" }
 
 # Manifest stores (optional, for Shared mode and Dedicated mode manifest polling)
-hadb-manifest-nats = { path = "../hadb/hadb-manifest-nats", version = "0.4.0", optional = true }
-hadb-manifest-s3 = { path = "../hadb/hadb-manifest-s3", version = "0.4.0", optional = true }
+turbodb-manifest-nats = { path = "../turbodb/turbodb-manifest-nats", version = "0.1.0", optional = true }
+turbodb-manifest-s3 = { path = "../turbodb/turbodb-manifest-s3", version = "0.1.0", optional = true }
 
 # Turbolite VFS (optional storage engine). The library depends on hadb-storage
 # (trait) only; concrete S3Storage for page storage is injected by haqlite.
@@ -85,8 +89,8 @@ rusqlite = { version = "0.35", features = ["bundled"] }
 
 [features]
 nats-lease = ["dep:hadb-lease-nats"]
-nats-manifest = ["dep:hadb-manifest-nats"]
-s3-manifest = ["dep:hadb-manifest-s3"]
+nats-manifest = ["dep:turbodb-manifest-nats"]
+s3-manifest = ["dep:turbodb-manifest-s3"]
 
 [[bin]]
 name = "haqlite"

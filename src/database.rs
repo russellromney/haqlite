@@ -93,7 +93,7 @@ pub struct HaQLiteBuilder {
     lease_store: Option<Arc<dyn hadb::LeaseStore>>,
     mode: HaMode,
     durability: Durability,
-    manifest_store: Option<Arc<dyn hadb::ManifestStore>>,
+    manifest_store: Option<Arc<dyn turbodb::ManifestStore>>,
     manifest_poll_interval: Option<Duration>,
     write_timeout: Option<Duration>,
     walrust_storage: Option<Arc<dyn hadb_storage::StorageBackend>>,
@@ -236,17 +236,17 @@ impl HaQLiteBuilder {
     }
 
     /// Use a ManifestStore (required for `HaMode::Shared`).
-    pub fn manifest_store(mut self, store: Arc<dyn hadb::ManifestStore>) -> Self {
+    pub fn manifest_store(mut self, store: Arc<dyn turbodb::ManifestStore>) -> Self {
         self.manifest_store = Some(store);
         self
     }
 
-    /// Use an HTTP-based ManifestStore (for embedded replicas via a proxy).
+    /// Use Cinch's HTTP-based ManifestStore (for embedded replicas via a proxy).
     ///
-    /// Shorthand for `.manifest_store(Arc::new(HttpManifestStore::new(endpoint, token)))`.
+    /// Shorthand for `.manifest_store(Arc::new(CinchManifestStore::new(endpoint, token)))`.
     pub fn manifest_endpoint(self, endpoint: &str, token: &str) -> Self {
         self.manifest_store(Arc::new(
-            hadb_manifest_http::HttpManifestStore::new(endpoint, token),
+            turbodb_manifest_cinch::CinchManifestStore::new(endpoint, token),
         ))
     }
 
@@ -490,10 +490,10 @@ impl HaQLiteBuilder {
                 // journal_mode=OFF, so walrust has no WAL to ship.
                 let (follower_behavior, tl_state, manifest_wakeup) = if self.durability == Durability::Synchronous {
                     // Phase Lucid: manifest store must be explicit for Synchronous mode.
-                    let ms: Arc<dyn hadb::ManifestStore> = self.manifest_store.clone().ok_or_else(|| {
+                    let ms: Arc<dyn turbodb::ManifestStore> = self.manifest_store.clone().ok_or_else(|| {
                         anyhow::anyhow!(
                             "Durability::Synchronous + HaMode::Dedicated requires manifest_store(). \
-                             Pass an Arc<dyn hadb::ManifestStore>, or call \
+                             Pass an Arc<dyn turbodb::ManifestStore>, or call \
                              haqlite::env::manifest_store_from_env(bucket, endpoint).await?"
                         )
                     })?;
@@ -598,9 +598,9 @@ impl HaQLiteBuilder {
                 let lease_ttl = self.lease_ttl.unwrap_or(5);
 
                 // Phase Lucid: manifest store must be explicit for Shared mode.
-                let manifest_store: Arc<dyn hadb::ManifestStore> = self.manifest_store.ok_or_else(|| {
+                let manifest_store: Arc<dyn turbodb::ManifestStore> = self.manifest_store.ok_or_else(|| {
                     anyhow::anyhow!(
-                        "HaMode::Shared requires manifest_store(). Pass an Arc<dyn hadb::ManifestStore>, \
+                        "HaMode::Shared requires manifest_store(). Pass an Arc<dyn turbodb::ManifestStore>, \
                          or call haqlite::env::manifest_store_from_env(bucket, endpoint).await?"
                     )
                 })?;
@@ -727,7 +727,7 @@ pub(crate) struct HaQLiteInner {
     /// Direct lease store access (Shared mode, bypasses Coordinator).
     shared_lease_store: Option<Arc<dyn hadb::LeaseStore>>,
     /// Direct manifest store access (Shared mode).
-    shared_manifest_store: Option<Arc<dyn hadb::ManifestStore>>,
+    shared_manifest_store: Option<Arc<dyn turbodb::ManifestStore>>,
     /// Direct replicator access (Shared mode).
     shared_replicator: Option<Arc<SqliteReplicator>>,
     /// Walrust storage backend for pull_incremental.
@@ -1590,7 +1590,7 @@ impl HaQLite {
             // may be stale if another writer published between our reads).
             {
                 let tl_manifest = vfs.manifest();
-                let ha_manifest = hadb::HaManifest {
+                let ha_manifest = turbodb::Manifest {
                     version: 0, // assigned by store
                     writer_id: self.inner.shared_instance_id.clone(),
                     lease_epoch: 0,
@@ -1848,7 +1848,7 @@ impl HaQLite {
 /// When present, the leader publishes manifests and the promoted leader
 /// opens turbolite VFS connections instead of plain SQLite.
 struct DedicatedTurboliteState {
-    manifest_store: Arc<dyn hadb::ManifestStore>,
+    manifest_store: Arc<dyn turbodb::ManifestStore>,
     vfs: turbolite::tiered::SharedTurboliteVfs,
     vfs_name: String,
     prefix: String,
@@ -2105,7 +2105,7 @@ async fn run_manifest_poller(
 #[allow(clippy::too_many_arguments)]
 async fn open_shared_turbolite(
     lease_store: Arc<dyn hadb::LeaseStore>,
-    manifest_store: Arc<dyn hadb::ManifestStore>,
+    manifest_store: Arc<dyn turbodb::ManifestStore>,
     vfs: turbolite::tiered::SharedTurboliteVfs,
     vfs_name: &str,
     db_path: PathBuf,

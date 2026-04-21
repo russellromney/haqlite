@@ -151,7 +151,7 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
     if let Ok(nats_url) = std::env::var("WAL_MANIFEST_NATS_URL")
         .or_else(|_| std::env::var("WAL_LEASE_NATS_URL"))
     {
-        match hadb_manifest_nats::NatsManifestStore::connect(&nats_url, "hadb-manifests").await {
+        match turbodb_manifest_nats::NatsManifestStore::connect(&nats_url, "hadb-manifests").await {
             Ok(store) => {
                 info!(url = %nats_url, "using NATS manifest store");
                 builder = builder.manifest_store(std::sync::Arc::new(store));
@@ -181,7 +181,7 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
             }
         };
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
-        let s3_manifest = hadb_manifest_s3::S3ManifestStore::new(s3_client, shared.s3.bucket.clone());
+        let s3_manifest = turbodb_manifest_s3::S3ManifestStore::new(s3_client, shared.s3.bucket.clone());
         builder = builder.manifest_store(std::sync::Arc::new(s3_manifest));
         manifest_store_configured = true;
         info!("using S3 manifest store");

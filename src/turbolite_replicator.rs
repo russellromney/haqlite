@@ -1,7 +1,7 @@
 //! Turbolite replicator: hadb::Replicator implementation for turbolite VFS.
 //!
-//! Translates between turbolite's native Manifest type and hadb's
-//! StorageManifest::Turbolite variant for manifest-based coordination.
+//! Translates between turbolite's native Manifest type and turbodb's
+//! Backend::Turbolite variant for manifest-based coordination.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -10,9 +10,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use hadb::{
-    BTreeManifestEntry as HaBTreeEntry, FrameEntry as HaFrameEntry, ManifestStore, Replicator,
-    StorageManifest, SubframeOverride as HaSubframeOverride,
+use hadb::Replicator;
+use turbodb::{
+    BTreeManifestEntry as HaBTreeEntry, Backend, FrameEntry as HaFrameEntry, ManifestStore,
+    SubframeOverride as HaSubframeOverride,
 };
 use turbolite::tiered::{
     BTreeManifestEntry as TlBTreeEntry, FrameEntry as TlFrameEntry, Manifest as TurboliteManifest,
@@ -59,7 +60,7 @@ impl Replicator for TurboliteReplicator {
     async fn pull(&self, _name: &str, _path: &Path) -> Result<()> {
         // Fetch manifest from store, extract turbolite state, apply to VFS.
         if let Some(ha_manifest) = self.manifest_store.get(&self.manifest_key).await? {
-            if let StorageManifest::Turbolite { .. } = &ha_manifest.storage {
+            if let Backend::Turbolite { .. } = &ha_manifest.storage {
                 let tl_manifest = ha_storage_to_turbolite(&ha_manifest.storage);
                 self.vfs.set_manifest(tl_manifest);
             }
@@ -85,9 +86,9 @@ impl Replicator for TurboliteReplicator {
 // Manifest conversion: turbolite <-> hadb
 // ============================================================================
 
-/// Convert a turbolite Manifest to hadb StorageManifest::Turbolite.
-pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> StorageManifest {
-    StorageManifest::Turbolite {
+/// Convert a turbolite Manifest to hadb Backend::Turbolite.
+pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> Backend {
+    Backend::Turbolite {
         turbolite_version: m.version,
         page_count: m.page_count,
         page_size: m.page_size,
@@ -158,13 +159,13 @@ pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> StorageManifest {
     }
 }
 
-/// Convert a turbolite Manifest + walrust position to hybrid StorageManifest::TurboliteWalrust.
+/// Convert a turbolite Manifest + walrust position to hybrid Backend::TurboliteWalrust.
 pub fn turbolite_walrust_to_ha_storage(
     m: &TurboliteManifest,
     walrust_txid: u64,
     walrust_changeset_prefix: &str,
-) -> StorageManifest {
-    StorageManifest::TurboliteWalrust {
+) -> Backend {
+    Backend::TurboliteWalrust {
         turbolite_version: m.version,
         page_count: m.page_count,
         page_size: m.page_size,
@@ -192,19 +193,19 @@ pub fn turbolite_walrust_to_ha_storage(
     }
 }
 
-/// Convert hadb StorageManifest::Turbolite back to a turbolite Manifest.
+/// Convert hadb Backend::Turbolite back to a turbolite Manifest.
 ///
 /// The returned manifest will have `detect_and_normalize_strategy()` called
 /// on it by `TurboliteVfs::set_manifest()`, so we do not need to set the
 /// strategy field or build the page_index here.
-pub fn ha_storage_to_turbolite(storage: &StorageManifest) -> TurboliteManifest {
+pub fn ha_storage_to_turbolite(storage: &Backend) -> TurboliteManifest {
     match storage {
-        StorageManifest::Turbolite {
+        Backend::Turbolite {
             turbolite_version, page_count, page_size, pages_per_group, sub_pages_per_frame,
             strategy: _, page_group_keys, frame_tables, group_pages, btrees,
             interior_chunk_keys, index_chunk_keys, subframe_overrides, db_header,
         }
-        | StorageManifest::TurboliteWalrust {
+        | Backend::TurboliteWalrust {
             turbolite_version, page_count, page_size, pages_per_group, sub_pages_per_frame,
             strategy: _, page_group_keys, frame_tables, group_pages, btrees,
             interior_chunk_keys, index_chunk_keys, subframe_overrides, db_header,
@@ -212,7 +213,7 @@ pub fn ha_storage_to_turbolite(storage: &StorageManifest) -> TurboliteManifest {
         } => TurboliteManifest {
             version: *turbolite_version,
             change_counter: 0,
-            // hadb::StorageManifest does not carry turbolite's epoch field;
+            // turbodb::Backend does not carry turbolite's epoch field;
             // this conversion path (haqlite manifest_store → turbolite) is
             // used by ha followers catching up from an HA manifest store.
             // Phase Strata's fork epoch is delivered via the direct
@@ -318,9 +319,9 @@ pub fn ha_storage_to_turbolite(storage: &StorageManifest) -> TurboliteManifest {
 
 /// Extract walrust fields from a TurboliteWalrust manifest.
 /// Returns (walrust_txid, walrust_changeset_prefix) or None if not a hybrid manifest.
-pub fn extract_walrust_fields(storage: &StorageManifest) -> Option<(u64, &str)> {
+pub fn extract_walrust_fields(storage: &Backend) -> Option<(u64, &str)> {
     match storage {
-        StorageManifest::TurboliteWalrust { walrust_txid, walrust_changeset_prefix, .. } => {
+        Backend::TurboliteWalrust { walrust_txid, walrust_changeset_prefix, .. } => {
             Some((*walrust_txid, walrust_changeset_prefix))
         }
         _ => None,
@@ -424,7 +425,7 @@ mod tests {
 
         // Verify hadb types
         match &ha {
-            StorageManifest::Turbolite {
+            Backend::Turbolite {
                 page_count,
                 page_size,
                 pages_per_group,
@@ -462,7 +463,7 @@ mod tests {
 
     #[test]
     fn ha_storage_to_turbolite_with_wrong_variant_returns_empty() {
-        let walrust = StorageManifest::Walrust {
+        let walrust = Backend::Walrust {
             txid: 1,
             changeset_prefix: "cs/".into(),
             latest_changeset_key: "cs/1".into(),

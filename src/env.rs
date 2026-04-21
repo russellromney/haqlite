@@ -119,7 +119,7 @@ pub async fn lease_store_from_env(
 pub async fn manifest_store_from_env(
     bucket: &str,
     endpoint: Option<&str>,
-) -> Result<Arc<dyn hadb::ManifestStore>> {
+) -> Result<Arc<dyn turbodb::ManifestStore>> {
     let url = std::env::var("HAQLITE_MANIFEST_URL").map_err(|_| {
         anyhow::anyhow!(
             "HAQLITE_MANIFEST_URL not set. Either call HaQLiteBuilder::manifest_store() \
@@ -154,7 +154,7 @@ pub async fn manifest_store_from_env(
                 s3_bucket,
                 s3_endpoint
             );
-            return Ok(Arc::new(hadb_manifest_s3::S3ManifestStore::new(
+            return Ok(Arc::new(turbodb_manifest_s3::S3ManifestStore::new(
                 client, s3_bucket,
             )));
         }
@@ -170,8 +170,8 @@ pub async fn manifest_store_from_env(
     if url.starts_with("http://") || url.starts_with("https://") {
         let parsed = parse_url_params(&url);
         let token = parsed.params.get("token").cloned().unwrap_or_default();
-        tracing::info!("haqlite::env: using HTTP manifest store: {}", parsed.base);
-        return Ok(Arc::new(hadb_manifest_http::HttpManifestStore::new(
+        tracing::info!("haqlite::env: using Cinch manifest store: {}", parsed.base);
+        return Ok(Arc::new(turbodb_manifest_cinch::CinchManifestStore::new(
             &parsed.base,
             &token,
         )));
@@ -191,7 +191,7 @@ pub async fn manifest_store_from_env(
             nats_bucket
         );
         let store =
-            hadb_manifest_nats::NatsManifestStore::connect(&parsed.base, &nats_bucket).await?;
+            turbodb_manifest_nats::NatsManifestStore::connect(&parsed.base, &nats_bucket).await?;
         return Ok(Arc::new(store));
     }
     #[cfg(not(feature = "nats-manifest"))]

@@ -50,16 +50,18 @@ pub use hadb::{
     Coordinator, CoordinatorConfig, HaMetrics,
     InMemoryLeaseStore, JoinResult, LeaseConfig, LeaseData, LeaseStore, MetricsSnapshot,
     NodeRegistration, NodeRegistry, Role, RoleEvent,
-    ManifestStore, HaManifest, StorageManifest, InMemoryManifestStore,
 };
+
+// Re-export turbodb manifest layer (extracted from hadb in Phase Turbogenesis).
+pub use turbodb::{Backend, Manifest, ManifestStore};
 
 // Re-export hadb-lease-s3 implementations.
 pub use hadb_lease_s3::{S3LeaseStore, S3NodeRegistry, S3StorageBackend};
 
 // Re-export Cinch-protocol lease store + fence primitives.
 pub use hadb_lease_cinch::{AtomicFence, AtomicFenceWriter, CinchLeaseStore};
-// Re-export generic HTTP manifest store.
-pub use hadb_manifest_http::HttpManifestStore;
+// Re-export Cinch-protocol manifest store (renamed from HttpManifestStore in Phase Turbogenesis).
+pub use turbodb_manifest_cinch::CinchManifestStore;
 
 // Re-export SQLite-specific implementations.
 pub use follower_behavior::SqliteFollowerBehavior;

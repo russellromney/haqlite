@@ -774,25 +774,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cbindgen"
-version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fce8dd7fcfcbf3a0a87d8f515194b49d6135acab73e18bd380d1d93bb1a15eb"
-dependencies = [
- "clap",
- "heck 0.4.1",
- "indexmap",
- "log",
- "proc-macro2",
- "quote",
- "serde",
- "serde_json",
- "syn",
- "tempfile",
- "toml",
-]
-
-[[package]]
 name = "cc"
 version = "1.2.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -867,7 +848,7 @@ version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1110bd8a634a1ab8cb04345d8d878267d57c3cf1b38d91b71af6686408bbca6a"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "proc-macro2",
  "quote",
  "syn",
@@ -1576,6 +1557,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "turbodb",
  "uuid",
 ]
 
@@ -1697,48 +1679,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hadb-manifest-http"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "hadb",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "hadb-manifest-nats"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "async-nats",
- "async-trait",
- "bytes",
- "hadb",
- "rmp-serde",
- "tokio",
-]
-
-[[package]]
-name = "hadb-manifest-s3"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aws-config",
- "aws-sdk-s3",
- "aws-smithy-types",
- "hadb",
- "rmp-serde",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "hadb-storage"
 version = "0.4.0"
 dependencies = [
@@ -1809,9 +1749,6 @@ dependencies = [
  "hadb-lease-cinch",
  "hadb-lease-nats",
  "hadb-lease-s3",
- "hadb-manifest-http",
- "hadb-manifest-nats",
- "hadb-manifest-s3",
  "hadb-storage",
  "hadb-storage-cinch",
  "hadb-storage-s3",
@@ -1834,6 +1771,10 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "turbodb",
+ "turbodb-manifest-cinch",
+ "turbodb-manifest-nats",
+ "turbodb-manifest-s3",
  "turbolite",
  "uuid",
  "walrust",
@@ -1870,12 +1811,6 @@ checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
 dependencies = [
  "hashbrown 0.15.5",
 ]
-
-[[package]]
-name = "heck"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95505c38b4572b2d910cecb0281560f54b440a19336cbbcb27bf6ce6adc6f5a8"
 
 [[package]]
 name = "heck"
@@ -4127,6 +4062,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "turbodb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hadb-storage",
+ "serde",
+]
+
+[[package]]
+name = "turbodb-manifest-cinch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hadb-storage",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "turbodb",
+]
+
+[[package]]
+name = "turbodb-manifest-nats"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "bytes",
+ "hadb-storage",
+ "rmp-serde",
+ "tokio",
+ "turbodb",
+]
+
+[[package]]
+name = "turbodb-manifest-s3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "aws-smithy-types",
+ "hadb-storage",
+ "rmp-serde",
+ "tokio",
+ "tracing",
+ "turbodb",
+]
+
+[[package]]
 name = "turbolite"
 version = "0.4.1"
 dependencies = [
@@ -4134,8 +4124,6 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "atty",
- "cbindgen",
- "cc",
  "clap",
  "clap_complete",
  "file-guard",
@@ -4157,6 +4145,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "ureq",
  "zstd",
 ]
@@ -4690,7 +4679,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea61de684c3ea68cb082b7a88508a8b27fcc8b797d738bfc99a82facf1d752dc"
 dependencies = [
  "anyhow",
- "heck 0.5.0",
+ "heck",
  "wit-parser",
 ]
 
@@ -4701,7 +4690,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7c566e0f4b284dd6561c786d9cb0142da491f46a9fbed79ea69cdad5db17f21"
 dependencies = [
  "anyhow",
- "heck 0.5.0",
+ "heck",
  "indexmap",
  "prettyplease",
  "syn",
