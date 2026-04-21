@@ -239,7 +239,7 @@ async fn turbolite_shared_manifest_has_turbolite_fields() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn turbolite_manifest_conversion_roundtrip() {
-    use haqlite::turbolite_replicator::{ha_storage_to_turbolite, turbolite_to_ha_storage};
+    use haqlite::turbolite_replicator::{backend_to_turbolite, turbolite_to_backend};
     use std::collections::HashMap;
     use turbolite::tiered::{
         BTreeManifestEntry, FrameEntry, GroupingStrategy, Manifest, SubframeOverride,
@@ -288,8 +288,8 @@ async fn turbolite_manifest_conversion_roundtrip() {
         epoch: 0,
     };
 
-    let ha = turbolite_to_ha_storage(&tl);
-    let back = ha_storage_to_turbolite(&ha);
+    let backend = turbolite_to_backend(&tl);
+    let back = backend_to_turbolite(&backend);
 
     assert_eq!(back.page_count, tl.page_count);
     assert_eq!(back.page_size, tl.page_size);

@@ -11,10 +11,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use hadb::Replicator;
-use turbodb::{
-    BTreeManifestEntry as HaBTreeEntry, Backend, FrameEntry as HaFrameEntry, ManifestStore,
-    SubframeOverride as HaSubframeOverride,
-};
+use turbodb::{BTreeManifestEntry, Backend, FrameEntry, ManifestStore, SubframeOverride};
 use turbolite::tiered::{
     BTreeManifestEntry as TlBTreeEntry, FrameEntry as TlFrameEntry, Manifest as TurboliteManifest,
     SharedTurboliteVfs, SubframeOverride as TlSubframeOverride, TurboliteVfs,
@@ -59,9 +56,9 @@ impl Replicator for TurboliteReplicator {
 
     async fn pull(&self, _name: &str, _path: &Path) -> Result<()> {
         // Fetch manifest from store, extract turbolite state, apply to VFS.
-        if let Some(ha_manifest) = self.manifest_store.get(&self.manifest_key).await? {
-            if let Backend::Turbolite { .. } = &ha_manifest.storage {
-                let tl_manifest = ha_storage_to_turbolite(&ha_manifest.storage);
+        if let Some(manifest) = self.manifest_store.get(&self.manifest_key).await? {
+            if let Backend::Turbolite { .. } = &manifest.storage {
+                let tl_manifest = backend_to_turbolite(&manifest.storage);
                 self.vfs.set_manifest(tl_manifest);
             }
         }
@@ -83,11 +80,11 @@ impl Replicator for TurboliteReplicator {
 }
 
 // ============================================================================
-// Manifest conversion: turbolite <-> hadb
+// Manifest conversion: turbolite <-> turbodb
 // ============================================================================
 
-/// Convert a turbolite Manifest to hadb Backend::Turbolite.
-pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> Backend {
+/// Convert a turbolite Manifest to turbodb Backend::Turbolite.
+pub fn turbolite_to_backend(m: &TurboliteManifest) -> Backend {
     Backend::Turbolite {
         turbolite_version: m.version,
         page_count: m.page_count,
@@ -101,7 +98,7 @@ pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> Backend {
             .iter()
             .map(|ft| {
                 ft.iter()
-                    .map(|e| HaFrameEntry {
+                    .map(|e| FrameEntry {
                         offset: e.offset,
                         len: e.len,
                         page_count: 0,
@@ -116,7 +113,7 @@ pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> Backend {
             .map(|(k, v)| {
                 (
                     *k,
-                    HaBTreeEntry {
+                    BTreeManifestEntry {
                         name: v.name.clone(),
                         obj_type: v.obj_type.clone(),
                         group_ids: v.group_ids.clone(),
@@ -142,9 +139,9 @@ pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> Backend {
                     .map(|(k, v)| {
                         (
                             *k,
-                            HaSubframeOverride {
+                            SubframeOverride {
                                 key: v.key.clone(),
-                                entry: HaFrameEntry {
+                                entry: FrameEntry {
                                     offset: v.entry.offset,
                                     len: v.entry.len,
                                     page_count: 0,
@@ -160,7 +157,7 @@ pub fn turbolite_to_ha_storage(m: &TurboliteManifest) -> Backend {
 }
 
 /// Convert a turbolite Manifest + walrust position to hybrid Backend::TurboliteWalrust.
-pub fn turbolite_walrust_to_ha_storage(
+pub fn turbolite_walrust_to_backend(
     m: &TurboliteManifest,
     walrust_txid: u64,
     walrust_changeset_prefix: &str,
@@ -174,17 +171,17 @@ pub fn turbolite_walrust_to_ha_storage(
         strategy: format!("{:?}", m.strategy),
         page_group_keys: m.page_group_keys.clone(),
         frame_tables: m.frame_tables.iter().map(|ft| {
-            ft.iter().map(|e| HaFrameEntry { offset: e.offset, len: e.len, page_count: 0 }).collect()
+            ft.iter().map(|e| FrameEntry { offset: e.offset, len: e.len, page_count: 0 }).collect()
         }).collect(),
         group_pages: m.group_pages.clone(),
         btrees: m.btrees.iter().map(|(k, v)| {
-            (*k, HaBTreeEntry { name: v.name.clone(), obj_type: v.obj_type.clone(), group_ids: v.group_ids.clone() })
+            (*k, BTreeManifestEntry { name: v.name.clone(), obj_type: v.obj_type.clone(), group_ids: v.group_ids.clone() })
         }).collect(),
         interior_chunk_keys: m.interior_chunk_keys.iter().map(|(k, v)| (*k, v.clone())).collect(),
         index_chunk_keys: m.index_chunk_keys.iter().map(|(k, v)| (*k, v.clone())).collect(),
         subframe_overrides: m.subframe_overrides.iter().map(|ovs| {
             ovs.iter().map(|(k, v)| {
-                (*k, HaSubframeOverride { key: v.key.clone(), entry: HaFrameEntry { offset: v.entry.offset, len: v.entry.len, page_count: 0 } })
+                (*k, SubframeOverride { key: v.key.clone(), entry: FrameEntry { offset: v.entry.offset, len: v.entry.len, page_count: 0 } })
             }).collect()
         }).collect(),
         db_header: m.db_header.clone(),
@@ -193,12 +190,12 @@ pub fn turbolite_walrust_to_ha_storage(
     }
 }
 
-/// Convert hadb Backend::Turbolite back to a turbolite Manifest.
+/// Convert turbodb Backend::Turbolite back to a turbolite Manifest.
 ///
 /// The returned manifest will have `detect_and_normalize_strategy()` called
 /// on it by `TurboliteVfs::set_manifest()`, so we do not need to set the
 /// strategy field or build the page_index here.
-pub fn ha_storage_to_turbolite(storage: &Backend) -> TurboliteManifest {
+pub fn backend_to_turbolite(storage: &Backend) -> TurboliteManifest {
     match storage {
         Backend::Turbolite {
             turbolite_version, page_count, page_size, pages_per_group, sub_pages_per_frame,
@@ -360,8 +357,8 @@ mod tests {
             epoch: 0,
         };
 
-        let ha = turbolite_to_ha_storage(&tl);
-        let back = ha_storage_to_turbolite(&ha);
+        let backend = turbolite_to_backend(&tl);
+        let back = backend_to_turbolite(&backend);
         assert_eq!(back.page_count, 0);
         assert_eq!(back.page_size, 0);
         assert!(back.page_group_keys.is_empty());
@@ -421,10 +418,10 @@ mod tests {
             epoch: 0,
         };
 
-        let ha = turbolite_to_ha_storage(&tl);
+        let backend = turbolite_to_backend(&tl);
 
-        // Verify hadb types
-        match &ha {
+        // Verify turbodb types
+        match &backend {
             Backend::Turbolite {
                 page_count,
                 page_size,
@@ -446,7 +443,7 @@ mod tests {
         }
 
         // Round-trip back
-        let back = ha_storage_to_turbolite(&ha);
+        let back = backend_to_turbolite(&backend);
         assert_eq!(back.page_count, 100);
         assert_eq!(back.page_size, 4096);
         assert_eq!(back.pages_per_group, 256);
@@ -462,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn ha_storage_to_turbolite_with_wrong_variant_returns_empty() {
+    fn backend_to_turbolite_with_wrong_variant_returns_empty() {
         let walrust = Backend::Walrust {
             txid: 1,
             changeset_prefix: "cs/".into(),
@@ -470,7 +467,7 @@ mod tests {
             snapshot_key: None,
             snapshot_txid: None,
         };
-        let result = ha_storage_to_turbolite(&walrust);
+        let result = backend_to_turbolite(&walrust);
         assert_eq!(result.page_count, 0);
         assert_eq!(result.page_size, 0);
     }

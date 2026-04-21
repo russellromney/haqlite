@@ -1515,11 +1515,11 @@ impl HaQLite {
         let current_version = self.inner.cached_manifest_version.load(Ordering::SeqCst);
 
         match manifest_store.get(&manifest_key).await {
-            Ok(Some(ha_manifest)) if ha_manifest.version > current_version => {
+            Ok(Some(manifest)) if manifest.version > current_version => {
                 // Apply the turbolite manifest from the store.
-                let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
+                let tl_manifest = crate::turbolite_replicator::backend_to_turbolite(&manifest.storage);
                 vfs.set_manifest(tl_manifest);
-                self.inner.cached_manifest_version.store(ha_manifest.version, Ordering::SeqCst);
+                self.inner.cached_manifest_version.store(manifest.version, Ordering::SeqCst);
                 self.inner.set_conn(None); // reopen with new manifest
             }
             Ok(_) => {} // no manifest or same version
@@ -1558,10 +1558,10 @@ impl HaQLite {
             {
                 let cached = self.inner.cached_manifest_version.load(Ordering::SeqCst);
                 match manifest_store.get(&manifest_key).await {
-                    Ok(Some(ha_manifest)) if ha_manifest.version > cached => {
-                        let tl_manifest = crate::turbolite_replicator::ha_storage_to_turbolite(&ha_manifest.storage);
+                    Ok(Some(manifest)) if manifest.version > cached => {
+                        let tl_manifest = crate::turbolite_replicator::backend_to_turbolite(&manifest.storage);
                         vfs.set_manifest(tl_manifest);
-                        self.inner.cached_manifest_version.store(ha_manifest.version, Ordering::SeqCst);
+                        self.inner.cached_manifest_version.store(manifest.version, Ordering::SeqCst);
                         self.inner.set_conn(None);
                     }
                     Ok(_) => {} // no manifest or same version
@@ -1590,7 +1590,7 @@ impl HaQLite {
             // may be stale if another writer published between our reads).
             {
                 let tl_manifest = vfs.manifest();
-                let ha_manifest = turbodb::Manifest {
+                let manifest = turbodb::Manifest {
                     version: 0, // assigned by store
                     writer_id: self.inner.shared_instance_id.clone(),
                     lease_epoch: 0,
@@ -1598,7 +1598,7 @@ impl HaQLite {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64,
-                    storage: crate::turbolite_replicator::turbolite_to_ha_storage(&tl_manifest),
+                    storage: crate::turbolite_replicator::turbolite_to_backend(&tl_manifest),
                 };
                 // Fetch current version from store for correct CAS.
                 let current_version = match manifest_store.meta(&manifest_key).await {
@@ -1609,7 +1609,7 @@ impl HaQLite {
                 };
                 match manifest_store.put(
                     &manifest_key,
-                    &ha_manifest,
+                    &manifest,
                     current_version,
                 ).await {
                     Ok(cas) if cas.success => {
