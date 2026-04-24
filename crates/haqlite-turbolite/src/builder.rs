@@ -354,6 +354,12 @@ impl Builder {
                 Ok(conn)
             });
 
+        let shared_vfs_for_flush = shared_vfs.clone();
+        let on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>> = Some(Arc::new(move || {
+            shared_vfs_for_flush.flush_to_storage()
+                .map_err(|e| anyhow::anyhow!("turbolite flush: {e}"))
+        }));
+
         haqlite::database::open_with_coordinator(
             coordinator,
             db_path,
@@ -366,6 +372,7 @@ impl Builder {
             self.inner.get_read_concurrency(),
             self.inner.get_authorizer().cloned(),
             Some(connection_opener),
+            on_flush,
         )
         .await
         .map_err(|e| e.into())

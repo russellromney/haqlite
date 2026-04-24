@@ -399,6 +399,7 @@ impl HaQLiteBuilder {
             self.read_concurrency,
             self.authorizer,
             None,
+            None,
         )
         .await
     }
@@ -495,6 +496,9 @@ pub struct HaQLiteInner {
     /// Optional lazy connection opener. Used by sibling crates to open
     /// connections via a custom VFS on first use.
     pub connection_opener: Option<Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>>,
+    /// Optional flush callback for tiered storage (turbolite). Set by sibling
+    /// crates that inject a custom VFS; base haqlite never sets this.
+    pub on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
 }
 
 impl HaQLiteInner {
@@ -537,6 +541,7 @@ impl HaQLiteInner {
             fwd_handle: tokio::sync::Mutex::new(None),
             authorizer: None,
             connection_opener: None,
+            on_flush: None,
         }
     }
 
@@ -708,6 +713,15 @@ impl HaQLite {
         }
     }
 
+    /// Flush tiered storage pages if a sibling crate (e.g. haqlite-turbolite)
+    /// registered an on_flush callback. No-op otherwise.
+    pub fn flush_turbolite(&self) -> Result<()> {
+        if let Some(ref callback) = self.inner.on_flush {
+            callback()?;
+        }
+        Ok(())
+    }
+
     /// Open a local-only SQLite database (no HA, no S3).
     ///
     /// Same `execute()`/`query_row()` API. Useful for development and testing.
@@ -758,6 +772,7 @@ impl HaQLite {
             forwarding_port: 0,
             fwd_handle: tokio::sync::Mutex::new(None),
             connection_opener: None,
+            on_flush: None,
         });
 
         // Apply custom authorizer (unfenced) on initial connection.
@@ -822,6 +837,7 @@ impl HaQLite {
             DEFAULT_READ_CONCURRENCY,
             None, // no custom authorizer for from_coordinator
             None, // no custom connection opener
+            None, // no tiered storage flush
         )
         .await
     }
@@ -1382,6 +1398,7 @@ pub async fn open_with_coordinator(
     read_concurrency: usize,
     authorizer: Option<AuthorizerFactory>,
     connection_opener: Option<Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>>,
+    on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
 ) -> Result<HaQLite> {
     ensure_schema(&db_path, schema)?;
 
@@ -1436,6 +1453,7 @@ pub async fn open_with_coordinator(
         forwarding_port,
         fwd_handle: tokio::sync::Mutex::new(None),
         connection_opener,
+        on_flush,
     });
 
     // If leader, open rw connection.
