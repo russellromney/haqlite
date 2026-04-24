@@ -2,9 +2,9 @@
 //!
 //! Supports all 4 valid haqlite configurations:
 //!   Dedicated + Replicated  (classic walrust HA)
-//!   Dedicated + Synchronous (turbolite S3Primary HA)
-//!   Dedicated + Eventual    (turbolite + walrust HA)
-//!   Shared + Synchronous    (multiwriter, turbolite S3Primary)
+//!   Dedicated + Synchronous (walrust HA)
+//!   Dedicated + Eventual    (walrust HA)
+//!   Shared + Synchronous    (not supported in base haqlite)
 //!
 //! Usage:
 //!   # Shared + Synchronous (2 nodes)
@@ -423,9 +423,9 @@ async fn main() -> Result<()> {
 
     match args.durability.as_str() {
         "replicated" => { builder = builder.durability(hadb::Durability::Replicated(Duration::from_secs(1))); }
-        "checkpoint" => { builder = builder.turbolite_durability(turbodb::Durability::Checkpoint(turbodb::CheckpointConfig::default())); }
-        "continuous" => { builder = builder.turbolite_durability(turbodb::Durability::default()); }
-        "cloud" => { builder = builder.turbolite_durability(turbodb::Durability::Cloud); }
+        "checkpoint" => { builder = builder.durability(hadb::Durability::Local); }
+        "continuous" => { builder = builder.durability(hadb::Durability::Replicated(Duration::from_secs(1))); }
+        "cloud" => { builder = builder.durability(hadb::Durability::SyncReplicated); }
         other => anyhow::bail!(
             "unknown durability: {} (expected: replicated, checkpoint, continuous, cloud)",
             other
@@ -459,6 +459,7 @@ async fn main() -> Result<()> {
     #[cfg(feature = "nats-lease")]
     if let Some(ref nats_url) = args.nats_url {
         let nats_lease = hadb_lease_nats::NatsLeaseStore::connect(nats_url, "haqlite-leases")
+            .await
             .map_err(|e| anyhow::anyhow!("NATS lease connect: {}", e))?;
         builder = builder.lease_store(std::sync::Arc::new(nats_lease));
         info!("Using NATS lease store: {}", nats_url);

@@ -14,7 +14,7 @@
 //! Usage:
 //!   TIERED_TEST_BUCKET=haqlite-test AWS_ENDPOINT_URL=https://fly.storage.tigris.dev \
 //!   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=auto \
-//!   cargo run --features turbolite-cloud,s3-manifest --bin haqlite-e2e -- \
+//!   cargo run --bin haqlite-e2e -- \
 //!     --durability synchronous --workers 4 --writes-per-worker 20
 
 use std::collections::HashMap;
@@ -101,8 +101,8 @@ async fn open_node(
 
     let mut builder = HaQLite::builder(&args.bucket)
         .prefix(prefix)
-        .mode(HaMode::Shared)
-        .turbolite_durability(turbodb::Durability::Cloud)
+        .mode(HaMode::Dedicated)
+        .durability(hadb::Durability::Replicated(Duration::from_secs(1)))
         .instance_id(instance_id)
         .lease_ttl(args.lease_ttl)
         .write_timeout(Duration::from_secs(args.write_timeout));

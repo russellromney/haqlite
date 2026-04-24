@@ -113,100 +113,6 @@ pub async fn lease_store_from_env(
     ))
 }
 
-/// Resolve a manifest store from `HAQLITE_MANIFEST_URL`.
-///
-/// Same scheme dispatch as [`lease_store_from_env`].
-pub async fn manifest_store_from_env(
-    bucket: &str,
-    endpoint: Option<&str>,
-) -> Result<Arc<dyn turbodb::ManifestStore>> {
-    let url = std::env::var("HAQLITE_MANIFEST_URL").map_err(|_| {
-        anyhow::anyhow!(
-            "HAQLITE_MANIFEST_URL not set. Either call HaQLiteBuilder::manifest_store() \
-             with an explicit store, or set the env var.\n\
-             Examples:\n  \
-               HAQLITE_MANIFEST_URL=http://proxy:8080?token=mytoken\n  \
-               HAQLITE_MANIFEST_URL=nats://localhost:4222?bucket=manifests\n  \
-               HAQLITE_MANIFEST_URL=s3  (uses the bucket/endpoint passed here)"
-        )
-    })?;
-
-    if url == "s3" || url.starts_with("s3://") {
-        #[cfg(feature = "s3-manifest")]
-        {
-            let (s3_bucket, s3_endpoint) = if url == "s3" {
-                (bucket.to_string(), endpoint.map(|s| s.to_string()))
-            } else {
-                let parsed = parse_url_params(&url[5..]);
-                (parsed.host, parsed.params.get("endpoint").cloned())
-            };
-            let base_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .load()
-                .await;
-            let mut s3_builder = aws_sdk_s3::config::Builder::from(&base_config)
-                .force_path_style(true);
-            if let Some(ref ep) = s3_endpoint {
-                s3_builder = s3_builder.endpoint_url(ep);
-            }
-            let client = aws_sdk_s3::Client::from_conf(s3_builder.build());
-            tracing::info!(
-                "haqlite::env: using S3 manifest store: bucket={} endpoint={:?}",
-                s3_bucket,
-                s3_endpoint
-            );
-            return Ok(Arc::new(turbodb_manifest_s3::S3ManifestStore::new(
-                client, s3_bucket,
-            )));
-        }
-        #[cfg(not(feature = "s3-manifest"))]
-        {
-            let _ = (bucket, endpoint);
-            return Err(anyhow::anyhow!(
-                "HAQLITE_MANIFEST_URL uses s3 but haqlite was compiled without the s3-manifest feature"
-            ));
-        }
-    }
-
-    if url.starts_with("http://") || url.starts_with("https://") {
-        let parsed = parse_url_params(&url);
-        let token = parsed.params.get("token").cloned().unwrap_or_default();
-        tracing::info!("haqlite::env: using Cinch manifest store: {}", parsed.base);
-        return Ok(Arc::new(turbodb_manifest_cinch::CinchManifestStore::new(
-            &parsed.base,
-            &token,
-        )));
-    }
-
-    #[cfg(feature = "nats-manifest")]
-    if url.starts_with("nats://") {
-        let parsed = parse_url_params(&url);
-        let nats_bucket = parsed
-            .params
-            .get("bucket")
-            .cloned()
-            .unwrap_or_else(|| "haqlite-manifests".to_string());
-        tracing::info!(
-            "haqlite::env: using NATS manifest store: {} bucket={}",
-            parsed.base,
-            nats_bucket
-        );
-        let store =
-            turbodb_manifest_nats::NatsManifestStore::connect(&parsed.base, &nats_bucket).await?;
-        return Ok(Arc::new(store));
-    }
-    #[cfg(not(feature = "nats-manifest"))]
-    if url.starts_with("nats://") {
-        return Err(anyhow::anyhow!(
-            "HAQLITE_MANIFEST_URL uses nats:// but haqlite was compiled without the nats-manifest feature"
-        ));
-    }
-
-    Err(anyhow::anyhow!(
-        "Unsupported HAQLITE_MANIFEST_URL scheme: {}. Supported: http://, https://, nats://, s3://, s3",
-        url
-    ))
-}
-
 struct ParsedUrl {
     base: String,
     host: String,
@@ -253,10 +159,6 @@ mod tests {
         std::env::remove_var("HAQLITE_LEASE_URL");
     }
 
-    fn unset_manifest() {
-        std::env::remove_var("HAQLITE_MANIFEST_URL");
-    }
-
     /// Helper: extract error message from `Result<Arc<dyn _>, _>` since the
     /// trait objects don't impl Debug (so `unwrap_err()` won't compile).
     fn err_msg<T>(r: Result<T>) -> String {
@@ -272,14 +174,6 @@ mod tests {
         let err = err_msg(lease_store_from_env("b", None).await);
         assert!(err.contains("HAQLITE_LEASE_URL not set"), "got: {err}");
         assert!(err.contains("HaQLiteBuilder::lease_store()"));
-    }
-
-    #[tokio::test]
-    async fn manifest_store_unset_returns_clear_error() {
-        unset_manifest();
-        let err = err_msg(manifest_store_from_env("b", None).await);
-        assert!(err.contains("HAQLITE_MANIFEST_URL not set"), "got: {err}");
-        assert!(err.contains("HaQLiteBuilder::manifest_store()"));
     }
 
     #[tokio::test]

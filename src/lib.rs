@@ -33,8 +33,6 @@ pub mod ops;
 pub mod replicator;
 pub mod serve;
 
-pub mod turbolite_replicator;
-
 // Re-export HaQLite as the primary API.
 pub use database::{AuthorizerFactory, HaQLite, HaQLiteBuilder};
 pub use hadb::{Durability, HaMode, validate_mode_durability};
@@ -52,18 +50,11 @@ pub use hadb::{
     NodeRegistration, NodeRegistry, Role, RoleEvent,
 };
 
-// Re-export turbodb manifest layer (extracted from hadb in Phase Turbogenesis).
-// Manifest is the envelope; payload shape is owned by each consumer
-// (haqlite passes turbolite's bytes through unchanged).
-pub use turbodb::{Manifest, ManifestStore};
-
 // Re-export hadb-lease-s3 implementations.
 pub use hadb_lease_s3::{S3LeaseStore, S3NodeRegistry, S3StorageBackend};
 
 // Re-export Cinch-protocol lease store + fence primitives.
 pub use hadb_lease_cinch::{AtomicFence, AtomicFenceWriter, CinchLeaseStore};
-// Re-export Cinch-protocol manifest store (renamed from HttpManifestStore in Phase Turbogenesis).
-pub use turbodb_manifest_cinch::CinchManifestStore;
 
 // Re-export SQLite-specific implementations.
 pub use follower_behavior::SqliteFollowerBehavior;
