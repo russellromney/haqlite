@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::InMemoryStorage;
-use haqlite::{Durability, HaMode, HaQLite, InMemoryLeaseStore, SqlValue};
+use haqlite::{HaQLite, InMemoryLeaseStore, SqlValue};
+use haqlite_turbolite::{Builder, Mode};
 use turbodb_manifest_mem::MemManifestStore;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -142,10 +143,8 @@ async fn build_node(
         .expect("register VFS");
 
     let db_path = tmp.path().join(format!("{}.db", name));
-    HaQLite::builder("test-bucket")
-        .prefix("test/")
-        .mode(HaMode::Shared)
-        .turbolite_durability(turbodb::Durability::Cloud)
+    Builder::new("test-bucket")
+        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, &vfs_name)

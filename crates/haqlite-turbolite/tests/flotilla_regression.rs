@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use hadb::InMemoryLeaseStore;
-use haqlite::{HaMode, HaQLite, SqlValue};
+use haqlite::{HaQLite, SqlValue};
+use haqlite_turbolite::{Builder, Mode};
 use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{CacheConfig, CompressionConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
@@ -71,10 +72,8 @@ async fn build_turbolite_dedicated(
 
     let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(common::InMemoryStorage::new());
     let db_path = cache_dir.join(format!("{}.db", db_name));
-    HaQLite::builder("unused-bucket")
-        .prefix("test/")
-        .mode(HaMode::Dedicated)
-        .turbolite_durability(durability)
+    Builder::new("unused-bucket")
+        .prefix("test/").mode(Mode::Writer).durability(durability)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .walrust_storage(walrust_storage)
@@ -95,9 +94,9 @@ async fn build_walrust_dedicated(
 ) -> HaQLite {
     let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(common::InMemoryStorage::new());
     let db_path = cache_dir.join(format!("{}.db", db_name));
-    HaQLite::builder("unused-bucket")
+    haqlite::HaQLite::builder("unused-bucket")
         .prefix("test/")
-        .mode(HaMode::Dedicated)
+        .mode(haqlite::HaMode::Dedicated)
         .durability(durability)
         .lease_store(lease_store)
         .walrust_storage(walrust_storage)

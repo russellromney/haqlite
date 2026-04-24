@@ -12,7 +12,8 @@ use proptest::prelude::*;
 use tempfile::TempDir;
 
 use common::InMemoryStorage;
-use haqlite::{Durability, HaMode, HaQLite, HaQLiteError, InMemoryLeaseStore, SqlValue};
+use haqlite::{HaQLite, HaQLiteError, InMemoryLeaseStore, SqlValue};
+use haqlite_turbolite::{Builder, Mode};
 use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{CacheConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
@@ -177,10 +178,10 @@ proptest! {
 
             let (vfs, vfs_name) = make_local_vfs(tmp.path());
             let db_path = tmp.path().join("shared_serial.db");
-            let mut db = HaQLite::builder("test-bucket")
+            let mut db = Builder::new("test-bucket")
                 .prefix("test/")
-                .mode(HaMode::Shared)
-                .turbolite_durability(turbodb::Durability::Cloud)
+                .mode(Mode::MultiWriter)
+                .durability(turbodb::Durability::Cloud)
                 .lease_store(lease_store)
                 .manifest_store(manifest_store)
                 .walrust_storage(storage)

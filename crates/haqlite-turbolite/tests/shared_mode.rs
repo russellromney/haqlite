@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
-use haqlite::{Durability, HaMode, HaQLite, HaQLiteError, ManifestStore, SqlValue};
+use haqlite::{HaQLite, HaQLiteError, SqlValue};
+use haqlite_turbolite::{Builder, Mode};
+use turbodb::ManifestStore;
 use hadb::{InMemoryLeaseStore, LeaseStore};
 use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
@@ -70,10 +72,8 @@ async fn build_shared(
         .expect("register VFS");
 
     let db_path = tmp.path().join(format!("{}.db", db_name));
-    HaQLite::builder("test-bucket")
-        .prefix("test/")
-        .mode(HaMode::Shared)
-        .turbolite_durability(turbodb::Durability::Cloud)
+    Builder::new("test-bucket")
+        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, &vfs_name)
@@ -576,10 +576,8 @@ async fn test_write_timeout_lease_contention() {
         .expect("register VFS");
 
     let db_path = tmp.path().join("contention.db");
-    let mut db = HaQLite::builder("test-bucket")
-        .prefix("test/")
-        .mode(HaMode::Shared)
-        .turbolite_durability(turbodb::Durability::Cloud)
+    let mut db = Builder::new("test-bucket")
+        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, &vfs_name)

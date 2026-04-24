@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use haqlite::{HaMode, HaQLite, InMemoryLeaseStore, SqlValue};
+use haqlite::{HaQLite, InMemoryLeaseStore, SqlValue};
+use haqlite_turbolite::{Builder, Mode};
 use turbodb_manifest_mem::MemManifestStore;
 use tempfile::TempDir;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
@@ -75,10 +76,8 @@ async fn build_node(
     turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
 
     let db_path = cache_dir.join("e2e.db");
-    let mut builder = HaQLite::builder("test-bucket")
-        .prefix("test/")
-        .mode(HaMode::Shared)
-        .turbolite_durability(turbodb::Durability::Cloud)
+    let mut builder = Builder::new("test-bucket")
+        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, &vfs_name)
@@ -250,10 +249,8 @@ async fn e2e_write_fails_without_lease() {
     let shared_vfs = SharedTurboliteVfs::new(vfs);
     turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("reg");
 
-    let db = HaQLite::builder("test-bucket")
-        .prefix("test/")
-        .mode(HaMode::Shared)
-        .turbolite_durability(turbodb::Durability::Cloud)
+    let db = Builder::new("test-bucket")
+        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, &vfs_name)

@@ -1,10 +1,11 @@
-//! Mode I: Production multiwriter -- turbolite S3 page groups + walrust WAL shipping.
+//! Mode F: haqlite shared + turbolite S3Primary multiwriter.
 //!
-//! turbolite handles storage (S3 page groups, local cache, compression).
-//! walrust handles WAL frame replication (incremental catch-up between checkpoints).
-//! haqlite coordinates via leases. Manifest is TurboliteWalrust (hybrid).
+//! Every commit uploads dirty subframes to S3. No WAL, no walrust.
+//! Catch-up is set_manifest only (page groups in S3 = full state).
+//! journal_mode=OFF. Simplest multiwriter path.
 //!
-//! Uses InMemoryStorage for walrust and S3 for turbolite (RustFS).
+//! Requires: TIERED_TEST_BUCKET, AWS_ENDPOINT_URL, AWS_ACCESS_KEY_ID,
+//! AWS_SECRET_ACCESS_KEY, AWS_REGION environment variables.
 
 #![cfg(feature = "turbolite-cloud")]
 
@@ -14,9 +15,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::InMemoryStorage;
 use hadb::InMemoryLeaseStore;
-use haqlite::{HaMode, HaQLite, SqlValue};
+use haqlite::{HaQLite, SqlValue};
+use haqlite_turbolite::{Builder, Mode};
 use turbodb_manifest_mem::MemManifestStore;
 use tempfile::TempDir;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
@@ -31,7 +32,8 @@ fn unique_vfs(prefix: &str) -> String {
 }
 
 fn test_bucket() -> String {
-    std::env::var("TIERED_TEST_BUCKET").expect("TIERED_TEST_BUCKET required")
+    std::env::var("TIERED_TEST_BUCKET")
+        .expect("TIERED_TEST_BUCKET required")
 }
 
 fn endpoint_url() -> Option<String> {
@@ -40,7 +42,7 @@ fn endpoint_url() -> Option<String> {
 
 fn unique_prefix(name: &str) -> String {
     format!(
-        "test/mode_i/{}/{}",
+        "test/mode_f/{}/{}",
         name,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -49,19 +51,20 @@ fn unique_prefix(name: &str) -> String {
     )
 }
 
-/// Build a Mode I node: turbolite Durable + walrust + haqlite shared.
-async fn build_mode_i_node(
+/// Build a Mode F node: turbolite S3Primary + haqlite shared.
+/// Each node gets its own S3 prefix (turbolite is single-writer per VFS).
+/// Coordination via shared lease_store + manifest_store.
+async fn build_mode_f_node(
     cache_dir: &std::path::Path,
     db_name: &str,
     s3_prefix: &str,
-    walrust_storage: Arc<InMemoryStorage>,
     lease_store: Arc<InMemoryLeaseStore>,
     manifest_store: Arc<MemManifestStore>,
     instance_id: &str,
     lease_ttl: u64,
     write_timeout_secs: u64,
 ) -> HaQLite {
-    let vfs_name = unique_vfs(&format!("mi_{}", instance_id));
+    let vfs_name = unique_vfs(&format!("mf_{}", instance_id));
     let config = TurboliteConfig {
         bucket: test_bucket(),
         prefix: s3_prefix.to_string(),
@@ -81,21 +84,23 @@ async fn build_mode_i_node(
         .expect("register VFS");
 
     let db_path = cache_dir.join(format!("{}.db", db_name));
-    HaQLite::builder("test-bucket")
-        .prefix("test/")
-        .mode(HaMode::Shared)
-        .turbolite_durability(turbodb::Durability::Cloud)
+    let db_path_str = db_path.to_str().expect("path");
+
+    // Let the builder handle everything (schema creation, connection management).
+    // Don't do external schema creation -- it triggers S3Primary uploads that
+    // interfere with multiwriter catch-up.
+    Builder::new("unused-bucket")
+        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
-        .walrust_storage(walrust_storage)
         .turbolite_vfs(shared_vfs, &vfs_name)
         .instance_id(instance_id)
         .manifest_poll_interval(Duration::from_millis(50))
         .write_timeout(Duration::from_secs(write_timeout_secs))
         .lease_ttl(lease_ttl)
-        .open(db_path.to_str().expect("path"), SCHEMA)
+        .open(db_path_str, SCHEMA)
         .await
-        .expect("open Mode I")
+        .expect("open Mode F")
 }
 
 fn has_key(rows: &[Vec<SqlValue>], key: &str) -> bool {
@@ -109,24 +114,23 @@ fn has_key(rows: &[Vec<SqlValue>], key: &str) -> bool {
 // Tests
 // ============================================================================
 
-/// Baseline: two nodes write sequentially via walrust WAL shipping.
+/// Baseline: two nodes write sequentially. Both succeed, both visible.
 #[tokio::test(flavor = "multi_thread")]
-async fn mode_i_baseline_sequential() {
+async fn mode_f_baseline_sequential() {
     let tmp_a = TempDir::new().expect("tmp");
     let tmp_b = TempDir::new().expect("tmp");
     let prefix = unique_prefix("seq");
 
-    let walrust_storage = Arc::new(InMemoryStorage::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(MemManifestStore::new());
 
-    let mut db_a = build_mode_i_node(
-        tmp_a.path(), "mi_seq", &prefix, walrust_storage.clone(),
-        lease_store.clone(), manifest_store.clone(), "node-a", 5, 10,
+    let mut db_a = build_mode_f_node(
+        tmp_a.path(), "mf_seq", &prefix, lease_store.clone(), manifest_store.clone(),
+        "node-a", 5, 10,
     ).await;
-    let mut db_b = build_mode_i_node(
-        tmp_b.path(), "mi_seq", &prefix, walrust_storage.clone(),
-        lease_store.clone(), manifest_store.clone(), "node-b", 5, 10,
+    let mut db_b = build_mode_f_node(
+        tmp_b.path(), "mf_seq", &prefix, lease_store.clone(), manifest_store.clone(),
+        "node-b", 5, 10,
     ).await;
 
     // Node A writes
@@ -134,7 +138,7 @@ async fn mode_i_baseline_sequential() {
         .await
         .expect("node A write");
 
-    // Node B writes (catches up via set_manifest + walrust restore)
+    // Node B writes (catches up via set_manifest from S3)
     db_b.execute("INSERT OR REPLACE INTO kv VALUES ('k2', 'from_b')", &[])
         .await
         .expect("node B write");
@@ -154,25 +158,24 @@ async fn mode_i_baseline_sequential() {
 
 /// Concurrent writes (lease serialized). All successful writes visible.
 #[tokio::test(flavor = "multi_thread")]
-async fn mode_i_concurrent_no_data_loss() {
+async fn mode_f_concurrent_no_data_loss() {
     let tmp_a = TempDir::new().expect("tmp");
     let tmp_b = TempDir::new().expect("tmp");
     let prefix = unique_prefix("conc");
 
-    let walrust_storage = Arc::new(InMemoryStorage::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(MemManifestStore::new());
 
     let db_a = Arc::new(tokio::sync::Mutex::new(
-        build_mode_i_node(
-            tmp_a.path(), "mi_conc", &prefix, walrust_storage.clone(),
-            lease_store.clone(), manifest_store.clone(), "node-a", 5, 10,
+        build_mode_f_node(
+            tmp_a.path(), "mf_conc", &prefix, lease_store.clone(), manifest_store.clone(),
+            "node-a", 5, 10,
         ).await,
     ));
     let db_b = Arc::new(tokio::sync::Mutex::new(
-        build_mode_i_node(
-            tmp_b.path(), "mi_conc", &prefix, walrust_storage.clone(),
-            lease_store.clone(), manifest_store.clone(), "node-b", 5, 10,
+        build_mode_f_node(
+            tmp_b.path(), "mf_conc", &prefix, lease_store.clone(), manifest_store.clone(),
+            "node-b", 5, 10,
         ).await,
     ));
 
@@ -233,4 +236,67 @@ async fn mode_i_concurrent_no_data_loss() {
         "total rows ({}) should equal total successes ({}+{}={})",
         rows.len(), a_count, b_count, a_count + b_count,
     );
+}
+
+/// 4-node stress test.
+#[tokio::test(flavor = "multi_thread")]
+async fn mode_f_four_nodes() {
+    let prefix = unique_prefix("stress");
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
+
+    // Open nodes sequentially
+    let mut tmps = Vec::new();
+    let mut dbs = Vec::new();
+    for node_id in 0..4 {
+        let tmp = TempDir::new().expect("tmp");
+        let db = build_mode_f_node(
+            tmp.path(), "mf_stress", &prefix, lease_store.clone(), manifest_store.clone(),
+            &format!("node-{}", node_id), 2, 10,
+        ).await;
+        tmps.push(tmp);
+        dbs.push(db);
+    }
+
+    // Each node writes 5 rows sequentially (lease serializes)
+    let mut total = 0u64;
+    for (node_id, db) in dbs.iter().enumerate() {
+        for i in 0..5 {
+            match db.execute(
+                "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
+                &[
+                    SqlValue::Text(format!("n{}_{}", node_id, i)),
+                    SqlValue::Text(format!("val_{}_{}", node_id, i)),
+                ],
+            ).await {
+                Ok(_) => { total += 1; }
+                Err(e) => eprintln!("node-{} write {} failed: {}", node_id, i, e),
+            }
+        }
+    }
+
+    // Close writers
+    for mut db in dbs {
+        db.close().await.expect("close");
+    }
+
+    eprintln!("total successes: {}", total);
+    assert!(total > 0);
+
+    // Fresh reader
+    let tmp_reader = TempDir::new().expect("tmp");
+    let mut reader = build_mode_f_node(
+        tmp_reader.path(), "mf_stress", &prefix, lease_store.clone(), manifest_store.clone(),
+        "reader", 5, 10,
+    ).await;
+
+    let rows = reader
+        .query_values_fresh("SELECT key FROM kv ORDER BY key", &[])
+        .await
+        .expect("query");
+
+    eprintln!("final rows: {}, expected: {}", rows.len(), total);
+    assert_eq!(rows.len() as u64, total, "all writes should be visible");
+
+    reader.close().await.expect("close reader");
 }

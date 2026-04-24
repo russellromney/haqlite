@@ -63,3 +63,4 @@ tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 turbodb-manifest-mem = { path = "../../../hadb/turbodb-manifest-mem", version = "0.4.0" }
 hadb-storage-local = { path = "../../../hadb/hadb-storage-local", version = "0.4.0" }
+proptest = "1"

@@ -101,6 +101,16 @@ impl Builder {
         self
     }
 
+    pub fn manifest_poll_interval(mut self, interval: Duration) -> Self {
+        self.inner = self.inner.manifest_poll_interval(interval);
+        self
+    }
+
+    pub fn write_timeout(mut self, timeout: Duration) -> Self {
+        self.inner = self.inner.write_timeout(timeout);
+        self
+    }
+
     pub fn lease_store(mut self, store: Arc<dyn LeaseStore>) -> Self {
         self.inner = self.inner.lease_store(store);
         self

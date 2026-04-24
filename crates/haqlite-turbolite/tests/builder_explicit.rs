@@ -23,7 +23,8 @@
 mod common;
 
 use common::InMemoryStorage;
-use haqlite::{HaMode, HaQLite};
+use haqlite::HaQLite;
+use haqlite_turbolite::{Builder, Mode};
 use turbodb_manifest_mem::MemManifestStore;
 use hadb::InMemoryLeaseStore;
 use std::sync::Arc;
@@ -66,7 +67,7 @@ async fn dedicated_without_lease_or_walrust_errors_clearly() {
     let db_path = tmp.path().join("t.db");
     let db_path_str = db_path.to_str().unwrap();
 
-    let result = HaQLite::builder("test-bucket")
+    let result = Builder::new("test-bucket")
         .prefix("p/")
         .instance_id("test-1")
         .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -89,11 +90,9 @@ async fn shared_without_lease_errors_clearly() {
     let db_path_str = db_path.to_str().unwrap();
     let (vfs, vfs_name) = dummy_turbolite_vfs(&tmp);
 
-    let result = HaQLite::builder("test-bucket")
+    let result = Builder::new("test-bucket")
         .prefix("p/")
-        .instance_id("test-1")
-        .mode(HaMode::Shared)
-        .turbolite_durability(turbodb::Durability::Cloud)
+        .instance_id("test-1").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .turbolite_vfs(vfs, &vfs_name)
         .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .await;
@@ -115,11 +114,9 @@ async fn shared_without_manifest_errors_clearly() {
     let lease = Arc::new(InMemoryLeaseStore::new());
     let (vfs, vfs_name) = dummy_turbolite_vfs(&tmp);
 
-    let result = HaQLite::builder("test-bucket")
+    let result = Builder::new("test-bucket")
         .prefix("p/")
-        .instance_id("test-1")
-        .mode(HaMode::Shared)
-        .turbolite_durability(turbodb::Durability::Cloud)
+        .instance_id("test-1").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .turbolite_vfs(vfs, &vfs_name)
         .lease_store(lease)
         .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -142,11 +139,9 @@ async fn shared_without_turbolite_errors_clearly() {
     let lease = Arc::new(InMemoryLeaseStore::new());
     let manifest = Arc::new(MemManifestStore::new());
 
-    let result = HaQLite::builder("test-bucket")
+    let result = Builder::new("test-bucket")
         .prefix("p/")
-        .instance_id("test-1")
-        .mode(HaMode::Shared)
-        .turbolite_durability(turbodb::Durability::Cloud)
+        .instance_id("test-1").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease)
         .manifest_store(manifest)
         .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -175,7 +170,7 @@ async fn lease_timing_setters_reach_coordinator() {
     let lease = Arc::new(InMemoryLeaseStore::new());
     let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
 
-    let db = HaQLite::builder("test-bucket")
+    let db = haqlite::HaQLite::builder("test-bucket")
         .prefix("p/")
         .instance_id("test-1")
         .address("http://127.0.0.1:19090")
@@ -233,7 +228,7 @@ async fn caller_lease_config_timing_is_preserved() {
         ..Default::default()
     };
 
-    let db = HaQLite::builder("test-bucket")
+    let db = haqlite::HaQLite::builder("test-bucket")
         .prefix("p/")
         .instance_id("caller-instance")
         .address("http://127.0.0.1:19091")
@@ -266,10 +261,4 @@ async fn env_module_is_public_and_returns_clear_errors() {
         Ok(_) => panic!("expected error when HAQLITE_LEASE_URL is unset"),
     };
     assert!(lease_err.contains("HAQLITE_LEASE_URL not set"));
-
-    let manifest_err = match haqlite::env::manifest_store_from_env("b", None).await {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("expected error when HAQLITE_MANIFEST_URL is unset"),
-    };
-    assert!(manifest_err.contains("HAQLITE_MANIFEST_URL not set"));
 }

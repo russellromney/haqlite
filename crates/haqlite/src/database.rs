@@ -1158,7 +1158,10 @@ impl HaQLite {
         // 2. Close connection (drains in-flight writes via the Mutex).
         self.inner.set_conn(None);
 
-        // 3. Leave the cluster (releases lease).
+        // 3. Flush tiered storage pages if a sibling crate registered an on_flush callback.
+        self.flush_turbolite()?;
+
+        // 4. Leave the cluster (releases lease).
         if let Some(ref coordinator) = self.inner.coordinator {
             coordinator
                 .leave(&self.inner.db_name)

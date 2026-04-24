@@ -12,7 +12,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use hadb::InMemoryLeaseStore;
-use haqlite::{HaMode, HaQLite, ManifestStore, SqlValue};
+use haqlite::{HaQLite, SqlValue};
+use haqlite_turbolite::{Builder, Mode};
+use turbodb::ManifestStore;
 use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{
     CacheConfig, CompressionConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs,
@@ -47,10 +49,8 @@ async fn build_turbolite_shared(
         .expect("register turbolite VFS");
 
     let db_path = cache_dir.join(format!("{}.db", db_name));
-    HaQLite::builder("unused-bucket")
-        .prefix("test/")
-        .mode(HaMode::Shared)
-        .turbolite_durability(turbodb::Durability::Cloud)
+    Builder::new("unused-bucket")
+        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, vfs_name)
