@@ -229,10 +229,12 @@ impl Builder {
             };
 
         // Resolve sync_interval and skip_snapshot from turbodb durability.
+        // Cloud mode uses journal_mode=DELETE (no WAL), so walrust has nothing
+        // to ship. Use a long interval to avoid burning CPU on an idle loop.
         let (sync_interval, skip_snapshot) = match self.turbolite_durability {
             turbodb::Durability::Checkpoint { .. } => (Duration::from_secs(3600), false),
             turbodb::Durability::Continuous { replication_interval, .. } => (replication_interval, false),
-            turbodb::Durability::Cloud => (Duration::from_millis(1), true),
+            turbodb::Durability::Cloud => (Duration::from_secs(3600), true),
         };
 
         let snapshot_interval = self.inner.get_coordinator_config()
