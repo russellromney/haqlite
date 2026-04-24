@@ -103,7 +103,7 @@ pub struct HaQLiteBuilder {
 }
 
 impl HaQLiteBuilder {
-    fn new(bucket: &str) -> Self {
+    pub fn new(bucket: &str) -> Self {
         Self {
             bucket: bucket.to_string(),
             prefix: DEFAULT_PREFIX.to_string(),
