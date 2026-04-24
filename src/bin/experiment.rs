@@ -24,9 +24,10 @@ use axum::routing::{get, post};
 use axum::Json;
 use clap::Parser;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info};
 
-use haqlite::{Durability, HaMode, HaQLite, SqlValue};
+use haqlite::{HaMode, HaQLite, SqlValue};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS test_data (
     id TEXT PRIMARY KEY,
@@ -414,12 +415,19 @@ async fn main() -> Result<()> {
         other => anyhow::bail!("unknown topology: {} (expected: dedicated, shared)", other),
     };
 
-    let durability = match args.durability.as_str() {
-        "replicated" => Durability::Replicated,
-        "synchronous" => Durability::Synchronous,
-        "eventual" => Durability::Eventual,
+    let mut builder = HaQLite::builder(&args.bucket)
+        .prefix(&args.prefix)
+        .mode(mode)
+        .instance_id(&instance_id)
+        .lease_ttl(args.lease_ttl);
+
+    match args.durability.as_str() {
+        "replicated" => { builder = builder.durability(hadb::Durability::Replicated(Duration::from_secs(1))); }
+        "checkpoint" => { builder = builder.turbolite_durability(turbodb::Durability::Checkpoint(turbodb::CheckpointConfig::default())); }
+        "continuous" => { builder = builder.turbolite_durability(turbodb::Durability::default()); }
+        "cloud" => { builder = builder.turbolite_durability(turbodb::Durability::Cloud); }
         other => anyhow::bail!(
-            "unknown durability: {} (expected: replicated, synchronous, eventual)",
+            "unknown durability: {} (expected: replicated, checkpoint, continuous, cloud)",
             other
         ),
     };
@@ -440,13 +448,6 @@ async fn main() -> Result<()> {
 
     let forwarding_port = args.port + 1000;
     let address = format!("http://localhost:{}", forwarding_port);
-
-    let mut builder = HaQLite::builder(&args.bucket)
-        .prefix(&args.prefix)
-        .mode(mode)
-        .durability(durability)
-        .instance_id(&instance_id)
-        .lease_ttl(args.lease_ttl);
 
     if let Some(ref ep) = args.endpoint {
         builder = builder.endpoint(ep);
@@ -469,7 +470,7 @@ async fn main() -> Result<()> {
             // --renew-interval-ms and --follower-poll-ms are Dedicated-only and
             // flow through the dedicated builder setters.
             let coordinator_config = haqlite::CoordinatorConfig {
-                sync_interval: std::time::Duration::from_millis(args.sync_interval_ms),
+                durability: hadb::Durability::Replicated(std::time::Duration::from_millis(args.sync_interval_ms)),
                 follower_pull_interval: std::time::Duration::from_millis(args.follower_pull_ms),
                 lease: None,
                 ..Default::default()

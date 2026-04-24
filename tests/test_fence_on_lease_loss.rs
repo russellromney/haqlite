@@ -31,19 +31,14 @@ fn build_coordinator(
 ) -> Arc<Coordinator> {
     let config = CoordinatorConfig {
         lease: Some(LeaseConfig {
-            ttl_secs,
-            renew_interval,
-            follower_poll_interval: follower_poll,
-            required_expired_reads: 1,
             max_consecutive_renewal_errors: 1, // fence fast on renewal failure
             ..LeaseConfig::new(lease_store, instance_id.to_string(), address.to_string())
         }),
-        sync_interval: Duration::from_millis(100),
         ..Default::default()
     };
 
     let repl_config = walrust::sync::ReplicationConfig {
-        sync_interval: config.sync_interval,
+        sync_interval: Duration::from_millis(100),
         ..Default::default()
     };
 

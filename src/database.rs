@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::routing::post;
-use hadb::{CoordinatorConfig, Coordinator, JoinResult, LeaseConfig, Replicator, Role, RoleEvent};
+use hadb::{CoordinatorConfig, Coordinator, JoinResult, LeaseConfig, Role, RoleEvent};
 use hadb_lease_s3::S3LeaseStore;
 
 use crate::error::HaQLiteError;
@@ -92,7 +92,10 @@ pub struct HaQLiteBuilder {
     read_concurrency: usize,
     lease_store: Option<Arc<dyn hadb::LeaseStore>>,
     mode: HaMode,
-    durability: Durability,
+    /// Walrust-only durability. Mutually exclusive with `turbolite_durability`.
+    durability: Option<hadb::Durability>,
+    /// Turbolite-backed durability. Mutually exclusive with `durability`.
+    turbolite_durability: Option<turbodb::Durability>,
     manifest_store: Option<Arc<dyn turbodb::ManifestStore>>,
     manifest_poll_interval: Option<Duration>,
     write_timeout: Option<Duration>,
@@ -128,7 +131,8 @@ impl HaQLiteBuilder {
             read_concurrency: DEFAULT_READ_CONCURRENCY,
             lease_store: None,
             mode: HaMode::Dedicated,
-            durability: Durability::Replicated,
+            durability: None,
+            turbolite_durability: None,
             manifest_store: None,
             manifest_poll_interval: None,
             write_timeout: None,
@@ -225,13 +229,20 @@ impl HaQLiteBuilder {
         self
     }
 
-    /// Set the durability mode. Default: `Durability::Replicated`.
-    ///
-    /// - `Replicated`: plain SQLite + walrust WAL shipping (Dedicated only)
-    /// - `Synchronous`: turbolite S3Primary, every write to S3
-    /// - `Eventual`: turbolite S3 + walrust WAL shipping between checkpoints
-    pub fn durability(mut self, durability: Durability) -> Self {
-        self.durability = durability;
+    /// Walrust-only path: plain HA SQLite with WAL shipping, no turbolite
+    /// tiering. Default `hadb::Durability::Replicated(1s)`.
+    /// Mutually exclusive with `.turbolite_durability()`.
+    pub fn durability(mut self, durability: hadb::Durability) -> Self {
+        self.durability = Some(durability);
+        self
+    }
+
+    /// Turbolite-backed path: requires one of `.turbolite_http()` /
+    /// `.turbolite_storage()` / `.turbolite_vfs()` to also be set.
+    /// Default `turbodb::Durability::default()` (Continuous).
+    /// Mutually exclusive with `.durability()`.
+    pub fn turbolite_durability(mut self, durability: turbodb::Durability) -> Self {
+        self.turbolite_durability = Some(durability);
         self
     }
 
@@ -367,17 +378,53 @@ impl HaQLiteBuilder {
             detect_address(&instance_id, self.forwarding_port)
         });
 
-        // Validate topology + durability combination.
-        // Shared mode only supports Synchronous durability. Multiple concurrent
-        // writers need every write to go through S3 so each writer always sees
-        // the latest state. Eventual consistency means writers operate on stale
-        // data, silently losing updates.
-        if self.mode == HaMode::Shared && self.durability != Durability::Synchronous {
+        // Determine if turbolite backend is configured.
+        let has_turbolite = self.turbolite_http.is_some()
+            || self.turbolite_storage.is_some()
+            || self.turbolite_vfs.is_some();
+
+        // Resolve durability values with defaults.
+        let walrust_durability: Option<hadb::Durability> = self.durability;
+        let turbodb_durability: Option<turbodb::Durability> = self.turbolite_durability;
+
+        // Validate mutual exclusivity.
+        if walrust_durability.is_some() && turbodb_durability.is_some() {
             return Err(anyhow::anyhow!(
-                "Shared topology only supports Synchronous durability. \
-                 Multiple writers require every write to be durable to S3 so \
-                 each writer always sees the latest state."
+                "`.durability()` and `.turbolite_durability()` are mutually exclusive. \
+                 Use `.durability()` for walrust-only (no turbolite) and \
+                 `.turbolite_durability()` when turbolite is configured."
             ));
+        }
+        if turbodb_durability.is_some() && !has_turbolite {
+            return Err(anyhow::anyhow!(
+                "`.turbolite_durability()` requires turbolite backend. \
+                 Call one of `.turbolite_http()`, `.turbolite_storage()`, or `.turbolite_vfs()` first."
+            ));
+        }
+
+        // Apply defaults when neither is explicitly set.
+        let (walrust_durability, turbodb_durability) = match (walrust_durability, turbodb_durability) {
+            (Some(w), None) => (Some(w), None),
+            (None, Some(t)) => (None, Some(t)),
+            (None, None) => {
+                if has_turbolite {
+                    (None, Some(turbodb::Durability::default()))
+                } else {
+                    (Some(hadb::Durability::default()), None)
+                }
+            }
+            (Some(_), Some(_)) => unreachable!("checked above"),
+        };
+
+        // Shared mode requires Cloud durability (S3Primary, per-commit page flush).
+        if self.mode == HaMode::Shared {
+            if turbodb_durability.map_or(true, |d| !d.is_cloud()) {
+                return Err(anyhow::anyhow!(
+                    "Shared topology requires turbodb::Durability::Cloud. \
+                     Multiple writers need every write to be durable to S3 so \
+                     each writer always sees the latest state."
+                ));
+            }
         }
 
         // Shared fence: the `AtomicFenceWriter` half goes to `DbLease`
@@ -473,75 +520,85 @@ impl HaQLiteBuilder {
             HaMode::Dedicated => {
                 let walrust_storage = walrust_storage_opt
                     .ok_or_else(|| anyhow::anyhow!("Dedicated mode requires walrust storage"))?;
+
+                // Resolve sync_interval and skip_snapshot from durability.
+                let (sync_interval, skip_snapshot) = if let Some(d) = walrust_durability {
+                    match d {
+                        hadb::Durability::Replicated(dur) => (dur, false),
+                        hadb::Durability::Local => (Duration::from_secs(3600), false),
+                        hadb::Durability::SyncReplicated => (Duration::from_millis(1), false),
+                    }
+                } else if let Some(d) = turbodb_durability {
+                    (d.replication_interval(), d.skip_snapshot())
+                } else {
+                    unreachable!("durability validated above")
+                };
+
                 let replication_config = walrust::ReplicationConfig {
-                    sync_interval: config.sync_interval,
+                    sync_interval,
                     snapshot_interval: config.snapshot_interval,
                     autonomous_snapshots: true,
                     ..Default::default()
                 };
                 let replicator = Arc::new(
                     SqliteReplicator::new(walrust_storage.clone(), &self.prefix, replication_config)
-                        .with_skip_snapshot(self.durability == Durability::Synchronous)
+                        .with_skip_snapshot(skip_snapshot)
                 );
 
-                // For Synchronous durability: create ONE turbolite VFS shared by
+                // For any turbodb-backed durability: create ONE turbolite VFS shared by
                 // both the follower (for manifest polling) and the leader/inner
-                // (for reads, writes, and manifest publishing). S3Primary uses
-                // journal_mode=OFF, so walrust has no WAL to ship.
-                let (follower_behavior, tl_state, manifest_wakeup) = if self.durability == Durability::Synchronous {
-                    // Phase Lucid: manifest store must be explicit for Synchronous mode.
+                // (for reads, writes, and manifest publishing).
+                let (follower_behavior, tl_state, manifest_wakeup) = if turbodb_durability.is_some() {
                     let ms: Arc<dyn turbodb::ManifestStore> = self.manifest_store.clone().ok_or_else(|| {
                         anyhow::anyhow!(
-                            "Durability::Synchronous + HaMode::Dedicated requires manifest_store(). \
+                            "Turbolite-backed durability requires manifest_store(). \
                              Pass an Arc<dyn turbodb::ManifestStore>, or call \
                              haqlite::env::manifest_store_from_env(bucket, endpoint).await?"
                         )
                     })?;
-                    let vfs_name = format!("haqlite_ded_sync_{}", uuid::Uuid::new_v4());
-                    // Per-database cache dir so turbolite page caches don't collide.
-                    let cache_dir = db_path.parent()
-                        .unwrap_or_else(|| std::path::Path::new("/tmp"))
-                        .join(format!(".tl_cache_{}", db_name));
-                    std::fs::create_dir_all(&cache_dir)?;
-                    let tl_config = turbolite::tiered::TurboliteConfig {
-                        cache_dir,
-                        // Disable inline GC: old page group versions must survive
-                        // until explicit gc() runs (which checks snapshot manifests).
-                        cache: turbolite::tiered::CacheConfig {
-                            gc_enabled: false,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    };
-                    let rt_handle = tokio::runtime::Handle::current();
-                    let vfs = if let Some((ref ep, ref tok)) = self.turbolite_http {
-                        // HTTP mode: page storage speaks the Cinch /v1/sync/pages
-                        // contract. Reader half of the shared AtomicFence is cloned
-                        // in so fenced writes refuse when no lease is held.
-                        let fence: Arc<dyn hadb_lease::FenceSource> =
-                            Arc::new(atomic_fence.clone());
-                        let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(
-                            hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "pages")
-                                .with_fence(fence),
-                        );
-                        turbolite::tiered::TurboliteVfs::with_backend(tl_config, storage, rt_handle)
-                            .map_err(|e| anyhow::anyhow!("turbolite VFS (HTTP) for Dedicated+Sync: {e}"))?
-                    } else if let Some(ref storage) = self.turbolite_storage {
-                        // Phase Lucid: caller-supplied backend.
-                        turbolite::tiered::TurboliteVfs::with_backend(tl_config, storage.clone(), rt_handle)
-                            .map_err(|e| anyhow::anyhow!("turbolite VFS (caller-supplied) for Dedicated+Sync: {e}"))?
+
+                    let (shared_vfs, vfs_name) = if let Some((ref vfs, ref name)) = self.turbolite_vfs {
+                        (vfs.clone(), name.clone())
                     } else {
-                        // Phase Lucid: no implicit S3-from-env fallback.
-                        return Err(anyhow::anyhow!(
-                            "Durability::Synchronous requires turbolite page storage. \
-                             Either call HaQLiteBuilder::turbolite_http(endpoint, token), \
-                             HaQLiteBuilder::turbolite_storage(backend), or \
-                             HaQLiteBuilder::turbolite_vfs(vfs, name)."
-                        ));
+                        let vfs_name = format!("haqlite_ded_sync_{}", uuid::Uuid::new_v4());
+                        let cache_dir = db_path.parent()
+                            .unwrap_or_else(|| std::path::Path::new("/tmp"))
+                            .join(format!(".tl_cache_{}", db_name));
+                        std::fs::create_dir_all(&cache_dir)?;
+                        let tl_config = turbolite::tiered::TurboliteConfig {
+                            cache_dir,
+                            cache: turbolite::tiered::CacheConfig {
+                                gc_enabled: false,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        };
+                        let rt_handle = tokio::runtime::Handle::current();
+                        let vfs = if let Some((ref ep, ref tok)) = self.turbolite_http {
+                            let fence: Arc<dyn hadb_lease::FenceSource> =
+                                Arc::new(atomic_fence.clone());
+                            let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(
+                                hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "pages")
+                                    .with_fence(fence),
+                            );
+                            turbolite::tiered::TurboliteVfs::with_backend(tl_config, storage, rt_handle)
+                                .map_err(|e| anyhow::anyhow!("turbolite VFS (HTTP) for Dedicated+turbolite: {e}"))?
+                        } else if let Some(ref storage) = self.turbolite_storage {
+                            turbolite::tiered::TurboliteVfs::with_backend(tl_config, storage.clone(), rt_handle)
+                                .map_err(|e| anyhow::anyhow!("turbolite VFS (caller-supplied) for Dedicated+turbolite: {e}"))?
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "Turbolite-backed durability requires turbolite page storage. \
+                                 Either call HaQLiteBuilder::turbolite_http(endpoint, token), \
+                                 HaQLiteBuilder::turbolite_storage(backend), or \
+                                 HaQLiteBuilder::turbolite_vfs(vfs, name)."
+                            ));
+                        };
+                        let shared_vfs = turbolite::tiered::SharedTurboliteVfs::new(vfs);
+                        turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone())
+                            .map_err(|e| anyhow::anyhow!("register VFS: {}", e))?;
+                        (shared_vfs, vfs_name)
                     };
-                    let shared_vfs = turbolite::tiered::SharedTurboliteVfs::new(vfs);
-                    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone())
-                        .map_err(|e| anyhow::anyhow!("register VFS: {}", e))?;
 
                     let manifest_wakeup = Arc::new(tokio::sync::Notify::new());
                     let fb: Arc<dyn hadb::FollowerBehavior> = Arc::new(
@@ -554,6 +611,7 @@ impl HaQLiteBuilder {
                         vfs: shared_vfs,
                         vfs_name,
                         prefix: self.prefix.clone(),
+                        durability: turbodb_durability.unwrap_or(turbodb::Durability::default()),
                     });
                     (fb, ts, Some(manifest_wakeup))
                 } else {
@@ -563,12 +621,10 @@ impl HaQLiteBuilder {
                     (fb, None, None)
                 };
 
-                // Build hadb Coordinator. Lease store is in `config.lease`
-                // already; Coordinator no longer takes it as a separate arg.
                 let coordinator = Coordinator::new(
                     replicator,
                     self.manifest_store.clone(),
-                    None, // node_registry
+                    None,
                     follower_behavior,
                     &self.prefix,
                     config,
@@ -744,6 +800,8 @@ pub(crate) struct HaQLiteInner {
     write_timeout: Duration,
     /// Lease TTL for shared mode leases.
     lease_ttl: u64,
+    /// Turbodb durability mode (Dedicated + turbolite only).
+    turbolite_durability: Option<turbodb::Durability>,
     /// Turbolite VFS for Shared mode turbolite path.
     shared_turbolite_vfs: Option<turbolite::tiered::SharedTurboliteVfs>,
     /// VFS name for reopening turbolite connections.
@@ -913,25 +971,50 @@ impl HaQLiteInner {
             format!("lazy turbolite conn open for '{}': {}", self.db_name, e)
         ))?;
 
-        // S3Primary VFS defaults to journal_mode=OFF which prevents SQLite from
-        // calling xSync on commit (data never reaches S3). Switch to DELETE so
-        // xSync fires every commit.
         let current_mode: String = new_conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap_or_else(|_| "unknown".to_string());
+        let is_cloud = self.turbolite_durability.map_or(false, |d| d.is_cloud());
         if current_mode == "off" {
-            // S3Primary: use DELETE mode so xSync fires on every commit.
-            // synchronous=FULL ensures data is flushed before xSync uploads to S3.
-            new_conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;")
-                .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma DELETE: {}", e)))?;
-        } else if current_mode != "wal" && current_mode != "delete" && current_mode != "memory" {
-            // WAL mode (Replicated/Eventual): NORMAL is safe because walrust provides durability.
-            new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")
-                .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma WAL: {}", e)))?;
+            if is_cloud {
+                new_conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;")
+                    .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma DELETE: {}", e)))?;
+            } else {
+                new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")
+                    .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma WAL: {}", e)))?;
+            }
+        } else if current_mode == "wal" || current_mode == "memory" {
+            // Already in the right mode for non-Cloud; just tune sync/cache.
+            if is_cloud {
+                // Cloud needs DELETE; try to switch. If the DB was previously
+                // WAL and has a stale WAL file, this may fail with I/O error.
+                // Ignore the error and rely on xSync to still fire because
+                // turbolite's xSync implementation does not depend on journal_mode.
+                let _ = new_conn.execute_batch(
+                    "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;"
+                );
+            } else {
+                new_conn.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")
+                    .map_err(|e| HaQLiteError::DatabaseError(format!("pragma sync NORMAL: {}", e)))?;
+            }
         } else if current_mode == "delete" {
-            // Already in DELETE mode (S3Primary reopened): ensure FULL sync.
-            new_conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;")
-                .map_err(|e| HaQLiteError::DatabaseError(format!("pragma sync FULL: {}", e)))?;
+            if is_cloud {
+                new_conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;")
+                    .map_err(|e| HaQLiteError::DatabaseError(format!("pragma sync FULL: {}", e)))?;
+            } else {
+                new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")
+                    .map_err(|e| HaQLiteError::DatabaseError(format!("journal pragma WAL from DELETE: {}", e)))?;
+            }
+        } else {
+            // Unknown mode (e.g. query failed, or turbolite returned something
+            // unexpected). For non-Cloud try WAL; for Cloud try DELETE.
+            // If it fails, the DB is probably already usable — just tune cache.
+            let target = if is_cloud { "DELETE" } else { "WAL" };
+            if new_conn.execute_batch(&format!(
+                "PRAGMA journal_mode={}; PRAGMA cache_size=-64000;", target
+            )).is_err() {
+                let _ = new_conn.execute_batch("PRAGMA cache_size=-64000;");
+            }
         }
 
         let arc = Arc::new(Mutex::new(new_conn));
@@ -991,6 +1074,7 @@ impl HaQLite {
             cached_manifest_version: AtomicU64::new(0),
             write_timeout: DEFAULT_FORWARD_TIMEOUT,
             lease_ttl: 5,
+            turbolite_durability: None,
             shared_turbolite_vfs: None,
             shared_turbolite_vfs_name: None,
             schema_sql: None,
@@ -1857,6 +1941,7 @@ struct DedicatedTurboliteState {
     vfs: turbolite::tiered::SharedTurboliteVfs,
     vfs_name: String,
     prefix: String,
+    durability: turbodb::Durability,
 }
 
 async fn open_with_coordinator(
@@ -1895,9 +1980,9 @@ async fn open_with_coordinator(
         .timeout(forward_timeout)
         .build()?;
 
-    let (tl_manifest_store, tl_vfs, tl_vfs_name, tl_prefix) = match turbolite_state {
-        Some(ts) => (Some(ts.manifest_store), Some(ts.vfs), Some(ts.vfs_name), ts.prefix),
-        None => (None, None, None, String::new()),
+    let (tl_manifest_store, tl_vfs, tl_vfs_name, tl_prefix, tl_durability) = match turbolite_state {
+        Some(ts) => (Some(ts.manifest_store), Some(ts.vfs), Some(ts.vfs_name), ts.prefix, Some(ts.durability)),
+        None => (None, None, None, String::new(), None),
     };
 
     let inner = Arc::new(HaQLiteInner {
@@ -1926,6 +2011,7 @@ async fn open_with_coordinator(
         cached_manifest_version: AtomicU64::new(0),
         write_timeout: DEFAULT_FORWARD_TIMEOUT,
         lease_ttl: 5,
+        turbolite_durability: tl_durability,
         shared_turbolite_vfs: tl_vfs,
         shared_turbolite_vfs_name: tl_vfs_name,
         schema_sql: None,
@@ -1938,16 +2024,17 @@ async fn open_with_coordinator(
     // If leader, open rw connection.
     if initial_role == Role::Leader {
         if inner.shared_turbolite_vfs.is_some() {
-            // Dedicated+Synchronous: open through turbolite VFS.
+            // Dedicated + turbolite: open through turbolite VFS.
             // Schema is applied via ensure_turbolite_conn + execute_batch.
             inner.ensure_turbolite_conn()?;
-            // Apply schema through turbolite connection.
-            let conn_arc = inner.get_conn()?
-                .expect("ensure_turbolite_conn should have set conn");
-            let conn = conn_arc.lock();
-            conn.execute_batch(schema)
-                .map_err(|e| anyhow::anyhow!("schema via turbolite: {}", e))?;
-            inner.apply_initial_authorizer(&conn);
+            {
+                let conn_arc = inner.get_conn()?
+                    .expect("ensure_turbolite_conn should have set conn");
+                let conn = conn_arc.lock();
+                conn.execute_batch(schema)
+                    .map_err(|e| anyhow::anyhow!("schema via turbolite: {}", e))?;
+                inner.apply_initial_authorizer(&conn);
+            }
         } else {
             let conn = open_leader_connection(&db_path)?;
             inner.apply_initial_authorizer(&conn);
@@ -2173,6 +2260,7 @@ async fn open_shared_turbolite(
         cached_manifest_version: AtomicU64::new(cached_version),
         write_timeout,
         lease_ttl,
+        turbolite_durability: Some(turbodb::Durability::Cloud),
         shared_turbolite_vfs: Some(vfs.clone()),
         shared_turbolite_vfs_name: Some(vfs_name.to_string()),
         schema_sql: Some(schema.to_string()),

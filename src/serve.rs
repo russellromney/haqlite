@@ -70,7 +70,7 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
     // `.lease_follower_poll_interval()`), so the coordinator config here
     // just carries non-lease fields.
     let coordinator_config = CoordinatorConfig {
-        sync_interval: Duration::from_millis(serve.sync_interval_ms),
+        durability: hadb::Durability::Replicated(Duration::from_millis(serve.sync_interval_ms)),
         follower_pull_interval: Duration::from_millis(serve.follower_pull_ms),
         lease: None,
         ..Default::default()

@@ -91,7 +91,7 @@ async fn build_mode_f_node(
     HaQLite::builder("unused-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
-        .durability(haqlite::Durability::Synchronous)
+        .turbolite_durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, &vfs_name)

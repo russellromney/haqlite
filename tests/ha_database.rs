@@ -41,7 +41,6 @@ fn build_coordinator(
     };
 
     let replication_config = walrust::sync::ReplicationConfig {
-        sync_interval: config.sync_interval,
         snapshot_interval: config.snapshot_interval,
         ..Default::default()
     };

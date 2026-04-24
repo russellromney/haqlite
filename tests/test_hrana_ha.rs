@@ -47,7 +47,6 @@ fn build_coordinator(
         ..Default::default()
     };
     let replication_config = walrust::sync::ReplicationConfig {
-        sync_interval: config.sync_interval,
         snapshot_interval: config.snapshot_interval,
         ..Default::default()
     };
@@ -1402,13 +1401,12 @@ fn build_coordinator_fast(
 
     let config = CoordinatorConfig {
         lease: Some(lease_config),
-        sync_interval: Duration::from_millis(100),
         follower_pull_interval: Duration::from_millis(100),
         replicator_timeout: Duration::from_secs(5),
         ..Default::default()
     };
     let replication_config = walrust::sync::ReplicationConfig {
-        sync_interval: config.sync_interval,
+        sync_interval: Duration::from_millis(100),
         snapshot_interval: config.snapshot_interval,
         ..Default::default()
     };

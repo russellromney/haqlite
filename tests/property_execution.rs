@@ -180,7 +180,7 @@ proptest! {
             let mut db = HaQLite::builder("test-bucket")
                 .prefix("test/")
                 .mode(HaMode::Shared)
-                .durability(Durability::Synchronous)
+                .turbolite_durability(turbodb::Durability::Cloud)
                 .lease_store(lease_store)
                 .manifest_store(manifest_store)
                 .walrust_storage(storage)

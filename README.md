@@ -72,11 +72,12 @@ haqlite sets `synchronous=NORMAL` and `cache_size=64MB` by default (WAL mode bes
 
 | Mode | Write cost | Use case |
 |------|-----------|----------|
-| Dedicated + Replicated | same as SQLite | Active databases with volume |
-| Dedicated + Synchronous | ~200ms/write | Every write durable to S3 |
-| Shared + Synchronous | ~700ms/write | Serverless, scale-to-zero |
+| Dedicated + Continuous | same as SQLite | Active databases with volume (default) |
+| Dedicated + Checkpoint | same as SQLite | Dev / single-node / desktop apps |
+| Dedicated + Cloud | ~200ms/write | Every write durable to S3 |
+| Shared + Cloud | ~700ms/write | Serverless, scale-to-zero |
 
-Replicated mode writes locally and ships WAL to S3 in the background via [walrust](https://github.com/russellromney/walrust) (zero overhead, async polling). Synchronous mode uploads every checkpoint to S3 before returning. Shared mode acquires a lease per write session.
+Continuous mode (default) writes locally, ships WAL to S3 in the background via [walrust](https://github.com/russellromney/walrust), and checkpoints page groups on timer. Checkpoint mode is the same without WAL shipping — crash loses everything since last checkpoint. Cloud mode uploads every commit to S3 before returning (no WAL). Shared mode acquires a lease per write session and requires Cloud durability.
 
 ## Lease and manifest store
 
@@ -145,7 +146,7 @@ let db = HaQLite::builder("my-bucket")
     .forwarding_port(18080)                   // internal HTTP port (default: 18080)
     .secret("my-auth-token")                  // inter-node forwarding auth
     .mode(HaMode::Dedicated)                  // Dedicated (default) or Shared
-    .durability(Durability::Replicated)        // Replicated, Synchronous, or Eventual
+    .turbolite_durability(turbodb::Durability::Continuous) // Checkpoint, Continuous, or Cloud
     .coordinator_config(config)               // override lease/sync timing
     .open("/data/my.db", schema)
     .await?;
@@ -185,7 +186,6 @@ let count = row[0].as_integer().unwrap();
 use haqlite::{CoordinatorConfig, LeaseConfig};
 
 let config = CoordinatorConfig {
-    sync_interval: Duration::from_millis(500),           // WAL sync frequency
     follower_pull_interval: Duration::from_millis(500),  // how often followers pull
     lease: Some(LeaseConfig {
         ttl_secs: 5,                   // lease time-to-live

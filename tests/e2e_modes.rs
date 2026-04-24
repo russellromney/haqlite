@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use haqlite::{Durability, HaMode, HaQLite, InMemoryLeaseStore, SqlValue};
+use haqlite::{HaMode, HaQLite, InMemoryLeaseStore, SqlValue};
 use turbodb_manifest_mem::MemManifestStore;
 use tempfile::TempDir;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
@@ -47,11 +47,10 @@ fn unique_prefix(name: &str) -> String {
         .duration_since(std::time::UNIX_EPOCH).expect("time").as_nanos())
 }
 
-/// Build a shared-mode node with the given durability.
+/// Build a shared-mode node with Cloud durability.
 async fn build_node(
     cache_dir: &std::path::Path,
     s3_prefix: &str,
-    durability: Durability,
     lease_store: Arc<InMemoryLeaseStore>,
     manifest_store: Arc<MemManifestStore>,
     walrust_storage: Option<Arc<InMemoryStorage>>,
@@ -79,7 +78,7 @@ async fn build_node(
     let mut builder = HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
-        .durability(durability)
+        .turbolite_durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, &vfs_name)
@@ -109,13 +108,13 @@ async fn e2e_synchronous_two_nodes_sequential() {
 
     let tmp_a = TempDir::new().expect("tmp");
     let db_a = build_node(
-        tmp_a.path(), &prefix, Durability::Synchronous,
+        tmp_a.path(), &prefix,
         lease_store.clone(), manifest_store.clone(), None, "node-a",
     ).await;
 
     let tmp_b = TempDir::new().expect("tmp");
     let db_b = build_node(
-        tmp_b.path(), &prefix, Durability::Synchronous,
+        tmp_b.path(), &prefix,
         lease_store.clone(), manifest_store.clone(), None, "node-b",
     ).await;
 
@@ -158,7 +157,7 @@ async fn e2e_synchronous_four_nodes_concurrent() {
     for i in 0..4 {
         let tmp = TempDir::new().expect("tmp");
         let db = build_node(
-            tmp.path(), &prefix, Durability::Synchronous,
+            tmp.path(), &prefix,
             lease_store.clone(), manifest_store.clone(), None, &format!("node-{}", i),
         ).await;
         tmps.push(tmp);
@@ -194,7 +193,7 @@ async fn e2e_synchronous_four_nodes_concurrent() {
     // Fresh reader verifies all successful writes are visible
     let tmp_reader = TempDir::new().expect("tmp");
     let reader = build_node(
-        tmp_reader.path(), &prefix, Durability::Synchronous,
+        tmp_reader.path(), &prefix,
         lease_store.clone(), manifest_store.clone(), None, "reader",
     ).await;
 
@@ -254,7 +253,7 @@ async fn e2e_write_fails_without_lease() {
     let db = HaQLite::builder("test-bucket")
         .prefix("test/")
         .mode(HaMode::Shared)
-        .durability(Durability::Synchronous)
+        .turbolite_durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, &vfs_name)

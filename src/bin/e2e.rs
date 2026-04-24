@@ -26,7 +26,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::{error, info, warn};
 
-use haqlite::{Durability, HaMode, HaQLite, SqlValue};
+use haqlite::{HaMode, HaQLite, SqlValue};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS e2e (
     id TEXT PRIMARY KEY,
@@ -94,7 +94,6 @@ fn op_name(op: &WriteOp) -> &str {
 async fn open_node(
     db_dir: &std::path::Path,
     prefix: &str,
-    durability: Durability,
     instance_id: &str,
     args: &Args,
 ) -> Result<HaQLite> {
@@ -103,7 +102,7 @@ async fn open_node(
     let mut builder = HaQLite::builder(&args.bucket)
         .prefix(prefix)
         .mode(HaMode::Shared)
-        .durability(durability)
+        .turbolite_durability(turbodb::Durability::Cloud)
         .instance_id(instance_id)
         .lease_ttl(args.lease_ttl)
         .write_timeout(Duration::from_secs(args.write_timeout));
@@ -120,7 +119,6 @@ async fn run_worker(
     worker_id: usize,
     total_ops: usize,
     prefix: &str,
-    durability: Durability,
     args: &Args,
 ) -> Vec<WriteRecord> {
     let instance_id = format!("worker-{}", worker_id);
@@ -131,7 +129,7 @@ async fn run_worker(
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("create dir");
 
-    let mut db = match open_node(&tmp, prefix, durability, &instance_id, args).await {
+    let mut db = match open_node(&tmp, prefix, &instance_id, args).await {
         Ok(db) => db,
         Err(e) => {
             error!("[{}] open failed: {}", instance_id, e);
@@ -210,7 +208,7 @@ fn compute_expected(records: &[WriteRecord]) -> HashMap<String, Option<String>> 
     state
 }
 
-async fn audit(prefix: &str, durability: Durability, args: &Args, records: &[WriteRecord]) -> Result<()> {
+async fn audit(prefix: &str, args: &Args, records: &[WriteRecord]) -> Result<()> {
     info!("=== AUDIT ===");
     let n = WORKER_COUNTER.fetch_add(1, Ordering::SeqCst);
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
@@ -218,7 +216,7 @@ async fn audit(prefix: &str, durability: Durability, args: &Args, records: &[Wri
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
 
-    let mut db = open_node(&tmp, prefix, durability, "auditor", args).await?;
+    let mut db = open_node(&tmp, prefix, "auditor", args).await?;
     let rows = db.query_values_fresh("SELECT id, worker, seq, payload, op FROM e2e ORDER BY id", &[]).await?;
 
     let ok = records.iter().filter(|r| r.succeeded).count();
@@ -287,17 +285,16 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let durability = match args.durability.as_str() {
-        "synchronous" => Durability::Synchronous,
-        "eventual" => Durability::Eventual,
-        other => anyhow::bail!("unknown durability: {}", other),
+    match args.durability.as_str() {
+        "cloud" => {}
+        other => anyhow::bail!("unknown durability: {} (expected: cloud)", other),
     };
 
     let run_id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
-    let prefix = format!("e2e/{}/{}/", args.durability, run_id);
+    let prefix = format!("e2e/cloud/{}/", run_id);
 
-    info!("=== haqlite e2e: shared + {} | {} workers x {} ops ===",
-        args.durability, args.workers, args.writes_per_worker);
+    info!("=== haqlite e2e: shared + cloud | {} workers x {} ops ===",
+        args.workers, args.writes_per_worker);
     info!("Bucket: {}, Prefix: {}", args.bucket, prefix);
 
     let start = Instant::now();
@@ -311,7 +308,7 @@ async fn main() -> Result<()> {
         let writes = args.writes_per_worker;
         handles.push(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(i as u64 * 200)).await;
-            run_worker(i, writes, &pfx, durability, &a).await
+            run_worker(i, writes, &pfx, &a).await
         }));
     }
 
@@ -330,7 +327,7 @@ async fn main() -> Result<()> {
 
     // Phase 2: audit
     info!("--- Phase 2: audit ---");
-    audit(&prefix, durability, &args, &all_records).await?;
+    audit(&prefix, &args, &all_records).await?;
 
     info!("=== ALL PASSED ({:?}) ===", start.elapsed());
     Ok(())

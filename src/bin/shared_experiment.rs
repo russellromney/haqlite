@@ -204,10 +204,9 @@ async fn main() -> Result<()> {
         format!("node-{}", args.port)
     });
 
-    let durability = match args.durability.as_str() {
-        "synchronous" => Durability::Synchronous,
-        "eventual" => Durability::Eventual,
-        other => anyhow::bail!("unknown durability: {}", other),
+    match args.durability.as_str() {
+        "cloud" => {}
+        other => anyhow::bail!("unknown durability: {} (expected: cloud)", other),
     };
 
     info!("=== haqlite shared-mode experiment ===");
@@ -226,7 +225,7 @@ async fn main() -> Result<()> {
     let mut builder = HaQLite::builder(&args.bucket)
         .prefix(&args.prefix)
         .mode(HaMode::Shared)
-        .durability(durability)
+        .turbolite_durability(turbodb::Durability::Cloud)
         .instance_id(&instance_id)
         .lease_ttl(args.lease_ttl);
 

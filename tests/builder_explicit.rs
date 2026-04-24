@@ -29,6 +29,7 @@ use hadb::InMemoryLeaseStore;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
+use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 /// `unwrap_err()` won't compile because `HaQLite` doesn't implement `Debug`.
 fn err_msg<T>(r: anyhow::Result<T>) -> String {
@@ -43,6 +44,19 @@ fn err_msg<T>(r: anyhow::Result<T>) -> String {
 fn unset_env() {
     std::env::remove_var("HAQLITE_LEASE_URL");
     std::env::remove_var("HAQLITE_MANIFEST_URL");
+}
+
+fn dummy_turbolite_vfs(tmp: &TempDir) -> (SharedTurboliteVfs, String) {
+    let cache_dir = tmp.path().join(".tl_cache");
+    let config = TurboliteConfig {
+        cache_dir,
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("create VFS");
+    let shared = SharedTurboliteVfs::new(vfs);
+    let name = format!("test_{}", uuid::Uuid::new_v4());
+    turbolite::tiered::register_shared(&name, shared.clone()).expect("register");
+    (shared, name)
 }
 
 #[tokio::test]
@@ -67,18 +81,20 @@ async fn dedicated_without_lease_or_walrust_errors_clearly() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn shared_without_lease_errors_clearly() {
     unset_env();
     let tmp = TempDir::new().expect("temp dir");
     let db_path = tmp.path().join("t.db");
     let db_path_str = db_path.to_str().unwrap();
+    let (vfs, vfs_name) = dummy_turbolite_vfs(&tmp);
 
     let result = HaQLite::builder("test-bucket")
         .prefix("p/")
         .instance_id("test-1")
         .mode(HaMode::Shared)
-        .durability(haqlite::Durability::Synchronous)
+        .turbolite_durability(turbodb::Durability::Cloud)
+        .turbolite_vfs(vfs, &vfs_name)
         .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .await;
 
@@ -89,7 +105,7 @@ async fn shared_without_lease_errors_clearly() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn shared_without_manifest_errors_clearly() {
     unset_env();
     let tmp = TempDir::new().expect("temp dir");
@@ -97,12 +113,14 @@ async fn shared_without_manifest_errors_clearly() {
     let db_path_str = db_path.to_str().unwrap();
 
     let lease = Arc::new(InMemoryLeaseStore::new());
+    let (vfs, vfs_name) = dummy_turbolite_vfs(&tmp);
 
     let result = HaQLite::builder("test-bucket")
         .prefix("p/")
         .instance_id("test-1")
         .mode(HaMode::Shared)
-        .durability(haqlite::Durability::Synchronous)
+        .turbolite_durability(turbodb::Durability::Cloud)
+        .turbolite_vfs(vfs, &vfs_name)
         .lease_store(lease)
         .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .await;
@@ -128,7 +146,7 @@ async fn shared_without_turbolite_errors_clearly() {
         .prefix("p/")
         .instance_id("test-1")
         .mode(HaMode::Shared)
-        .durability(haqlite::Durability::Synchronous)
+        .turbolite_durability(turbodb::Durability::Cloud)
         .lease_store(lease)
         .manifest_store(manifest)
         .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")

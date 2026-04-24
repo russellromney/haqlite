@@ -293,7 +293,7 @@ async fn main() -> Result<()> {
     // the HaQLite builder patches the lease store + instance id + address
     // into the LeaseConfig at finalize-time without clobbering timing.
     let coordinator_config = CoordinatorConfig {
-        sync_interval: std::time::Duration::from_millis(args.sync_interval_ms),
+        durability: hadb::Durability::Replicated(std::time::Duration::from_millis(args.sync_interval_ms)),
         follower_pull_interval: std::time::Duration::from_millis(args.follower_pull_ms),
         lease: None,
         ..Default::default()
