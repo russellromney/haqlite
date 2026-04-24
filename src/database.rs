@@ -492,14 +492,14 @@ pub struct HaQLiteInner {
     pub fwd_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Custom authorizer factory. If set, used instead of built-in fence/unfence authorizer.
     pub authorizer: Option<AuthorizerFactory>,
-    /// Optional lazy connection opener. Used by haqlite-turbolite to open
-    /// connections via a custom VFS (e.g. turbolite) on first use.
+    /// Optional lazy connection opener. Used by sibling crates to open
+    /// connections via a custom VFS on first use.
     pub connection_opener: Option<Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>>,
 }
 
 impl HaQLiteInner {
     /// Create a new HaQLiteInner with default values for optional fields.
-    /// Primarily for use by haqlite-turbolite and advanced use cases.
+    /// Primarily for use by sibling crates and advanced use cases.
     pub fn new(
         db_path: PathBuf,
         db_name: String,
@@ -541,7 +541,7 @@ impl HaQLiteInner {
     }
 
     /// Ensure a connection is available, using the lazy opener if set.
-    /// For haqlite-turbolite and advanced use cases.
+    /// For sibling crates and advanced use cases.
     pub fn ensure_conn(&self) -> Result<Arc<Mutex<rusqlite::Connection>>, HaQLiteError> {
         if let Some(conn) = self.conn.load_full() {
             return Ok(conn);
@@ -620,7 +620,7 @@ impl HaQLiteInner {
         );
     }
 
-    /// Open a leader connection, using the custom opener if set (e.g. turbolite VFS).
+    /// Open a leader connection, using the custom opener if set.
     pub fn try_open_leader_conn(&self) -> Result<rusqlite::Connection, HaQLiteError> {
         if let Some(ref opener) = self.connection_opener {
             return opener();
@@ -699,7 +699,7 @@ impl HaQLite {
     }
 
     /// Construct from a pre-built inner and role handle.
-    /// For haqlite-turbolite and advanced use cases.
+    /// For sibling crates and advanced use cases.
     pub fn from_inner(inner: Arc<HaQLiteInner>, role_handle: tokio::task::JoinHandle<()>) -> Self {
         Self {
             inner,
@@ -849,7 +849,7 @@ impl HaQLite {
                 }
             }
             HaMode::Shared => Err(HaQLiteError::ConfigurationError(
-                "Shared mode not supported in base haqlite. Use haqlite-turbolite.".into())),
+                "Shared mode not supported in base haqlite. Use the tiered-storage crate.".into())),
         }
     }
 
@@ -873,7 +873,7 @@ impl HaQLite {
                 }
             }
             HaMode::Shared => Err(HaQLiteError::ConfigurationError(
-                "Shared mode not supported in base haqlite. Use haqlite-turbolite.".into())),
+                "Shared mode not supported in base haqlite. Use the tiered-storage crate.".into())),
         }
     }
 
