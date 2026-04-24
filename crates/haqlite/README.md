@@ -6,6 +6,10 @@ Embed HA SQLite in your app with one line of code. Leader election, WAL replicat
 
 Part of the [hadb](https://github.com/russellromney/hadb) ecosystem for making any embedded database highly available.
 
+This repo is a Cargo workspace with two crates:
+- **`haqlite`** — Base HA SQLite with WAL replication. No turbolite dependencies.
+- **`haqlite-turbolite`** — Tiered HA SQLite with page-level S3 tiering via [turbolite](https://github.com/russellromney/turbolite).
+
 ## Quick start
 
 ```rust
@@ -75,9 +79,10 @@ haqlite sets `synchronous=NORMAL` and `cache_size=64MB` by default (WAL mode bes
 | Dedicated + Continuous | same as SQLite | Active databases with volume (default) |
 | Dedicated + Checkpoint | same as SQLite | Dev / single-node / desktop apps |
 | Dedicated + Cloud | ~200ms/write | Every write durable to S3 |
-| Shared + Cloud | ~700ms/write | Serverless, scale-to-zero |
 
-Continuous mode (default) writes locally, ships WAL to S3 in the background via [walrust](https://github.com/russellromney/walrust), and checkpoints page groups on timer. Checkpoint mode is the same without WAL shipping — crash loses everything since last checkpoint. Cloud mode uploads every commit to S3 before returning (no WAL). Shared mode acquires a lease per write session and requires Cloud durability.
+Continuous mode (default) writes locally, ships WAL to S3 in the background via [walrust](https://github.com/russellromney/walrust). Checkpoint mode is the same without WAL shipping — crash loses everything since last checkpoint. Cloud mode uploads every commit to S3 before returning (no WAL).
+
+For page-level S3 tiering (sub-250ms cold queries, transparent page eviction), use the [`haqlite-turbolite`](./crates/haqlite-turbolite) crate.
 
 ## Lease and manifest store
 
@@ -146,11 +151,29 @@ let db = HaQLite::builder("my-bucket")
     .forwarding_port(18080)                   // internal HTTP port (default: 18080)
     .secret("my-auth-token")                  // inter-node forwarding auth
     .mode(HaMode::Dedicated)                  // Dedicated (default) or Shared
-    .turbolite_durability(turbodb::Durability::Continuous) // Checkpoint, Continuous, or Cloud
     .coordinator_config(config)               // override lease/sync timing
     .open("/data/my.db", schema)
     .await?;
 ```
+
+## Tiered storage (haqlite-turbolite)
+
+For page-level S3 tiering (sub-250ms cold queries, transparent page eviction), use the `haqlite-turbolite` crate:
+
+```rust
+use haqlite_turbolite::{Builder, Mode};
+
+let db = Builder::new("my-bucket")
+    .turbolite_http("https://t3.storage.dev", "my-token")
+    .manifest_endpoint("https://t3.storage.dev", "my-token")
+    .lease_endpoint("https://t3.storage.dev", "my-token")
+    .open("/data/my.db", schema)
+    .await?;
+```
+
+`haqlite-turbolite` wraps base `haqlite` and injects a turbolite VFS for page-level tiering. Two modes:
+- `Mode::Writer` (default) — Single writer with lease-per-database. Maps to haqlite's Dedicated mode.
+- `Mode::MultiWriter` (experimental) — Multiple writers with per-write lease acquisition. Requires Cloud durability.
 
 ## Local mode (no HA)
 
@@ -203,10 +226,10 @@ let config = CoordinatorConfig {
 
 ```
 hadb        - coordination (leader election, role management, metrics)
-hadb-io     - shared infrastructure (S3, retry, circuit breaker)
 walrust     - SQLite WAL replication to S3
-haqlite     - HA API + write forwarding + CLI
-your app    - uses haqlite as an embedded library or CLI server
+haqlite     - HA API + write forwarding (base, no tiering)
+haqlite-turbolite - HA + turbolite page-level S3 tiering
+your app    - uses haqlite or haqlite-turbolite as an embedded library
 ```
 
 See [hadb](https://github.com/russellromney/hadb) for the full ecosystem.
