@@ -280,6 +280,27 @@ impl HaQLiteBuilder {
         self
     }
 
+    pub fn get_bucket(&self) -> &str { &self.bucket }
+    pub fn get_prefix(&self) -> &str { &self.prefix }
+    pub fn get_endpoint(&self) -> Option<&str> { self.endpoint.as_deref() }
+    pub fn get_instance_id(&self) -> Option<&str> { self.instance_id.as_deref() }
+    pub fn get_address(&self) -> Option<&str> { self.address.as_deref() }
+    pub fn get_forwarding_port(&self) -> u16 { self.forwarding_port }
+    pub fn get_forward_timeout(&self) -> Duration { self.forward_timeout }
+    pub fn get_coordinator_config(&self) -> Option<&CoordinatorConfig> { self.coordinator_config.as_ref() }
+    pub fn get_secret(&self) -> Option<&str> { self.secret.as_deref() }
+    pub fn get_read_concurrency(&self) -> usize { self.read_concurrency }
+    pub fn get_lease_store(&self) -> Option<&Arc<dyn hadb::LeaseStore>> { self.lease_store.as_ref() }
+    pub fn get_mode(&self) -> HaMode { self.mode }
+    pub fn get_durability(&self) -> Option<hadb::Durability> { self.durability }
+    pub fn get_manifest_poll_interval(&self) -> Option<Duration> { self.manifest_poll_interval }
+    pub fn get_write_timeout(&self) -> Option<Duration> { self.write_timeout }
+    pub fn get_walrust_storage(&self) -> Option<&Arc<dyn hadb_storage::StorageBackend>> { self.walrust_storage.as_ref() }
+    pub fn get_lease_ttl(&self) -> Option<u64> { self.lease_ttl }
+    pub fn get_lease_renew_interval(&self) -> Option<Duration> { self.lease_renew_interval }
+    pub fn get_lease_follower_poll_interval(&self) -> Option<Duration> { self.lease_follower_poll_interval }
+    pub fn get_authorizer(&self) -> Option<&AuthorizerFactory> { self.authorizer.as_ref() }
+
     /// Open the database and join the HA cluster.
     ///
     /// `schema` is run once on first open (e.g. CREATE TABLE IF NOT EXISTS ...).
@@ -377,6 +398,7 @@ impl HaQLiteBuilder {
             self.secret,
             self.read_concurrency,
             self.authorizer,
+            None,
         )
         .await
     }
@@ -470,6 +492,9 @@ pub struct HaQLiteInner {
     pub fwd_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Custom authorizer factory. If set, used instead of built-in fence/unfence authorizer.
     pub authorizer: Option<AuthorizerFactory>,
+    /// Optional lazy connection opener. Used by haqlite-turbolite to open
+    /// connections via a custom VFS (e.g. turbolite) on first use.
+    pub connection_opener: Option<Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>>,
 }
 
 impl HaQLiteInner {
@@ -511,7 +536,23 @@ impl HaQLiteInner {
             forwarding_port,
             fwd_handle: tokio::sync::Mutex::new(None),
             authorizer: None,
+            connection_opener: None,
         }
+    }
+
+    /// Ensure a connection is available, using the lazy opener if set.
+    /// For haqlite-turbolite and advanced use cases.
+    pub fn ensure_conn(&self) -> Result<Arc<Mutex<rusqlite::Connection>>, HaQLiteError> {
+        if let Some(conn) = self.conn.load_full() {
+            return Ok(conn);
+        }
+        if let Some(ref opener) = self.connection_opener {
+            let new_conn = opener().map_err(|e| e)?;
+            let arc = Arc::new(Mutex::new(new_conn));
+            self.set_conn(Some(arc.clone()));
+            return Ok(arc);
+        }
+        Err(HaQLiteError::DatabaseError("No write connection available (not leader?)".into()))
     }
 
     /// Start the write-forwarding HTTP server. Only leaders need this.
@@ -579,6 +620,15 @@ impl HaQLiteInner {
         );
     }
 
+    /// Open a leader connection, using the custom opener if set (e.g. turbolite VFS).
+    pub fn try_open_leader_conn(&self) -> Result<rusqlite::Connection, HaQLiteError> {
+        if let Some(ref opener) = self.connection_opener {
+            return opener();
+        }
+        open_leader_connection(&self.db_path)
+            .map_err(|e| HaQLiteError::DatabaseError(format!("open leader connection: {e}")))
+    }
+
     fn leader_addr(&self) -> std::result::Result<String, HaQLiteError> {
         Ok(self.leader_address.read().clone())
     }
@@ -587,7 +637,7 @@ impl HaQLiteInner {
         *self.leader_address.write() = addr;
     }
 
-    fn set_conn(&self, conn: Option<Arc<Mutex<rusqlite::Connection>>>) {
+    pub fn set_conn(&self, conn: Option<Arc<Mutex<rusqlite::Connection>>>) {
         self.conn.store(conn);
     }
 
@@ -707,6 +757,7 @@ impl HaQLite {
             authorizer,
             forwarding_port: 0,
             fwd_handle: tokio::sync::Mutex::new(None),
+            connection_opener: None,
         });
 
         // Apply custom authorizer (unfenced) on initial connection.
@@ -770,6 +821,7 @@ impl HaQLite {
             secret,
             DEFAULT_READ_CONCURRENCY,
             None, // no custom authorizer for from_coordinator
+            None, // no custom connection opener
         )
         .await
     }
@@ -846,8 +898,7 @@ impl HaQLite {
 
         match role {
             Some(Role::Leader) | None => {
-                let conn_arc = self.inner.get_conn()?
-                    .ok_or(HaQLiteError::DatabaseError("No connection available".into()))?;
+                let conn_arc = self.inner.ensure_conn()?;
                 let conn = conn_arc.lock();
                 conn.query_row(sql, params, f)
                     .map_err(|e| HaQLiteError::DatabaseError(format!("query_row failed: {e}")))
@@ -928,8 +979,7 @@ impl HaQLite {
         let role = self.inner.current_role();
         match role {
             Some(Role::Leader) | None => {
-                let conn_arc = self.inner.get_conn()?
-                    .ok_or(HaQLiteError::DatabaseError("No connection available".into()))?;
+                let conn_arc = self.inner.ensure_conn()?;
                 let conn = conn_arc.lock();
                 query_with(&conn)
             }
@@ -982,8 +1032,7 @@ impl HaQLite {
     /// # }
     /// ```
     pub fn connection(&self) -> std::result::Result<Arc<Mutex<rusqlite::Connection>>, HaQLiteError> {
-        self.inner.get_conn()?
-            .ok_or(HaQLiteError::DatabaseError("No connection available".into()))
+        self.inner.ensure_conn()
     }
 
     /// Block all writes on the connection. Reads keep working.
@@ -1208,10 +1257,7 @@ impl HaQLite {
     }
 
     fn execute_local_raw(&self, sql: &str, params: &[&dyn rusqlite::types::ToSql]) -> std::result::Result<u64, HaQLiteError> {
-        // Fast path: load Guard (no Arc clone), lock Mutex directly.
-        let guard = self.inner.conn.load();
-        let conn_arc = guard.as_ref()
-            .ok_or(HaQLiteError::DatabaseError("No write connection available (not leader?)".into()))?;
+        let conn_arc = self.inner.ensure_conn()?;
         let conn = conn_arc.lock();
         let rows = conn.execute(sql, params)
             .map_err(|e| HaQLiteError::DatabaseError(format!("execute failed: {e}")))?;
@@ -1335,6 +1381,7 @@ pub async fn open_with_coordinator(
     secret: Option<String>,
     read_concurrency: usize,
     authorizer: Option<AuthorizerFactory>,
+    connection_opener: Option<Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>>,
 ) -> Result<HaQLite> {
     ensure_schema(&db_path, schema)?;
 
@@ -1388,13 +1435,20 @@ pub async fn open_with_coordinator(
         authorizer,
         forwarding_port,
         fwd_handle: tokio::sync::Mutex::new(None),
+        connection_opener,
     });
 
     // If leader, open rw connection.
     if initial_role == Role::Leader {
-        let conn = open_leader_connection(&db_path)?;
-        inner.apply_initial_authorizer(&conn);
-        inner.set_conn(Some(Arc::new(Mutex::new(conn))));
+        match inner.try_open_leader_conn() {
+            Ok(conn) => {
+                inner.apply_initial_authorizer(&conn);
+                inner.set_conn(Some(Arc::new(Mutex::new(conn))));
+            }
+            Err(e) => {
+                tracing::error!("HaQLite: failed to open initial leader connection: {}", e);
+            }
+        }
     }
 
     // Start forwarding server only if we're the leader.
@@ -1421,7 +1475,7 @@ pub async fn open_with_coordinator(
 // Role event listener
 // ============================================================================
 
-async fn run_role_listener(
+pub async fn run_role_listener(
     mut role_rx: tokio::sync::broadcast::Receiver<RoleEvent>,
     inner: Arc<HaQLiteInner>,
     self_address: String,
@@ -1439,7 +1493,7 @@ async fn run_role_listener(
                     inner.unfence_connection();
                 } else {
                     // No connection (first promotion or after sleep). Open one.
-                    match open_leader_connection(&inner.db_path) {
+                    match inner.try_open_leader_conn() {
                         Ok(conn) => {
                             inner.apply_initial_authorizer(&conn);
                             inner.set_conn(Some(Arc::new(Mutex::new(conn))));
