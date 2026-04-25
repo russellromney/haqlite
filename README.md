@@ -6,9 +6,7 @@ Embed HA SQLite in your app with one line of code. Leader election, WAL replicat
 
 Part of the [hadb](https://github.com/russellromney/hadb) ecosystem for making any embedded database highly available.
 
-This repo is a Cargo workspace with two crates:
-- **`haqlite`** — Base HA SQLite with WAL replication. No turbolite dependencies.
-- **`haqlite-turbolite`** — Tiered HA SQLite with page-level S3 tiering via [turbolite](https://github.com/russellromney/turbolite).
+`haqlite` is the base HA SQLite library with WAL replication. For tiered HA SQLite with page-level S3 tiering, add the optional [`haqlite-turbolite`](haqlite-turbolite/README.md) sibling crate.
 
 ## Quick start
 

@@ -10,22 +10,22 @@ keywords = ["sqlite", "ha", "tiered-storage", "vfs", "s3"]
 categories = ["database", "network-programming"]
 
 [dependencies]
-# Base haqlite (walrust HA layer)
-haqlite = { path = "../haqlite", version = "0.4.0" }
+# Base haqlite (walrust HA layer) — workspace root.
+haqlite = { path = "..", version = "0.4.0" }
 
 # HA coordination
-hadb = { path = "../../../hadb/hadb", version = "0.4.0" }
-hadb-lease = { path = "../../../hadb/hadb-lease", version = "0.4.0" }
+hadb = { path = "../../hadb/hadb", version = "0.4.0" }
+hadb-lease = { path = "../../hadb/hadb-lease", version = "0.4.0" }
 
 # Storage substrate
-turbodb = { path = "../../../hadb/turbodb", version = "0.4.0" }
-turbodb-manifest-cinch = { path = "../../../hadb/turbodb-manifest-cinch", version = "0.4.0" }
+turbodb = { path = "../../hadb/turbodb", version = "0.4.0" }
+turbodb-manifest-cinch = { path = "../../hadb/turbodb-manifest-cinch", version = "0.4.0" }
 
 # Turbolite VFS
-turbolite = { path = "../../../turbolite", version = "0.4.0", features = ["zstd"] }
+turbolite = { path = "../../turbolite", version = "0.4.0", features = ["zstd"] }
 
 # WAL sync (walrust is always present for Continuous/Checkpoint paths)
-walrust = { path = "../../../walrust/crates/walrust-core", version = "0.3.1" }
+walrust = { path = "../../walrust/crates/walrust-core", version = "0.3.1" }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
@@ -43,12 +43,12 @@ rmp-serde = "1"
 reqwest = { version = "0.12", features = ["json"] }
 
 # Cinch-protocol HTTP lease store (for builder convenience)
-hadb-lease-cinch = { path = "../../../hadb/hadb-lease-cinch", version = "0.4.0" }
+hadb-lease-cinch = { path = "../../hadb/hadb-lease-cinch", version = "0.4.0" }
 
 # S3 storage backend (optional, for direct S3 use)
-hadb-storage = { path = "../../../hadb/hadb-storage", version = "0.4.0" }
-hadb-storage-s3 = { path = "../../../hadb/hadb-storage-s3", version = "0.4.0", optional = true }
-hadb-storage-cinch = { path = "../../../hadb/hadb-storage-cinch", version = "0.4.0" }
+hadb-storage = { path = "../../hadb/hadb-storage", version = "0.4.0" }
+hadb-storage-s3 = { path = "../../hadb/hadb-storage-s3", version = "0.4.0", optional = true }
+hadb-storage-cinch = { path = "../../hadb/hadb-storage-cinch", version = "0.4.0" }
 
 # SQLite
 rusqlite = { version = "0.35", features = ["bundled"] }
@@ -61,6 +61,6 @@ s3 = ["dep:hadb-storage-s3"]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-turbodb-manifest-mem = { path = "../../../hadb/turbodb-manifest-mem", version = "0.4.0" }
-hadb-storage-local = { path = "../../../hadb/hadb-storage-local", version = "0.4.0" }
+turbodb-manifest-mem = { path = "../../hadb/turbodb-manifest-mem", version = "0.4.0" }
+hadb-storage-local = { path = "../../hadb/hadb-storage-local", version = "0.4.0" }
 proptest = "1"
