@@ -76,7 +76,7 @@ async fn build_node(
     turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
 
     let db_path = cache_dir.join("e2e.db");
-    let mut builder = Builder::new("test-bucket")
+    let mut builder = Builder::new()
         .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
@@ -249,7 +249,7 @@ async fn e2e_write_fails_without_lease() {
     let shared_vfs = SharedTurboliteVfs::new(vfs);
     turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("reg");
 
-    let db = Builder::new("test-bucket")
+    let db = Builder::new()
         .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)

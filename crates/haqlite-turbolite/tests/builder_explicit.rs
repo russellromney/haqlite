@@ -67,7 +67,7 @@ async fn dedicated_without_lease_or_walrust_errors_clearly() {
     let db_path = tmp.path().join("t.db");
     let db_path_str = db_path.to_str().unwrap();
 
-    let result = Builder::new("test-bucket")
+    let result = Builder::new()
         .prefix("p/")
         .instance_id("test-1")
         .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -90,7 +90,7 @@ async fn shared_without_lease_errors_clearly() {
     let db_path_str = db_path.to_str().unwrap();
     let (vfs, vfs_name) = dummy_turbolite_vfs(&tmp);
 
-    let result = Builder::new("test-bucket")
+    let result = Builder::new()
         .prefix("p/")
         .instance_id("test-1").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .turbolite_vfs(vfs, &vfs_name)
@@ -114,7 +114,7 @@ async fn shared_without_manifest_errors_clearly() {
     let lease = Arc::new(InMemoryLeaseStore::new());
     let (vfs, vfs_name) = dummy_turbolite_vfs(&tmp);
 
-    let result = Builder::new("test-bucket")
+    let result = Builder::new()
         .prefix("p/")
         .instance_id("test-1").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .turbolite_vfs(vfs, &vfs_name)
@@ -139,7 +139,7 @@ async fn shared_without_turbolite_errors_clearly() {
     let lease = Arc::new(InMemoryLeaseStore::new());
     let manifest = Arc::new(MemManifestStore::new());
 
-    let result = Builder::new("test-bucket")
+    let result = Builder::new()
         .prefix("p/")
         .instance_id("test-1").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease)
@@ -170,7 +170,7 @@ async fn lease_timing_setters_reach_coordinator() {
     let lease = Arc::new(InMemoryLeaseStore::new());
     let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
 
-    let db = haqlite::HaQLite::builder("test-bucket")
+    let db = haqlite::HaQLite::builder()
         .prefix("p/")
         .instance_id("test-1")
         .address("http://127.0.0.1:19090")
@@ -228,7 +228,7 @@ async fn caller_lease_config_timing_is_preserved() {
         ..Default::default()
     };
 
-    let db = haqlite::HaQLite::builder("test-bucket")
+    let db = haqlite::HaQLite::builder()
         .prefix("p/")
         .instance_id("caller-instance")
         .address("http://127.0.0.1:19091")

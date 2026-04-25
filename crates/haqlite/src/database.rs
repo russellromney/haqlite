@@ -5,7 +5,9 @@
 //! # async fn main() -> anyhow::Result<()> {
 //! use haqlite::{HaQLite, SqlValue};
 //!
-//! let db = HaQLite::builder("my-bucket")
+//! let db = HaQLite::builder()
+//!     .lease_store(my_lease_store)
+//!     .walrust_storage(my_storage)
 //!     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);")
 //!     .await?;
 //!
@@ -69,7 +71,7 @@ pub use hadb::{Durability, HaMode, validate_mode_durability};
 /// # async fn main() -> anyhow::Result<()> {
 /// use haqlite::HaQLite;
 ///
-/// let db = HaQLite::builder("my-bucket")
+/// let db = HaQLite::builder()
 ///     .prefix("myapp/")
 ///     .forwarding_port(19000)
 ///     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS ...")
@@ -80,7 +82,6 @@ pub use hadb::{Durability, HaMode, validate_mode_durability};
 const DEFAULT_READ_CONCURRENCY: usize = 32;
 
 pub struct HaQLiteBuilder {
-    bucket: String,
     prefix: String,
     endpoint: Option<String>,
     instance_id: Option<String>,
@@ -102,10 +103,15 @@ pub struct HaQLiteBuilder {
     authorizer: Option<AuthorizerFactory>,
 }
 
+impl Default for HaQLiteBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HaQLiteBuilder {
-    pub fn new(bucket: &str) -> Self {
+    pub fn new() -> Self {
         Self {
-            bucket: bucket.to_string(),
             prefix: DEFAULT_PREFIX.to_string(),
             endpoint: None,
             instance_id: None,
@@ -280,7 +286,6 @@ impl HaQLiteBuilder {
         self
     }
 
-    pub fn get_bucket(&self) -> &str { &self.bucket }
     pub fn get_prefix(&self) -> &str { &self.prefix }
     pub fn get_endpoint(&self) -> Option<&str> { self.endpoint.as_deref() }
     pub fn get_instance_id(&self) -> Option<&str> { self.instance_id.as_deref() }
@@ -407,7 +412,7 @@ impl HaQLiteBuilder {
 
 /// HA SQLite database — transparent write forwarding, local reads, automatic failover.
 ///
-/// Create via `HaQLite::builder("bucket").open(path, schema).await?`
+/// Create via `HaQLite::builder().<wire-storage>.open(path, schema).await?`
 /// or `HaQLite::local(path, schema)?` for single-node mode.
 /// HA SQLite database with transparent write forwarding, local reads, and automatic failover.
 ///
@@ -415,7 +420,7 @@ impl HaQLiteBuilder {
 /// close(), background tasks are aborted and the lease is not cleanly released, which may
 /// block other nodes from acquiring the lease until TTL expires.
 ///
-/// Create via `HaQLite::builder("bucket").open(path, schema).await?`
+/// Create via `HaQLite::builder().<wire-storage>.open(path, schema).await?`
 /// or `HaQLite::local(path, schema)?` for single-node mode.
 pub struct HaQLite {
     inner: Arc<HaQLiteInner>,
@@ -698,9 +703,13 @@ impl HaQLiteInner {
 }
 
 impl HaQLite {
-    /// Start building an HA SQLite instance. Only the S3 bucket is required.
-    pub fn builder(bucket: &str) -> HaQLiteBuilder {
-        HaQLiteBuilder::new(bucket)
+    /// Start building an HA SQLite instance. Wire storage explicitly via
+    /// `.lease_store(...)` / `.walrust_storage(...)`; bucket-based defaults
+    /// no longer ship from the builder. The `haqlite::env` module provides
+    /// opt-in env-var helpers that construct S3 stores from
+    /// `CINCH_S3_BUCKET` etc., for callers who want the convenience.
+    pub fn builder() -> HaQLiteBuilder {
+        HaQLiteBuilder::new()
     }
 
     /// Construct from a pre-built inner and role handle.
@@ -1039,7 +1048,7 @@ impl HaQLite {
     /// ```no_run
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let db = haqlite::HaQLite::builder("bucket").open("/data/my.db", "").await?;
+    /// let db = haqlite::HaQLite::builder().open("/data/my.db", "").await?;
     /// let conn = db.connection()?;
     /// let guard = conn.lock();
     /// guard.execute("INSERT INTO users (name) VALUES (?1)", ["Alice"])?;

@@ -178,7 +178,7 @@ proptest! {
 
             let (vfs, vfs_name) = make_local_vfs(tmp.path());
             let db_path = tmp.path().join("shared_serial.db");
-            let mut db = Builder::new("test-bucket")
+            let mut db = Builder::new()
                 .prefix("test/")
                 .mode(Mode::MultiWriter)
                 .durability(turbodb::Durability::Cloud)

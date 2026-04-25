@@ -8,7 +8,7 @@
 //! # async fn main() -> anyhow::Result<()> {
 //! use haqlite::{HaQLite, SqlValue};
 //!
-//! let db = HaQLite::builder("my-bucket")
+//! let db = HaQLite::builder()
 //!     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);")
 //!     .await?;
 //!

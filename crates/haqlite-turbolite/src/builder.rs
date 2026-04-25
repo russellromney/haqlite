@@ -42,20 +42,28 @@ pub struct Builder {
     turbolite_storage: Option<Arc<dyn hadb_storage::StorageBackend>>,
     turbolite_vfs: Option<(SharedTurboliteVfs, String)>,
     manifest_store: Option<Arc<dyn ManifestStore>>,
+    rollback_database_id: Option<String>,
     rollback_token: Option<String>,
     rollback_url: Option<String>,
 }
 
+impl Default for Builder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Builder {
-    pub fn new(bucket: &str) -> Self {
+    pub fn new() -> Self {
         Self {
-            inner: HaQLiteBuilder::new(bucket),
+            inner: HaQLiteBuilder::new(),
             mode: Mode::Writer,
             turbolite_durability: turbodb::Durability::default(),
             turbolite_http: None,
             turbolite_storage: None,
             turbolite_vfs: None,
             manifest_store: None,
+            rollback_database_id: None,
             rollback_token: None,
             rollback_url: None,
         }
@@ -174,7 +182,16 @@ impl Builder {
         self
     }
 
-    pub fn with_rollback_detection(mut self, token: &str) -> Self {
+    /// Enable Phase Strata rollback detection. Before turbolite VFS opens,
+    /// the builder GETs the remote turbolite manifest from the storage URL
+    /// (taken from `.turbolite_http()`), compares its `epoch` to the local
+    /// cached manifest, and wipes the local cache + SQLite stub on mismatch.
+    /// `database_id` is used to compute the cache directory path
+    /// (`<db_path.parent>/.tl_cache_<database_id>/`).
+    ///
+    /// Requires `.turbolite_http(endpoint, _)` to also be set.
+    pub fn with_rollback_detection(mut self, database_id: &str, token: &str) -> Self {
+        self.rollback_database_id = Some(database_id.to_string());
         self.rollback_token = Some(token.to_string());
         self
     }
@@ -206,6 +223,26 @@ impl Builder {
             .and_then(|s| s.to_str())
             .unwrap_or("db")
             .to_string();
+
+        // Phase Strata: detect manifest epoch mismatch (fork/rollback) and wipe
+        // the local cache + SQLite stub before turbolite opens. Requires
+        // turbolite_http to be set so we have a storage URL to GET the remote
+        // manifest from.
+        if let (Some(ref database_id), Some(ref token)) =
+            (self.rollback_database_id.as_ref(), self.rollback_token.as_ref())
+        {
+            let storage_url = match self.turbolite_http {
+                Some((ref ep, _)) => ep.clone(),
+                None => anyhow::bail!(
+                    "with_rollback_detection requires .turbolite_http() to be set"
+                ),
+            };
+            let detector = crate::RollbackDetector::new(&storage_url, token);
+            detector
+                .check_and_repair(database_id, &db_path)
+                .await
+                .map_err(|e| anyhow::anyhow!("rollback detection: {e}"))?;
+        }
 
         let instance_id = self.inner.get_instance_id().map(|s| s.to_string()).unwrap_or_else(|| {
             std::env::var("FLY_MACHINE_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())

@@ -116,7 +116,7 @@ async fn run_mode_sync(enc: &Encoding) {
     // VFS fetches the S3 manifest at creation time; creating both upfront means
     // the second VFS would have a stale view of S3.
     let (vfs_a, vfs_name_a) = build_node(tmp_a.path(), "a");
-    let mut db_a = Builder::new("unused-bucket")
+    let mut db_a = Builder::new()
         .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone())
@@ -127,7 +127,7 @@ async fn run_mode_sync(enc: &Encoding) {
         .await.expect("open a");
 
     let (vfs_b, vfs_name_b) = build_node(tmp_b.path(), "b");
-    let mut db_b = Builder::new("unused-bucket")
+    let mut db_b = Builder::new()
         .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone())

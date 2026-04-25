@@ -72,7 +72,7 @@ async fn build_shared(
         .expect("register VFS");
 
     let db_path = tmp.path().join(format!("{}.db", db_name));
-    Builder::new("test-bucket")
+    Builder::new()
         .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
@@ -576,7 +576,7 @@ async fn test_write_timeout_lease_contention() {
         .expect("register VFS");
 
     let db_path = tmp.path().join("contention.db");
-    let mut db = Builder::new("test-bucket")
+    let mut db = Builder::new()
         .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)

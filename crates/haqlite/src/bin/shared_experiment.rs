@@ -223,7 +223,7 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut builder = HaQLite::builder(&args.bucket)
+    let mut builder = HaQLite::builder()
         .prefix(&args.prefix)
         .mode(HaMode::Dedicated)
         .durability(hadb::Durability::Replicated(Duration::from_secs(1)))

@@ -10,13 +10,10 @@
 //! Typical use (CLI binaries, dev harnesses):
 //!
 //! ```no_run
-//! # use std::sync::Arc;
 //! # async fn demo(bucket: &str, endpoint: Option<&str>) -> anyhow::Result<()> {
 //! let lease = haqlite::env::lease_store_from_env(bucket, endpoint).await?;
-//! let manifest = haqlite::env::manifest_store_from_env(bucket, endpoint).await?;
-//! let _ = haqlite::HaQLite::builder(bucket)
-//!     .lease_store(lease)
-//!     .manifest_store(manifest);
+//! let _ = haqlite::HaQLite::builder()
+//!     .lease_store(lease);
 //! # Ok(()) }
 //! ```
 

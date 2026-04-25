@@ -300,7 +300,7 @@ async fn main() -> Result<()> {
     };
 
     // Build HaQLite.
-    let mut builder = HaQLite::builder(&args.bucket)
+    let mut builder = HaQLite::builder()
         .prefix(&args.prefix)
         .forwarding_port(forwarding_port)
         .instance_id(&instance_id)

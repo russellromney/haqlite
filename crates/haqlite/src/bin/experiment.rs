@@ -415,7 +415,7 @@ async fn main() -> Result<()> {
         other => anyhow::bail!("unknown topology: {} (expected: dedicated, shared)", other),
     };
 
-    let mut builder = HaQLite::builder(&args.bucket)
+    let mut builder = HaQLite::builder()
         .prefix(&args.prefix)
         .mode(mode)
         .instance_id(&instance_id)

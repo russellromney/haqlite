@@ -49,7 +49,7 @@ async fn build_turbolite_shared(
         .expect("register turbolite VFS");
 
     let db_path = cache_dir.join(format!("{}.db", db_name));
-    Builder::new("unused-bucket")
+    Builder::new()
         .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)

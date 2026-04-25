@@ -72,7 +72,7 @@ async fn build_turbolite_dedicated(
 
     let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(common::InMemoryStorage::new());
     let db_path = cache_dir.join(format!("{}.db", db_name));
-    Builder::new("unused-bucket")
+    Builder::new()
         .prefix("test/").mode(Mode::Writer).durability(durability)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
@@ -94,7 +94,7 @@ async fn build_walrust_dedicated(
 ) -> HaQLite {
     let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(common::InMemoryStorage::new());
     let db_path = cache_dir.join(format!("{}.db", db_name));
-    haqlite::HaQLite::builder("unused-bucket")
+    haqlite::HaQLite::builder()
         .prefix("test/")
         .mode(haqlite::HaMode::Dedicated)
         .durability(durability)

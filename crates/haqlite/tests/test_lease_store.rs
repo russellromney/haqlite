@@ -191,7 +191,7 @@ async fn custom_lease_store_is_used() {
 async fn builder_lease_store_method_compiles_and_sets() {
     // Verify that the builder method compiles and accepts Arc<dyn LeaseStore>.
     let store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
-    let _builder = HaQLite::builder("test-bucket").lease_store(store.clone());
+    let _builder = HaQLite::builder().lease_store(store.clone());
 
     // Since open() needs real S3, we verify the store works end-to-end via
     // from_coordinator (which is the same downstream path open() uses).

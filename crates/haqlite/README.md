@@ -15,7 +15,7 @@ This repo is a Cargo workspace with two crates:
 ```rust
 use haqlite::{HaQLite, SqlValue};
 
-let db = HaQLite::builder("my-bucket")
+let db = HaQLite::builder()
     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);")
     .await?;
 
@@ -115,14 +115,14 @@ No fallbacks. If the env var is missing and no store is set on the builder, haql
 
 ```rust
 // Explicit store objects
-let db = HaQLite::builder("my-bucket")
+let db = HaQLite::builder()
     .lease_store(Arc::new(my_nats_store))
     .manifest_store(Arc::new(my_manifest_store))
     .open("/data/my.db", schema)
     .await?;
 
 // HTTP convenience (equivalent to setting the env vars)
-let db = HaQLite::builder("my-bucket")
+let db = HaQLite::builder()
     .lease_endpoint("http://proxy:8080", "my-token")
     .manifest_endpoint("http://proxy:8080", "my-token")
     .open("/data/my.db", schema)
@@ -143,7 +143,7 @@ let db = HaQLite::builder("my-bucket")
 ## Builder options
 
 ```rust
-let db = HaQLite::builder("my-bucket")
+let db = HaQLite::builder()
     .prefix("myapp/")                        // S3 key prefix (default: "haqlite/")
     .endpoint("https://t3.storage.dev")       // S3 endpoint (Tigris, MinIO, R2)
     .instance_id("node-1")                    // default: FLY_MACHINE_ID or UUID
@@ -163,7 +163,7 @@ For page-level S3 tiering (sub-250ms cold queries, transparent page eviction), u
 ```rust
 use haqlite_turbolite::{Builder, Mode};
 
-let db = Builder::new("my-bucket")
+let db = Builder::new()
     .turbolite_http("https://t3.storage.dev", "my-token")
     .manifest_endpoint("https://t3.storage.dev", "my-token")
     .lease_endpoint("https://t3.storage.dev", "my-token")

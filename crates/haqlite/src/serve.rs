@@ -87,7 +87,7 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
     };
 
     // Build HaQLite.
-    let mut builder = HaQLite::builder(&shared.s3.bucket)
+    let mut builder = HaQLite::builder()
         .mode(ha_mode)
         .prefix(&serve.prefix)
         .forwarding_port(serve.forwarding_port)

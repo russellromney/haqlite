@@ -99,7 +99,7 @@ async fn open_node(
 ) -> Result<HaQLite> {
     let db_path = db_dir.join("e2e.db");
 
-    let mut builder = HaQLite::builder(&args.bucket)
+    let mut builder = HaQLite::builder()
         .prefix(prefix)
         .mode(HaMode::Dedicated)
         .durability(hadb::Durability::Replicated(Duration::from_secs(1)))

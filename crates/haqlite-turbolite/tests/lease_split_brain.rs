@@ -143,7 +143,7 @@ async fn build_node(
         .expect("register VFS");
 
     let db_path = tmp.path().join(format!("{}.db", name));
-    Builder::new("test-bucket")
+    Builder::new()
         .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)

@@ -89,7 +89,7 @@ async fn build_mode_f_node(
     // Let the builder handle everything (schema creation, connection management).
     // Don't do external schema creation -- it triggers S3Primary uploads that
     // interfere with multiwriter catch-up.
-    Builder::new("unused-bucket")
+    Builder::new()
         .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)

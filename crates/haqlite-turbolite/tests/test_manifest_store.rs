@@ -89,7 +89,7 @@ async fn dedicated_mode_with_manifest_store() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
     let manifest_store = Arc::new(MemManifestStore::new());
 
-    let mut db = Builder::new("test-bucket")
+    let mut db = Builder::new()
         .prefix("test/").mode(Mode::Writer)
         .lease_store(lease_store)
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
@@ -122,7 +122,7 @@ async fn dedicated_mode_without_manifest_store_still_works() {
     let storage = Arc::new(InMemoryStorage::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
 
-    let mut db = Builder::new("test-bucket")
+    let mut db = Builder::new()
         .prefix("test/").mode(Mode::Writer)
         .lease_store(lease_store)
         .walrust_storage(storage)
@@ -160,7 +160,7 @@ async fn shared_mode_manifest_published_on_write() {
     let manifest_store = Arc::new(MemManifestStore::new());
 
     let (vfs, vfs_name) = make_local_vfs(tmp.path());
-    let mut db = Builder::new("test-bucket")
+    let mut db = Builder::new()
         .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
@@ -206,7 +206,7 @@ async fn shared_mode_sequential_writes_increment_manifest_version() {
     let manifest_store = Arc::new(MemManifestStore::new());
 
     let (vfs, vfs_name) = make_local_vfs(tmp.path());
-    let mut db = Builder::new("test-bucket")
+    let mut db = Builder::new()
         .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
@@ -251,7 +251,7 @@ async fn shared_mode_two_writers_see_each_others_data() {
     let s3_prefix = format!("test/two_writers/{}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).expect("time").as_nanos());
     let (vfs1, vfs_name1) = make_s3_vfs(tmp1.path(), &s3_prefix);
-    let db1 = Builder::new(&test_bucket())
+    let db1 = Builder::new()
         .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
@@ -276,7 +276,7 @@ async fn shared_mode_two_writers_see_each_others_data() {
 
     // Writer 2 opens and writes (should catch up from manifest first)
     let (vfs2, vfs_name2) = make_s3_vfs(tmp2.path(), &s3_prefix);
-    let mut db2 = Builder::new(&test_bucket())
+    let mut db2 = Builder::new()
         .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
