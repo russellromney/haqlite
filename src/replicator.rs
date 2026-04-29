@@ -7,7 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use hadb_storage::StorageBackend;
-use walrust::ReplicationConfig;
+use walrust::{ReplicationConfig, SnapshotOwnership, SnapshotSource};
 
 use hadb::Replicator;
 
@@ -28,11 +28,7 @@ impl SqliteReplicator {
     /// `storage` is the walrust S3 backend for WAL data.
     /// `prefix` is the S3 key prefix for all databases (e.g. "wal/" or "ha/").
     /// `config` is the walrust replication configuration.
-    pub fn new(
-        storage: Arc<dyn StorageBackend>,
-        prefix: &str,
-        config: ReplicationConfig,
-    ) -> Self {
+    pub fn new(storage: Arc<dyn StorageBackend>, prefix: &str, config: ReplicationConfig) -> Self {
         Self {
             inner: walrust::Replicator::new(storage, prefix, config),
             skip_snapshot_on_add: false,
@@ -67,6 +63,45 @@ impl SqliteReplicator {
     }
 }
 
+/// SQLite replicator for external-base-state mode.
+///
+/// Use this when another layer owns checkpointed base state and walrust should
+/// only ship / replay WAL deltas after that checkpoint.
+pub struct ExternalSnapshotSqliteReplicator {
+    inner: Arc<walrust::Replicator>,
+    snapshot_source: Arc<dyn SnapshotSource>,
+}
+
+impl ExternalSnapshotSqliteReplicator {
+    /// Create a new external-base-state SQLite replicator.
+    ///
+    /// The wrapper forces walrust into external snapshot ownership. The caller
+    /// must still pass `autonomous_snapshots = false`; enabling periodic
+    /// snapshots in this mode is a real bug and is rejected.
+    pub fn new(
+        storage: Arc<dyn StorageBackend>,
+        prefix: &str,
+        mut config: ReplicationConfig,
+        snapshot_source: Arc<dyn SnapshotSource>,
+    ) -> Result<Self> {
+        if config.autonomous_snapshots {
+            anyhow::bail!(
+                "external-base-state SQLite replication requires autonomous_snapshots = false"
+            );
+        }
+        config.snapshot_ownership = SnapshotOwnership::External;
+
+        Ok(Self {
+            inner: walrust::Replicator::try_new(storage, prefix, config)?,
+            snapshot_source,
+        })
+    }
+
+    pub fn inner(&self) -> &Arc<walrust::Replicator> {
+        &self.inner
+    }
+}
+
 #[async_trait]
 impl Replicator for SqliteReplicator {
     async fn add(&self, name: &str, path: &Path) -> Result<()> {
@@ -96,12 +131,15 @@ impl Replicator for SqliteReplicator {
             name,
             path,
             seq,
-        ).await?;
+        )
+        .await?;
 
         if final_seq > seq {
             tracing::info!(
                 "SqliteReplicator::pull('{}') bridged chain gap: restore seq {} -> pull seq {}",
-                name, seq, final_seq,
+                name,
+                seq,
+                final_seq,
             );
         }
         Ok(())
@@ -115,7 +153,69 @@ impl Replicator for SqliteReplicator {
     async fn sync(&self, name: &str) -> Result<()> {
         let frames = self.inner.flush(name).await?;
         if frames > 0 {
-            tracing::info!("SqliteReplicator::sync('{}') flushed {} frames", name, frames);
+            tracing::info!(
+                "SqliteReplicator::sync('{}') flushed {} frames",
+                name,
+                frames
+            );
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Replicator for ExternalSnapshotSqliteReplicator {
+    async fn add(&self, name: &str, path: &Path) -> Result<()> {
+        self.inner.add(name, path).await
+    }
+
+    async fn add_continuing(&self, name: &str, path: &Path) -> Result<()> {
+        self.inner.add_without_snapshot(name, path).await
+    }
+
+    async fn pull(&self, name: &str, path: &Path) -> Result<()> {
+        let restored_seq = walrust::restore_with_snapshot_source(
+            self.inner.storage().as_ref(),
+            self.inner.prefix(),
+            name,
+            path,
+            self.snapshot_source.as_ref(),
+        )
+        .await?;
+
+        let final_seq = walrust::sync::pull_incremental(
+            self.inner.storage().as_ref(),
+            self.inner.prefix(),
+            name,
+            path,
+            restored_seq,
+        )
+        .await?;
+
+        if final_seq > restored_seq {
+            tracing::info!(
+                "ExternalSnapshotSqliteReplicator::pull('{}') advanced after restore: {} -> {}",
+                name,
+                restored_seq,
+                final_seq,
+            );
+        }
+        Ok(())
+    }
+
+    async fn remove(&self, name: &str) -> Result<()> {
+        self.inner.remove(name).await;
+        Ok(())
+    }
+
+    async fn sync(&self, name: &str) -> Result<()> {
+        let frames = self.inner.flush(name).await?;
+        if frames > 0 {
+            tracing::info!(
+                "ExternalSnapshotSqliteReplicator::sync('{}') flushed {} frames",
+                name,
+                frames,
+            );
         }
         Ok(())
     }

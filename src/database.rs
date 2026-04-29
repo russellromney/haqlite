@@ -17,15 +17,15 @@
 //! # }
 //! ```
 
+use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use parking_lot::{Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
 use axum::routing::post;
-use hadb::{CoordinatorConfig, Coordinator, JoinResult, LeaseConfig, Role, RoleEvent};
+use hadb::{Coordinator, CoordinatorConfig, JoinResult, LeaseConfig, Role, RoleEvent};
 use hadb_lease_s3::S3LeaseStore;
 
 use crate::error::HaQLiteError;
@@ -45,8 +45,11 @@ use crate::forwarding::{self, ForwardingState, SqlValue};
 /// The returned closure is installed as the SQLite authorizer via
 /// `conn.authorizer()`. It must be `FnMut` + `Send` + `'static`.
 pub type AuthorizerFactory = Arc<
-    dyn Fn(bool) -> Box<dyn FnMut(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization + Send>
-        + Send
+    dyn Fn(
+            bool,
+        ) -> Box<
+            dyn FnMut(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization + Send,
+        > + Send
         + Sync,
 >;
 use crate::replicator::SqliteReplicator;
@@ -58,9 +61,30 @@ const DEFAULT_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 const ROLE_LEADER: u8 = 0;
 const ROLE_FOLLOWER: u8 = 1;
 
+/// How a dedicated-mode leader accepts forwarded writes from followers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardingMode {
+    /// Use haqlite's built-in HTTP forwarding server on the given port.
+    BuiltinHttp { port: u16 },
+    /// Disable haqlite's built-in forwarding server entirely.
+    ///
+    /// Use this when a higher-level system already handles leader routing,
+    /// redirects, or request replay.
+    Disabled,
+}
+
+impl ForwardingMode {
+    fn port(self) -> Option<u16> {
+        match self {
+            ForwardingMode::BuiltinHttp { port } => Some(port),
+            ForwardingMode::Disabled => None,
+        }
+    }
+}
+
 // Re-export canonical mode/durability types from hadb.
 // Shared across haqlite and hakuzu for consistent validation.
-pub use hadb::{Durability, HaMode, validate_mode_durability};
+pub use hadb::{validate_mode_durability, Durability, HaMode};
 
 /// Builder for creating an HA SQLite instance.
 ///
@@ -86,7 +110,7 @@ pub struct HaQLiteBuilder {
     endpoint: Option<String>,
     instance_id: Option<String>,
     address: Option<String>,
-    forwarding_port: u16,
+    forwarding_mode: ForwardingMode,
     forward_timeout: Duration,
     coordinator_config: Option<CoordinatorConfig>,
     secret: Option<String>,
@@ -116,7 +140,9 @@ impl HaQLiteBuilder {
             endpoint: None,
             instance_id: None,
             address: None,
-            forwarding_port: DEFAULT_FORWARDING_PORT,
+            forwarding_mode: ForwardingMode::BuiltinHttp {
+                port: DEFAULT_FORWARDING_PORT,
+            },
             forward_timeout: DEFAULT_FORWARD_TIMEOUT,
             coordinator_config: None,
             secret: None,
@@ -152,16 +178,34 @@ impl HaQLiteBuilder {
         self
     }
 
-    /// Network address for this node (how other nodes reach the forwarding server).
-    /// Default: auto-detected from Fly internal DNS or hostname.
+    /// Network address for this node (how other nodes or routing layers reach it).
+    /// Default: auto-detected from Fly internal DNS or hostname when built-in
+    /// forwarding is enabled; empty when forwarding is disabled.
     pub fn address(mut self, addr: &str) -> Self {
         self.address = Some(addr.to_string());
         self
     }
 
     /// Port for the internal write-forwarding HTTP server. Default: 18080.
+    /// Set to `0` to disable forwarding.
     pub fn forwarding_port(mut self, port: u16) -> Self {
-        self.forwarding_port = port;
+        self.forwarding_mode = if port == 0 {
+            ForwardingMode::Disabled
+        } else {
+            ForwardingMode::BuiltinHttp { port }
+        };
+        self
+    }
+
+    /// Set the forwarding strategy explicitly.
+    pub fn forwarding_mode(mut self, mode: ForwardingMode) -> Self {
+        self.forwarding_mode = mode;
+        self
+    }
+
+    /// Disable haqlite's built-in leader forwarding server.
+    pub fn disable_forwarding(mut self) -> Self {
+        self.forwarding_mode = ForwardingMode::Disabled;
         self
     }
 
@@ -205,9 +249,9 @@ impl HaQLiteBuilder {
     ///
     /// Shorthand for `.lease_store(Arc::new(CinchLeaseStore::new(endpoint, token)))`.
     pub fn lease_endpoint(self, endpoint: &str, token: &str) -> Self {
-        self.lease_store(Arc::new(
-            hadb_lease_cinch::CinchLeaseStore::new(endpoint, token),
-        ))
+        self.lease_store(Arc::new(hadb_lease_cinch::CinchLeaseStore::new(
+            endpoint, token,
+        )))
     }
 
     /// Set the coordination topology. Default: `HaMode::Dedicated`.
@@ -280,31 +324,74 @@ impl HaQLiteBuilder {
     pub fn authorizer<F, G>(mut self, factory: F) -> Self
     where
         F: Fn(bool) -> G + Send + Sync + 'static,
-        G: FnMut(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization + Send + 'static,
+        G: FnMut(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization
+            + Send
+            + 'static,
     {
         self.authorizer = Some(Arc::new(move |fenced| Box::new(factory(fenced))));
         self
     }
 
-    pub fn get_prefix(&self) -> &str { &self.prefix }
-    pub fn get_endpoint(&self) -> Option<&str> { self.endpoint.as_deref() }
-    pub fn get_instance_id(&self) -> Option<&str> { self.instance_id.as_deref() }
-    pub fn get_address(&self) -> Option<&str> { self.address.as_deref() }
-    pub fn get_forwarding_port(&self) -> u16 { self.forwarding_port }
-    pub fn get_forward_timeout(&self) -> Duration { self.forward_timeout }
-    pub fn get_coordinator_config(&self) -> Option<&CoordinatorConfig> { self.coordinator_config.as_ref() }
-    pub fn get_secret(&self) -> Option<&str> { self.secret.as_deref() }
-    pub fn get_read_concurrency(&self) -> usize { self.read_concurrency }
-    pub fn get_lease_store(&self) -> Option<&Arc<dyn hadb::LeaseStore>> { self.lease_store.as_ref() }
-    pub fn get_mode(&self) -> HaMode { self.mode }
-    pub fn get_durability(&self) -> Option<hadb::Durability> { self.durability }
-    pub fn get_manifest_poll_interval(&self) -> Option<Duration> { self.manifest_poll_interval }
-    pub fn get_write_timeout(&self) -> Option<Duration> { self.write_timeout }
-    pub fn get_walrust_storage(&self) -> Option<&Arc<dyn hadb_storage::StorageBackend>> { self.walrust_storage.as_ref() }
-    pub fn get_lease_ttl(&self) -> Option<u64> { self.lease_ttl }
-    pub fn get_lease_renew_interval(&self) -> Option<Duration> { self.lease_renew_interval }
-    pub fn get_lease_follower_poll_interval(&self) -> Option<Duration> { self.lease_follower_poll_interval }
-    pub fn get_authorizer(&self) -> Option<&AuthorizerFactory> { self.authorizer.as_ref() }
+    pub fn get_prefix(&self) -> &str {
+        &self.prefix
+    }
+    pub fn get_endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
+    }
+    pub fn get_instance_id(&self) -> Option<&str> {
+        self.instance_id.as_deref()
+    }
+    pub fn get_address(&self) -> Option<&str> {
+        self.address.as_deref()
+    }
+    pub fn get_forwarding_port(&self) -> u16 {
+        self.forwarding_mode.port().unwrap_or(0)
+    }
+    pub fn get_forwarding_mode(&self) -> ForwardingMode {
+        self.forwarding_mode
+    }
+    pub fn get_forward_timeout(&self) -> Duration {
+        self.forward_timeout
+    }
+    pub fn get_coordinator_config(&self) -> Option<&CoordinatorConfig> {
+        self.coordinator_config.as_ref()
+    }
+    pub fn get_secret(&self) -> Option<&str> {
+        self.secret.as_deref()
+    }
+    pub fn get_read_concurrency(&self) -> usize {
+        self.read_concurrency
+    }
+    pub fn get_lease_store(&self) -> Option<&Arc<dyn hadb::LeaseStore>> {
+        self.lease_store.as_ref()
+    }
+    pub fn get_mode(&self) -> HaMode {
+        self.mode
+    }
+    pub fn get_durability(&self) -> Option<hadb::Durability> {
+        self.durability
+    }
+    pub fn get_manifest_poll_interval(&self) -> Option<Duration> {
+        self.manifest_poll_interval
+    }
+    pub fn get_write_timeout(&self) -> Option<Duration> {
+        self.write_timeout
+    }
+    pub fn get_walrust_storage(&self) -> Option<&Arc<dyn hadb_storage::StorageBackend>> {
+        self.walrust_storage.as_ref()
+    }
+    pub fn get_lease_ttl(&self) -> Option<u64> {
+        self.lease_ttl
+    }
+    pub fn get_lease_renew_interval(&self) -> Option<Duration> {
+        self.lease_renew_interval
+    }
+    pub fn get_lease_follower_poll_interval(&self) -> Option<Duration> {
+        self.lease_follower_poll_interval
+    }
+    pub fn get_authorizer(&self) -> Option<&AuthorizerFactory> {
+        self.authorizer.as_ref()
+    }
 
     /// Open the database and join the HA cluster.
     ///
@@ -318,16 +405,18 @@ impl HaQLiteBuilder {
             .to_string();
 
         let instance_id = self.instance_id.unwrap_or_else(|| {
-            std::env::var("FLY_MACHINE_ID")
-                .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
+            std::env::var("FLY_MACHINE_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
         });
-        let address = self.address.unwrap_or_else(|| {
-            detect_address(&instance_id, self.forwarding_port)
+        let forwarding_mode = self.forwarding_mode;
+        let address = self.address.unwrap_or_else(|| match forwarding_mode {
+            ForwardingMode::BuiltinHttp { port } => detect_address(&instance_id, port),
+            ForwardingMode::Disabled => String::new(),
         });
 
         let walrust_durability = self.durability.unwrap_or_else(hadb::Durability::default);
 
-        let walrust_storage = self.walrust_storage
+        let walrust_storage = self
+            .walrust_storage
             .ok_or_else(|| anyhow::anyhow!("Dedicated mode requires walrust storage"))?;
 
         let lease_store: Arc<dyn hadb::LeaseStore> = self.lease_store.ok_or_else(|| {
@@ -345,11 +434,7 @@ impl HaQLiteBuilder {
                 existing.address = address.clone();
                 existing
             }
-            None => LeaseConfig::new(
-                lease_store.clone(),
-                instance_id.clone(),
-                address.clone(),
-            ),
+            None => LeaseConfig::new(lease_store.clone(), instance_id.clone(), address.clone()),
         };
         if let Some(ttl) = self.lease_ttl {
             lease_cfg.ttl_secs = ttl;
@@ -376,12 +461,11 @@ impl HaQLiteBuilder {
         };
         let replicator = Arc::new(
             SqliteReplicator::new(walrust_storage.clone(), &self.prefix, replication_config)
-                .with_skip_snapshot(skip_snapshot)
+                .with_skip_snapshot(skip_snapshot),
         );
 
-        let follower_behavior: Arc<dyn hadb::FollowerBehavior> = Arc::new(
-            SqliteFollowerBehavior::new(walrust_storage.clone())
-        );
+        let follower_behavior: Arc<dyn hadb::FollowerBehavior> =
+            Arc::new(SqliteFollowerBehavior::new(walrust_storage.clone()));
 
         let coordinator = Coordinator::new(
             replicator,
@@ -398,7 +482,7 @@ impl HaQLiteBuilder {
             &db_name,
             schema,
             &address,
-            self.forwarding_port,
+            forwarding_mode,
             self.forward_timeout,
             self.secret,
             self.read_concurrency,
@@ -492,15 +576,16 @@ pub struct HaQLiteInner {
     pub schema_sql: Option<String>,
     /// Whether schema has been applied on this node.
     pub schema_applied: AtomicBool,
-    /// Port for the write-forwarding HTTP server.
-    pub forwarding_port: u16,
+    /// How leader write forwarding is handled for this database.
+    pub forwarding_mode: ForwardingMode,
     /// Running forwarding server task. Started when leader, stopped on demotion.
     pub fwd_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Custom authorizer factory. If set, used instead of built-in fence/unfence authorizer.
     pub authorizer: Option<AuthorizerFactory>,
     /// Optional lazy connection opener. Used by sibling crates to open
     /// connections via a custom VFS on first use.
-    pub connection_opener: Option<Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>>,
+    pub connection_opener:
+        Option<Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>>,
     /// Optional flush callback for tiered storage (turbolite). Set by sibling
     /// crates that inject a custom VFS; base haqlite never sets this.
     pub on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
@@ -516,7 +601,7 @@ impl HaQLiteInner {
         conn: arc_swap::ArcSwapOption<Mutex<rusqlite::Connection>>,
         http_client: reqwest::Client,
         mode: HaMode,
-        forwarding_port: u16,
+        forwarding_mode: ForwardingMode,
     ) -> Self {
         Self {
             coordinator: None,
@@ -542,7 +627,7 @@ impl HaQLiteInner {
             lease_ttl: 5,
             schema_sql: None,
             schema_applied: AtomicBool::new(true),
-            forwarding_port,
+            forwarding_mode,
             fwd_handle: tokio::sync::Mutex::new(None),
             authorizer: None,
             connection_opener: None,
@@ -562,12 +647,21 @@ impl HaQLiteInner {
             self.set_conn(Some(arc.clone()));
             return Ok(arc);
         }
-        Err(HaQLiteError::DatabaseError("No write connection available (not leader?)".into()))
+        Err(HaQLiteError::DatabaseError(
+            "No write connection available (not leader?)".into(),
+        ))
     }
 
     /// Start the write-forwarding HTTP server. Only leaders need this.
     /// Followers send writes to the leader; they don't listen.
     async fn start_forwarding_server(self: &Arc<Self>) {
+        let port = match self.forwarding_mode {
+            ForwardingMode::BuiltinHttp { port } => port,
+            ForwardingMode::Disabled => {
+                tracing::debug!(db = %self.db_name, "Forwarding server disabled");
+                return;
+            }
+        };
         let mut handle = self.fwd_handle.lock().await;
         if handle.is_some() {
             return; // Already running
@@ -585,7 +679,7 @@ impl HaQLiteInner {
                 axum::routing::post(forwarding::handle_forwarded_query),
             )
             .with_state(fwd_state);
-        match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", self.forwarding_port)).await {
+        match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await {
             Ok(listener) => {
                 let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
                 tracing::debug!(db = %self.db_name, port, "Forwarding server started");
@@ -656,22 +750,22 @@ impl HaQLiteInner {
     fn fence_connection(&self) {
         if let Ok(Some(conn_arc)) = self.get_conn() {
             let conn = conn_arc.lock();
-                if let Some(ref factory) = self.authorizer {
-                    conn.authorizer(Some(factory(true)));
-                } else {
-                    // Default: read-only allowlist.
-                    conn.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
-                        use rusqlite::hooks::{AuthAction, Authorization};
-                        match ctx.action {
-                            AuthAction::Select
-                            | AuthAction::Read { .. }
-                            | AuthAction::Function { .. }
-                            | AuthAction::Recursive => Authorization::Allow,
-                            _ => Authorization::Deny,
-                        }
-                    }));
-                }
-                tracing::info!("HaQLite: connection fenced (writes blocked)");
+            if let Some(ref factory) = self.authorizer {
+                conn.authorizer(Some(factory(true)));
+            } else {
+                // Default: read-only allowlist.
+                conn.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
+                    use rusqlite::hooks::{AuthAction, Authorization};
+                    match ctx.action {
+                        AuthAction::Select
+                        | AuthAction::Read { .. }
+                        | AuthAction::Function { .. }
+                        | AuthAction::Recursive => Authorization::Allow,
+                        _ => Authorization::Deny,
+                    }
+                }));
+            }
+            tracing::info!("HaQLite: connection fenced (writes blocked)");
         }
     }
 
@@ -682,7 +776,9 @@ impl HaQLiteInner {
             if let Some(ref factory) = self.authorizer {
                 conn.authorizer(Some(factory(false)));
             } else {
-                conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>);
+                conn.authorizer(
+                    None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+                );
             }
             tracing::info!("HaQLite: connection unfenced (writes allowed)");
         }
@@ -696,10 +792,11 @@ impl HaQLiteInner {
         }
     }
 
-    pub(crate) fn get_conn(&self) -> std::result::Result<Option<Arc<Mutex<rusqlite::Connection>>>, HaQLiteError> {
+    pub(crate) fn get_conn(
+        &self,
+    ) -> std::result::Result<Option<Arc<Mutex<rusqlite::Connection>>>, HaQLiteError> {
         Ok(self.conn.load_full())
     }
-
 }
 
 impl HaQLite {
@@ -778,7 +875,7 @@ impl HaQLite {
             schema_sql: None,
             schema_applied: AtomicBool::new(true),
             authorizer,
-            forwarding_port: 0,
+            forwarding_mode: ForwardingMode::Disabled,
             fwd_handle: tokio::sync::Mutex::new(None),
             connection_opener: None,
             on_flush: None,
@@ -812,7 +909,12 @@ impl HaQLite {
         forward_timeout: Duration,
     ) -> Result<HaQLite> {
         Self::from_coordinator_with_secret(
-            coordinator, db_path, schema, forwarding_port, forward_timeout, None,
+            coordinator,
+            db_path,
+            schema,
+            forwarding_port,
+            forward_timeout,
+            None,
         )
         .await
     }
@@ -840,7 +942,9 @@ impl HaQLite {
             &db_name,
             schema,
             &address,
-            forwarding_port,
+            ForwardingMode::BuiltinHttp {
+                port: forwarding_port,
+            },
             forward_timeout,
             secret,
             DEFAULT_READ_CONCURRENCY,
@@ -856,25 +960,35 @@ impl HaQLite {
     /// Execute SQL. Synchronous on the leader (the common path).
     /// On a follower: blocks on HTTP forwarding to the leader.
     /// In shared mode: blocks on lease acquisition + S3 commit.
-    pub fn execute(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    pub fn execute(
+        &self,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> std::result::Result<u64, HaQLiteError> {
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
         match self.inner.mode {
             HaMode::Dedicated => {
                 let role = self.inner.current_role();
                 match role {
-                    Some(Role::Leader) | None => {
-                        self.execute_local_raw(sql, &param_refs)
-                    }
+                    Some(Role::Leader) | None => self.execute_local_raw(sql, &param_refs),
                     Some(Role::Follower) => {
-                        let handle = tokio::runtime::Handle::try_current()
-                            .map_err(|_| HaQLiteError::DatabaseError("execute forwarding requires tokio runtime".into()))?;
-                        tokio::task::block_in_place(|| handle.block_on(self.execute_forwarded(sql, params)))
+                        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+                            HaQLiteError::DatabaseError(
+                                "execute forwarding requires tokio runtime".into(),
+                            )
+                        })?;
+                        tokio::task::block_in_place(|| {
+                            handle.block_on(self.execute_forwarded(sql, params))
+                        })
                     }
                 }
             }
             HaMode::Shared => Err(HaQLiteError::ConfigurationError(
-                "Shared mode not supported in base haqlite. Use the tiered-storage crate.".into())),
+                "Shared mode not supported in base haqlite. Use the tiered-storage crate.".into(),
+            )),
         }
     }
 
@@ -882,7 +996,11 @@ impl HaQLite {
     /// Equivalent to `execute()` but avoids the `block_on` for follower/shared paths.
     ///
     /// The returned future is Send, so it can be used with `tokio::spawn`.
-    pub async fn execute_async(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
+    pub async fn execute_async(
+        &self,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> std::result::Result<u64, HaQLiteError> {
         match self.inner.mode {
             HaMode::Dedicated => {
                 let role = self.inner.current_role();
@@ -890,15 +1008,18 @@ impl HaQLite {
                     Some(Role::Leader) | None => {
                         // param_refs scoped to this synchronous branch only.
                         // Keeping it out of the async scope makes the future Send.
-                        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+                            .iter()
+                            .map(|p| p as &dyn rusqlite::types::ToSql)
+                            .collect();
                         self.execute_local_raw(sql, &param_refs)
                     }
                     Some(Role::Follower) => self.execute_forwarded(sql, params).await,
                 }
             }
             HaMode::Shared => Err(HaQLiteError::ConfigurationError(
-                "Shared mode not supported in base haqlite. Use the tiered-storage crate.".into())),
+                "Shared mode not supported in base haqlite. Use the tiered-storage crate.".into(),
+            )),
         }
     }
 
@@ -930,12 +1051,15 @@ impl HaQLite {
             }
             Some(Role::Follower) => {
                 // Bound concurrent follower reads via semaphore.
-                let _permit = self.inner.read_semaphore.try_acquire()
+                let _permit = self
+                    .inner
+                    .read_semaphore
+                    .try_acquire()
                     .map_err(|e| match e {
                         tokio::sync::TryAcquireError::Closed => HaQLiteError::EngineClosed,
-                        tokio::sync::TryAcquireError::NoPermits => HaQLiteError::DatabaseError(
-                            "Too many concurrent reads".into(),
-                        ),
+                        tokio::sync::TryAcquireError::NoPermits => {
+                            HaQLiteError::DatabaseError("Too many concurrent reads".into())
+                        }
                     })?;
                 // Open fresh plain SQLite connections (walrust applies
                 // LTX files externally, pooled connections hold stale snapshots).
@@ -944,7 +1068,9 @@ impl HaQLite {
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 )
-                .map_err(|e| HaQLiteError::DatabaseError(format!("Failed to open read-only connection: {e}")))?;
+                .map_err(|e| {
+                    HaQLiteError::DatabaseError(format!("Failed to open read-only connection: {e}"))
+                })?;
                 conn.query_row(sql, params, f)
                     .map_err(|e| HaQLiteError::DatabaseError(format!("query_row failed: {e}")))
             }
@@ -952,7 +1078,9 @@ impl HaQLite {
     }
 
     /// Deprecated: use [`query_row_local`] (stale reads ok) or [`query_row_fresh`] (consistency required).
-    #[deprecated(note = "use query_row_local (stale reads ok) or query_row_fresh (consistency required)")]
+    #[deprecated(
+        note = "use query_row_local (stale reads ok) or query_row_fresh (consistency required)"
+    )]
     pub fn query_row<T, F>(
         &self,
         sql: &str,
@@ -971,35 +1099,41 @@ impl HaQLite {
     ///
     /// Returns all matching rows. Each row is a Vec of column values.
     /// Returns an empty Vec if no rows match (not an error).
-    pub fn query_values_local(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
+    pub fn query_values_local(
+        &self,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
         // SqlValue implements ToSql directly (zero-copy, no String/Blob clone).
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
 
-        let query_with = |conn: &rusqlite::Connection| -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
-            let mut stmt = conn
-                .prepare(sql)
-                .map_err(|e| HaQLiteError::DatabaseError(format!("query prepare failed: {e}")))?;
-            let column_count = stmt.column_count();
-            let mut rows_iter = stmt
-                .query(param_refs.as_slice())
-                .map_err(|e| HaQLiteError::DatabaseError(format!("query failed: {e}")))?;
-            let mut rows = Vec::new();
-            while let Some(row) = rows_iter
-                .next()
-                .map_err(|e| HaQLiteError::DatabaseError(format!("row iteration failed: {e}")))?
-            {
-                let mut vals = Vec::with_capacity(column_count);
-                for i in 0..column_count {
-                    let val: rusqlite::types::Value = row
-                        .get(i)
-                        .map_err(|e| HaQLiteError::DatabaseError(format!("column {i} read failed: {e}")))?;
-                    vals.push(SqlValue::from_rusqlite(val));
+        let query_with =
+            |conn: &rusqlite::Connection| -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
+                let mut stmt = conn.prepare(sql).map_err(|e| {
+                    HaQLiteError::DatabaseError(format!("query prepare failed: {e}"))
+                })?;
+                let column_count = stmt.column_count();
+                let mut rows_iter = stmt
+                    .query(param_refs.as_slice())
+                    .map_err(|e| HaQLiteError::DatabaseError(format!("query failed: {e}")))?;
+                let mut rows = Vec::new();
+                while let Some(row) = rows_iter.next().map_err(|e| {
+                    HaQLiteError::DatabaseError(format!("row iteration failed: {e}"))
+                })? {
+                    let mut vals = Vec::with_capacity(column_count);
+                    for i in 0..column_count {
+                        let val: rusqlite::types::Value = row.get(i).map_err(|e| {
+                            HaQLiteError::DatabaseError(format!("column {i} read failed: {e}"))
+                        })?;
+                        vals.push(SqlValue::from_rusqlite(val));
+                    }
+                    rows.push(vals);
                 }
-                rows.push(vals);
-            }
-            Ok(rows)
-        };
+                Ok(rows)
+            };
 
         let role = self.inner.current_role();
         match role {
@@ -1009,27 +1143,38 @@ impl HaQLite {
                 query_with(&conn)
             }
             Some(Role::Follower) => {
-                let _permit = self.inner.read_semaphore.try_acquire()
+                let _permit = self
+                    .inner
+                    .read_semaphore
+                    .try_acquire()
                     .map_err(|e| match e {
                         tokio::sync::TryAcquireError::Closed => HaQLiteError::EngineClosed,
-                        tokio::sync::TryAcquireError::NoPermits => HaQLiteError::DatabaseError(
-                            "Too many concurrent reads".into(),
-                        ),
+                        tokio::sync::TryAcquireError::NoPermits => {
+                            HaQLiteError::DatabaseError("Too many concurrent reads".into())
+                        }
                     })?;
                 let conn = rusqlite::Connection::open_with_flags(
                     &self.inner.db_path,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 )
-                .map_err(|e| HaQLiteError::DatabaseError(format!("Failed to open read-only connection: {e}")))?;
+                .map_err(|e| {
+                    HaQLiteError::DatabaseError(format!("Failed to open read-only connection: {e}"))
+                })?;
                 query_with(&conn)
             }
         }
     }
 
     /// Deprecated: use [`query_values_local`] (stale reads ok) or [`query_values_fresh`] (consistency required).
-    #[deprecated(note = "use query_values_local (stale reads ok) or query_values_fresh (consistency required)")]
-    pub fn query_values(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
+    #[deprecated(
+        note = "use query_values_local (stale reads ok) or query_values_fresh (consistency required)"
+    )]
+    pub fn query_values(
+        &self,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
         self.query_values_local(sql, params)
     }
 
@@ -1056,7 +1201,9 @@ impl HaQLite {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn connection(&self) -> std::result::Result<Arc<Mutex<rusqlite::Connection>>, HaQLiteError> {
+    pub fn connection(
+        &self,
+    ) -> std::result::Result<Arc<Mutex<rusqlite::Connection>>, HaQLiteError> {
         self.inner.ensure_conn()
     }
 
@@ -1105,24 +1252,21 @@ impl HaQLite {
     /// Get metrics in Prometheus exposition format.
     /// Returns None in local mode (no coordinator).
     pub fn prometheus_metrics(&self) -> Option<String> {
-        self.inner
-            .coordinator
-            .as_ref()
-            .map(|c| {
-                let mut output = c.metrics().snapshot().to_prometheus();
-                let caught_up = if self.is_caught_up() { 1 } else { 0 };
-                let position = self.replay_position();
-                output.push_str(&format!(
-                    "\n# HELP haqlite_follower_caught_up Whether follower is caught up (1=yes, 0=no)\n\
+        self.inner.coordinator.as_ref().map(|c| {
+            let mut output = c.metrics().snapshot().to_prometheus();
+            let caught_up = if self.is_caught_up() { 1 } else { 0 };
+            let position = self.replay_position();
+            output.push_str(&format!(
+                "\n# HELP haqlite_follower_caught_up Whether follower is caught up (1=yes, 0=no)\n\
                      # TYPE haqlite_follower_caught_up gauge\n\
                      haqlite_follower_caught_up {}\n\
                      # HELP haqlite_follower_replay_position Current follower replay TXID\n\
                      # TYPE haqlite_follower_replay_position gauge\n\
                      haqlite_follower_replay_position {}\n",
-                    caught_up, position,
-                ));
-                output
-            })
+                caught_up, position,
+            ));
+            output
+        })
     }
 
     /// Graceful leader handoff — release leadership without shutting down.
@@ -1188,7 +1332,10 @@ impl HaQLite {
     /// Read with freshness guarantee: checks manifest and catches up before querying.
     /// In Dedicated mode, this is equivalent to `query_row_local()`.
     pub async fn query_row_fresh<T, F>(
-        &self, sql: &str, params: &[&dyn rusqlite::types::ToSql], f: F,
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::types::ToSql],
+        f: F,
     ) -> std::result::Result<T, HaQLiteError>
     where
         F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
@@ -1198,7 +1345,9 @@ impl HaQLite {
 
     /// Read with freshness guarantee (multi-row version).
     pub async fn query_values_fresh(
-        &self, sql: &str, params: &[SqlValue],
+        &self,
+        sql: &str,
+        params: &[SqlValue],
     ) -> std::result::Result<Vec<Vec<SqlValue>>, HaQLiteError> {
         self.query_values_local(sql, params)
     }
@@ -1218,9 +1367,10 @@ impl HaQLite {
 
         loop {
             if tokio::time::Instant::now() >= deadline {
-                return Err(HaQLiteError::LeaseContention(
-                    format!("could not acquire lease for '{}' within {:?}",
-                        self.inner.db_name, self.inner.write_timeout)));
+                return Err(HaQLiteError::LeaseContention(format!(
+                    "could not acquire lease for '{}' within {:?}",
+                    self.inner.db_name, self.inner.write_timeout
+                )));
             }
 
             let lease_data = serde_json::to_vec(&serde_json::json!({
@@ -1229,7 +1379,8 @@ impl HaQLite {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_millis() as u64,
                 "ttl_secs": self.inner.lease_ttl,
-            })).unwrap_or_default();
+            }))
+            .unwrap_or_default();
 
             match lease_store.read(lease_key).await {
                 Ok(None) => {
@@ -1238,16 +1389,21 @@ impl HaQLite {
                     match result {
                         Ok(cas) if cas.success => return Ok(()),
                         Ok(_) => {} // Someone else created it. Retry.
-                        Err(e) => return Err(HaQLiteError::CoordinatorError(
-                            format!("lease write failed: {}", e))),
+                        Err(e) => {
+                            return Err(HaQLiteError::CoordinatorError(format!(
+                                "lease write failed: {}",
+                                e
+                            )))
+                        }
                     }
                 }
                 Ok(Some((data, etag))) => {
                     let is_ours = serde_json::from_slice::<serde_json::Value>(&data)
                         .map(|j| {
-                            j.get("instance_id").and_then(|v| v.as_str()).unwrap_or("") ==
-                                self.inner.shared_instance_id
-                        }).unwrap_or(false);
+                            j.get("instance_id").and_then(|v| v.as_str()).unwrap_or("")
+                                == self.inner.shared_instance_id
+                        })
+                        .unwrap_or(false);
 
                     if is_ours {
                         return Ok(());
@@ -1259,23 +1415,35 @@ impl HaQLite {
                             let ttl = j.get("ttl_secs").and_then(|v| v.as_u64()).unwrap_or(5);
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default().as_millis() as u64;
+                                .unwrap_or_default()
+                                .as_millis() as u64;
                             now > ts + (ttl * 1000)
-                        }).unwrap_or(true);
+                        })
+                        .unwrap_or(true);
 
                     if expired {
                         // CAS replace the expired lease.
-                        let result = lease_store.write_if_match(lease_key, lease_data, &etag).await;
+                        let result = lease_store
+                            .write_if_match(lease_key, lease_data, &etag)
+                            .await;
                         match result {
                             Ok(cas) if cas.success => return Ok(()),
                             Ok(_) => {} // CAS conflict. Retry.
-                            Err(e) => return Err(HaQLiteError::CoordinatorError(
-                                format!("lease CAS failed: {}", e))),
+                            Err(e) => {
+                                return Err(HaQLiteError::CoordinatorError(format!(
+                                    "lease CAS failed: {}",
+                                    e
+                                )))
+                            }
                         }
                     }
                 }
-                Err(e) => return Err(HaQLiteError::CoordinatorError(
-                    format!("lease read failed: {}", e))),
+                Err(e) => {
+                    return Err(HaQLiteError::CoordinatorError(format!(
+                        "lease read failed: {}",
+                        e
+                    )))
+                }
             }
 
             let backoff = Duration::from_millis(50 * 2u64.pow(attempt.min(4)));
@@ -1284,18 +1452,31 @@ impl HaQLite {
         }
     }
 
-    fn execute_local_raw(&self, sql: &str, params: &[&dyn rusqlite::types::ToSql]) -> std::result::Result<u64, HaQLiteError> {
+    fn execute_local_raw(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::types::ToSql],
+    ) -> std::result::Result<u64, HaQLiteError> {
         let conn_arc = self.inner.ensure_conn()?;
-        let conn = conn_arc.lock();
-        let rows = conn.execute(sql, params)
-            .map_err(|e| HaQLiteError::DatabaseError(format!("execute failed: {e}")))?;
+        let rows = {
+            let conn = conn_arc.lock();
+            conn.execute(sql, params)
+                .map_err(|e| HaQLiteError::DatabaseError(format!("execute failed: {e}")))?
+        };
+        self.flush_turbolite()?;
         Ok(rows as u64)
     }
 
-    fn execute_local(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
+    fn execute_local(
+        &self,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> std::result::Result<u64, HaQLiteError> {
         // SqlValue implements ToSql directly (zero-copy, no String/Blob clone).
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
         self.execute_local_raw(sql, &param_refs)
     }
 
@@ -1311,7 +1492,11 @@ impl HaQLite {
         self.inner.leader_addr()
     }
 
-    async fn execute_forwarded(&self, sql: &str, params: &[SqlValue]) -> std::result::Result<u64, HaQLiteError> {
+    async fn execute_forwarded(
+        &self,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> std::result::Result<u64, HaQLiteError> {
         let body = forwarding::ForwardedExecute {
             sql: sql.to_string(),
             params: params.to_vec(),
@@ -1324,7 +1509,10 @@ impl HaQLite {
         ];
         let mut last_err = String::new();
 
-        for (attempt, backoff) in std::iter::once(&Duration::ZERO).chain(backoffs.iter()).enumerate() {
+        for (attempt, backoff) in std::iter::once(&Duration::ZERO)
+            .chain(backoffs.iter())
+            .enumerate()
+        {
             if attempt > 0 {
                 tokio::time::sleep(*backoff).await;
             }
@@ -1353,12 +1541,11 @@ impl HaQLite {
 
             let status = resp.status();
             if status.is_success() {
-                let result: forwarding::ExecuteResult = resp
-                    .json()
-                    .await
-                    .map_err(|e| HaQLiteError::LeaderResponseParseError(
-                        format!("failed to parse leader response: {e}")
-                    ))?;
+                let result: forwarding::ExecuteResult = resp.json().await.map_err(|e| {
+                    HaQLiteError::LeaderResponseParseError(format!(
+                        "failed to parse leader response: {e}"
+                    ))
+                })?;
                 return Ok(result.rows_affected);
             }
 
@@ -1388,7 +1575,8 @@ impl HaQLite {
             Err(HaQLiteError::NotLeader)
         } else {
             Err(HaQLiteError::LeaderConnectionError(format!(
-                "all {} forwarding attempts failed: {last_err}", backoffs.len() + 1
+                "all {} forwarding attempts failed: {last_err}",
+                backoffs.len() + 1
             )))
         }
     }
@@ -1404,12 +1592,14 @@ pub async fn open_with_coordinator(
     db_name: &str,
     schema: &str,
     address: &str,
-    forwarding_port: u16,
+    forwarding_mode: ForwardingMode,
     forward_timeout: Duration,
     secret: Option<String>,
     read_concurrency: usize,
     authorizer: Option<AuthorizerFactory>,
-    connection_opener: Option<Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>>,
+    connection_opener: Option<
+        Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>,
+    >,
     on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
 ) -> Result<HaQLite> {
     ensure_schema(&db_path, schema)?;
@@ -1418,8 +1608,11 @@ pub async fn open_with_coordinator(
     let role_rx = coordinator.role_events();
 
     // Join the HA cluster.
-    let JoinResult { role: initial_role, caught_up, position } =
-        coordinator.join(db_name, &db_path).await?;
+    let JoinResult {
+        role: initial_role,
+        caught_up,
+        position,
+    } = coordinator.join(db_name, &db_path).await?;
 
     let leader_addr = if initial_role == Role::Leader {
         address.to_string()
@@ -1462,7 +1655,7 @@ pub async fn open_with_coordinator(
         schema_sql: None,
         schema_applied: AtomicBool::new(true),
         authorizer,
-        forwarding_port,
+        forwarding_mode,
         fwd_handle: tokio::sync::Mutex::new(None),
         connection_opener,
         on_flush,
@@ -1592,7 +1785,6 @@ fn open_leader_connection(db_path: &Path) -> Result<rusqlite::Connection> {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")?;
     Ok(conn)
 }
-
 
 /// Parse a URL into base (scheme + host + port + path) and query params.
 struct ParsedUrl {
@@ -1747,14 +1939,41 @@ mod url_parsing_tests {
     }
 }
 
+#[cfg(test)]
+mod forwarding_mode_tests {
+    use super::*;
+
+    #[test]
+    fn forwarding_port_zero_disables_forwarding() {
+        let builder = HaQLite::builder().forwarding_port(0);
+        assert_eq!(builder.get_forwarding_mode(), ForwardingMode::Disabled);
+        assert_eq!(builder.get_forwarding_port(), 0);
+    }
+
+    #[test]
+    fn disable_forwarding_sets_disabled_mode() {
+        let builder = HaQLite::builder().disable_forwarding();
+        assert_eq!(builder.get_forwarding_mode(), ForwardingMode::Disabled);
+        assert_eq!(builder.get_forwarding_port(), 0);
+    }
+
+    #[test]
+    fn explicit_builtin_forwarding_keeps_port() {
+        let builder =
+            HaQLite::builder().forwarding_mode(ForwardingMode::BuiltinHttp { port: 19080 });
+        assert_eq!(
+            builder.get_forwarding_mode(),
+            ForwardingMode::BuiltinHttp { port: 19080 }
+        );
+        assert_eq!(builder.get_forwarding_port(), 19080);
+    }
+}
+
 /// Auto-detect this node's network address for the forwarding server.
 fn detect_address(instance_id: &str, port: u16) -> String {
     // On Fly: use internal DNS.
     if let Ok(app_name) = std::env::var("FLY_APP_NAME") {
-        return format!(
-            "http://{}.vm.{}.internal:{}",
-            instance_id, app_name, port
-        );
+        return format!("http://{}.vm.{}.internal:{}", instance_id, app_name, port);
     }
 
     // Fallback: hostname.

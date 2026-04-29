@@ -1,30 +1,31 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 
-use haqlite::{HaQLite, HaQLiteBuilder, HaQLiteError, SqlValue, AuthorizerFactory};
-use hadb::{Role, LeaseStore};
+use hadb::{LeaseStore, NoOpReplicator, Replicator};
+use haqlite::{ForwardingMode, HaQLite, HaQLiteBuilder};
 use turbodb::ManifestStore;
 use turbolite::tiered::SharedTurboliteVfs;
 
 /// Coordination topology for tiered HA SQLite.
+///
+/// Today only `Writer` (single-writer, lease-protected) ships. The enum is
+/// kept as the future-proof shape for additional coordination topologies
+/// (multi-writer with per-write lease, read-only replica, etc.) — adding a
+/// new variant later is non-breaking, removing the enum and re-introducing
+/// it would force every caller to add a `.mode(...)` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Single writer with lease-per-database (production default).
     /// Maps to haqlite's Dedicated mode.
     Writer,
-    /// Multiple writers with per-write lease acquisition (experimental).
-    /// Maps to haqlite's Shared mode. Requires Cloud durability.
-    MultiWriter,
 }
 
 impl std::fmt::Display for Mode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Mode::Writer => write!(f, "Writer"),
-            Mode::MultiWriter => write!(f, "MultiWriter"),
         }
     }
 }
@@ -32,16 +33,23 @@ impl std::fmt::Display for Mode {
 /// Builder for tiered HA SQLite with turbolite VFS.
 ///
 /// Wraps haqlite's walrust HA layer and injects turbolite for page-level
-/// S3 tiering. Two modes: Writer (Dedicated, default) and MultiWriter
-/// (Shared, experimental).
+/// S3 tiering. Single-writer with lease-protected coordination today; see
+/// [`Mode`] for the topology axis.
 pub struct Builder {
     inner: HaQLiteBuilder,
     mode: Mode,
     turbolite_durability: turbodb::Durability,
     turbolite_http: Option<(String, String)>,
+    manifest_http: Option<(String, String)>,
     turbolite_storage: Option<Arc<dyn hadb_storage::StorageBackend>>,
     turbolite_vfs: Option<(SharedTurboliteVfs, String)>,
     manifest_store: Option<Arc<dyn ManifestStore>>,
+    /// Optional replicator override. When `None`, the open path picks a
+    /// default based on `turbolite_durability`: walrust-backed
+    /// `SqliteReplicator` for `Continuous`/`Checkpoint`, `NoOpReplicator`
+    /// for `Cloud`. Setting this explicitly lets a consumer plug in any
+    /// `hadb::Replicator` impl (test harnesses, alternative WAL shippers).
+    replicator: Option<Arc<dyn Replicator>>,
     rollback_database_id: Option<String>,
     rollback_token: Option<String>,
     rollback_url: Option<String>,
@@ -60,9 +68,11 @@ impl Builder {
             mode: Mode::Writer,
             turbolite_durability: turbodb::Durability::default(),
             turbolite_http: None,
+            manifest_http: None,
             turbolite_storage: None,
             turbolite_vfs: None,
             manifest_store: None,
+            replicator: None,
             rollback_database_id: None,
             rollback_token: None,
             rollback_url: None,
@@ -91,6 +101,16 @@ impl Builder {
 
     pub fn forwarding_port(mut self, port: u16) -> Self {
         self.inner = self.inner.forwarding_port(port);
+        self
+    }
+
+    pub fn forwarding_mode(mut self, mode: ForwardingMode) -> Self {
+        self.inner = self.inner.forwarding_mode(mode);
+        self
+    }
+
+    pub fn disable_forwarding(mut self) -> Self {
+        self.inner = self.inner.disable_forwarding();
         self
     }
 
@@ -125,9 +145,7 @@ impl Builder {
     }
 
     pub fn lease_endpoint(self, endpoint: &str, token: &str) -> Self {
-        let store = Arc::new(
-            hadb_lease_cinch::CinchLeaseStore::new(endpoint, token),
-        );
+        let store = Arc::new(hadb_lease_cinch::CinchLeaseStore::new(endpoint, token));
         self.lease_store(store)
     }
 
@@ -157,15 +175,15 @@ impl Builder {
     }
 
     pub fn manifest_store(mut self, store: Arc<dyn ManifestStore>) -> Self {
+        self.manifest_http = None;
         self.manifest_store = Some(store);
         self
     }
 
-    pub fn manifest_endpoint(self, endpoint: &str, token: &str) -> Self {
-        let store = Arc::new(
-            turbodb_manifest_cinch::CinchManifestStore::new(endpoint, token),
-        );
-        self.manifest_store(store)
+    pub fn manifest_endpoint(mut self, endpoint: &str, token: &str) -> Self {
+        self.manifest_http = Some((endpoint.to_string(), token.to_string()));
+        self.manifest_store = None;
+        self
     }
 
     pub fn walrust_storage(mut self, storage: Arc<dyn hadb_storage::StorageBackend>) -> Self {
@@ -173,10 +191,23 @@ impl Builder {
         self
     }
 
+    /// Inject a custom `hadb::Replicator`. Overrides the durability-driven
+    /// default (walrust `SqliteReplicator` for Continuous/Checkpoint,
+    /// `NoOpReplicator` for Cloud).
+    ///
+    /// Useful for tests, alternative WAL shippers, or consumers that want
+    /// haqlite-turbolite without walrust at all.
+    pub fn replicator(mut self, replicator: Arc<dyn Replicator>) -> Self {
+        self.replicator = Some(replicator);
+        self
+    }
+
     pub fn authorizer<F, G>(mut self, factory: F) -> Self
     where
         F: Fn(bool) -> G + Send + Sync + 'static,
-        G: FnMut(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization + Send + 'static,
+        G: FnMut(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization
+            + Send
+            + 'static,
     {
         self.inner = self.inner.authorizer(factory);
         self
@@ -202,17 +233,8 @@ impl Builder {
     }
 
     pub async fn open(self, db_path: &str, schema: &str) -> Result<HaQLite> {
-        if self.mode == Mode::MultiWriter && !self.turbolite_durability.is_cloud() {
-            return Err(anyhow::anyhow!(
-                "MultiWriter requires Cloud durability"
-            ));
-        }
-
         match self.mode {
             Mode::Writer => self.open_writer(db_path, schema).await,
-            Mode::MultiWriter => {
-                anyhow::bail!("MultiWriter mode not yet implemented in haqlite-turbolite")
-            }
         }
     }
 
@@ -228,14 +250,15 @@ impl Builder {
         // the local cache + SQLite stub before turbolite opens. Requires
         // turbolite_http to be set so we have a storage URL to GET the remote
         // manifest from.
-        if let (Some(ref database_id), Some(ref token)) =
-            (self.rollback_database_id.as_ref(), self.rollback_token.as_ref())
-        {
+        if let (Some(ref database_id), Some(ref token)) = (
+            self.rollback_database_id.as_ref(),
+            self.rollback_token.as_ref(),
+        ) {
             let storage_url = match self.turbolite_http {
                 Some((ref ep, _)) => ep.clone(),
-                None => anyhow::bail!(
-                    "with_rollback_detection requires .turbolite_http() to be set"
-                ),
+                None => {
+                    anyhow::bail!("with_rollback_detection requires .turbolite_http() to be set")
+                }
             };
             let detector = crate::RollbackDetector::new(&storage_url, token);
             detector
@@ -244,59 +267,49 @@ impl Builder {
                 .map_err(|e| anyhow::anyhow!("rollback detection: {e}"))?;
         }
 
-        let instance_id = self.inner.get_instance_id().map(|s| s.to_string()).unwrap_or_else(|| {
-            std::env::var("FLY_MACHINE_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
-        });
-        let address = self.inner.get_address().map(|s| s.to_string()).unwrap_or_else(|| {
-            detect_address(&instance_id, self.inner.get_forwarding_port())
-        });
-
-        // Build walrust storage.
-        let walrust_storage: Arc<dyn hadb_storage::StorageBackend> =
-            if let Some(storage) = self.inner.get_walrust_storage().cloned() {
-                storage
-            } else if let Some((ref ep, ref tok)) = self.turbolite_http {
-                let (fence, _) = haqlite::AtomicFence::new();
-                Arc::new(
-                    hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "wal")
-                        .with_fence(Arc::new(fence)),
-                )
-            } else {
-                anyhow::bail!("Writer mode requires walrust storage. Pass .walrust_storage() or .turbolite_http()")
-            };
-
-        // Resolve sync_interval and skip_snapshot from turbodb durability.
-        // Cloud mode uses journal_mode=DELETE (no WAL), so walrust has nothing
-        // to ship. Use a long interval to avoid burning CPU on an idle loop.
-        let (sync_interval, skip_snapshot) = match self.turbolite_durability {
-            turbodb::Durability::Checkpoint { .. } => (Duration::from_secs(3600), false),
-            turbodb::Durability::Continuous { replication_interval, .. } => (replication_interval, false),
-            turbodb::Durability::Cloud => (Duration::from_secs(3600), true),
+        let instance_id = self
+            .inner
+            .get_instance_id()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                std::env::var("FLY_MACHINE_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
+            });
+        let forwarding_mode = self.inner.get_forwarding_mode();
+        let address = self
+            .inner
+            .get_address()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| match forwarding_mode {
+                ForwardingMode::BuiltinHttp { port } => detect_address(&instance_id, port),
+                ForwardingMode::Disabled => String::new(),
+            });
+        let shared_fence = if self.turbolite_http.is_some() {
+            let (fence, writer) = haqlite::AtomicFence::new();
+            Some((Arc::new(fence), Arc::new(writer)))
+        } else {
+            None
         };
-
-        let snapshot_interval = self.inner.get_coordinator_config()
-            .map(|c| c.snapshot_interval)
-            .unwrap_or(Duration::from_secs(3600));
-        let replication_config = walrust::ReplicationConfig {
-            sync_interval,
-            snapshot_interval,
-            autonomous_snapshots: true,
-            ..Default::default()
-        };
-        let replicator = Arc::new(
-            haqlite::SqliteReplicator::new(walrust_storage.clone(), self.inner.get_prefix(), replication_config)
-                .with_skip_snapshot(skip_snapshot)
-        );
 
         // Build turbolite VFS.
-        let manifest_store: Arc<dyn turbodb::ManifestStore> = self.manifest_store
-            .ok_or_else(|| anyhow::anyhow!("Turbolite-backed Writer mode requires manifest_store()"))?;
+        let manifest_store: Arc<dyn turbodb::ManifestStore> =
+            if let Some(store) = self.manifest_store.clone() {
+                store
+            } else if let Some((ref endpoint, ref token)) = self.manifest_http.clone() {
+                let mut store = turbodb_manifest_cinch::CinchManifestStore::new(endpoint, token);
+                if let Some((fence, _)) = &shared_fence {
+                    store = store.with_fence(fence.clone());
+                }
+                Arc::new(store)
+            } else {
+                anyhow::bail!("Turbolite-backed Writer mode requires manifest_store()");
+            };
 
         let (shared_vfs, vfs_name) = if let Some((ref vfs, ref name)) = self.turbolite_vfs {
             (vfs.clone(), name.clone())
         } else {
             let vfs_name = format!("haqlite_ded_sync_{}", uuid::Uuid::new_v4());
-            let cache_dir = db_path.parent()
+            let cache_dir = db_path
+                .parent()
                 .unwrap_or_else(|| std::path::Path::new("/tmp"))
                 .join(format!(".tl_cache_{}", db_name));
             std::fs::create_dir_all(&cache_dir)?;
@@ -310,10 +323,12 @@ impl Builder {
             };
             let rt_handle = tokio::runtime::Handle::current();
             let vfs = if let Some((ref ep, ref tok)) = self.turbolite_http {
-                let (fence, _) = haqlite::AtomicFence::new();
+                let fence = shared_fence
+                    .as_ref()
+                    .map(|(fence, _)| fence.clone())
+                    .expect("turbolite_http implies shared fence");
                 let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(
-                    hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "pages")
-                        .with_fence(Arc::new(fence)),
+                    hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "pages").with_fence(fence),
                 );
                 turbolite::tiered::TurboliteVfs::with_backend(tl_config, storage, rt_handle)
                     .map_err(|e| anyhow::anyhow!("turbolite VFS (HTTP): {e}"))?
@@ -329,18 +344,136 @@ impl Builder {
             (shared_vfs, vfs_name)
         };
 
+        let walrust_storage: Option<Arc<dyn hadb_storage::StorageBackend>> =
+            match self.turbolite_durability {
+                turbodb::Durability::Continuous { .. } => {
+                    let storage: Arc<dyn hadb_storage::StorageBackend> =
+                        if let Some(storage) = self.inner.get_walrust_storage().cloned() {
+                            storage
+                        } else if let Some((ref ep, ref tok)) = self.turbolite_http {
+                            let fence = shared_fence
+                                .as_ref()
+                                .map(|(fence, _)| fence.clone())
+                                .expect("turbolite_http implies shared fence");
+                            Arc::new(
+                                hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "wal")
+                                    .with_fence(fence),
+                            )
+                        } else {
+                            anyhow::bail!(
+                                "Continuous durability requires walrust storage. \
+                                 Pass .walrust_storage(), .turbolite_http(), or .replicator()."
+                            );
+                        };
+                    Some(storage)
+                }
+                turbodb::Durability::Checkpoint { .. } | turbodb::Durability::Cloud => None,
+            };
+
+        // Pick replicator. Three sources, in priority order:
+        // 1. Caller-supplied via `.replicator(...)` (test harnesses, alt WAL shippers).
+        // 2. `Cloud` durability → `NoOpReplicator`.
+        // 3. `Checkpoint` / `Continuous` → Turbolite-owned base state, with
+        //    optional walrust delta shipping in `Continuous`.
+        let replicator: Arc<dyn Replicator> = if let Some(r) = self.replicator.clone() {
+            r
+        } else {
+            match self.turbolite_durability {
+                turbodb::Durability::Cloud => Arc::new(NoOpReplicator::new()),
+                turbodb::Durability::Checkpoint { .. } => Arc::new(
+                    crate::TurboliteReplicator::new(
+                        shared_vfs.clone(),
+                        manifest_store.clone(),
+                        self.inner.get_prefix(),
+                        &db_name,
+                    )
+                    .with_writer_id(instance_id.clone()),
+                ),
+                turbodb::Durability::Continuous {
+                    replication_interval,
+                    ..
+                } => {
+                    let snapshot_interval = self
+                        .inner
+                        .get_coordinator_config()
+                        .map(|c| c.snapshot_interval)
+                        .unwrap_or(Duration::from_secs(3600));
+                    let delta_replicator =
+                        Arc::new(haqlite::ExternalSnapshotSqliteReplicator::new(
+                            walrust_storage
+                                .as_ref()
+                                .expect("continuous durability validated walrust storage")
+                                .clone(),
+                            self.inner.get_prefix(),
+                            walrust::ReplicationConfig {
+                                sync_interval: replication_interval,
+                                snapshot_interval,
+                                autonomous_snapshots: false,
+                                ..Default::default()
+                            },
+                            Arc::new(turbolite::tiered::TurboliteSnapshotSource::new(
+                                shared_vfs.clone(),
+                            )),
+                        )?);
+                    Arc::new(crate::TurboliteWalReplicator::new(
+                        shared_vfs.clone(),
+                        manifest_store.clone(),
+                        self.inner.get_prefix(),
+                        &db_name,
+                        instance_id.clone(),
+                        self.inner.get_prefix().to_string(),
+                        walrust_storage
+                            .as_ref()
+                            .expect("continuous durability validated walrust storage")
+                            .clone(),
+                        delta_replicator,
+                    ))
+                }
+            }
+        };
+
         let manifest_wakeup = Arc::new(tokio::sync::Notify::new());
-        let follower_behavior: Arc<dyn hadb::FollowerBehavior> = Arc::new(
-            crate::TurboliteFollowerBehavior::new(shared_vfs.clone())
-                .with_wakeup(manifest_wakeup)
-        );
+        let follower_behavior: Arc<dyn hadb::FollowerBehavior> = {
+            let mut behavior = crate::TurboliteFollowerBehavior::new(shared_vfs.clone())
+                .with_wakeup(manifest_wakeup);
+            match self.turbolite_durability {
+                turbodb::Durability::Cloud => {}
+                turbodb::Durability::Checkpoint { .. } => {
+                    behavior = behavior.with_manifest_store(
+                        manifest_store.clone(),
+                        format!("{}{}/_manifest", self.inner.get_prefix(), db_name),
+                    );
+                }
+                turbodb::Durability::Continuous { .. } => {
+                    behavior = behavior
+                        .with_manifest_store(
+                            manifest_store.clone(),
+                            format!("{}{}/_manifest", self.inner.get_prefix(), db_name),
+                        )
+                        .with_walrust(
+                            walrust_storage
+                                .as_ref()
+                                .expect("continuous durability validated walrust storage")
+                                .clone(),
+                            self.inner.get_prefix().to_string(),
+                        );
+                }
+            }
+            Arc::new(behavior)
+        };
 
         // Build lease store and coordinator config.
-        let lease_store: Arc<dyn hadb::LeaseStore> = self.inner.get_lease_store()
+        let lease_store: Arc<dyn hadb::LeaseStore> = self
+            .inner
+            .get_lease_store()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("lease_store() required"))?;
 
-        let mut config = self.inner.get_coordinator_config().cloned().unwrap_or_default();
+        let mut config = self
+            .inner
+            .get_coordinator_config()
+            .cloned()
+            .unwrap_or_default();
         let mut lease_cfg = match config.lease.take() {
             Some(mut existing) => {
                 existing.store = lease_store.clone();
@@ -348,7 +481,9 @@ impl Builder {
                 existing.address = address.clone();
                 existing
             }
-            None => haqlite::LeaseConfig::new(lease_store.clone(), instance_id.clone(), address.clone()),
+            None => {
+                haqlite::LeaseConfig::new(lease_store.clone(), instance_id.clone(), address.clone())
+            }
         };
         if let Some(ttl) = self.inner.get_lease_ttl() {
             lease_cfg.ttl_secs = ttl;
@@ -360,14 +495,14 @@ impl Builder {
             lease_cfg.follower_poll_interval = d;
         }
         config.lease = Some(lease_cfg);
-        if self.turbolite_http.is_some() {
-            let fence_writer = Arc::new(haqlite::AtomicFence::new().1);
+        if let Some((_, fence_writer)) = shared_fence {
             config.fence_writer = Some(fence_writer);
         }
 
+        let replicator_for_flush = replicator.clone();
         let coordinator = haqlite::Coordinator::new(
             replicator,
-            Some(manifest_store.clone()),
+            None,
             None,
             follower_behavior,
             self.inner.get_prefix(),
@@ -377,37 +512,55 @@ impl Builder {
         // Build connection opener for turbolite VFS.
         let vfs_name_for_opener = vfs_name.clone();
         let db_name_for_opener = db_name.clone();
-        let db_filename = db_path.file_name()
+        let db_filename = db_path
+            .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| db_name.clone());
         let is_cloud = self.turbolite_durability.is_cloud();
-        let connection_opener: Arc<dyn Fn() -> Result<rusqlite::Connection, haqlite::HaQLiteError> + Send + Sync> =
-            Arc::new(move || {
-                let vfs_uri = format!("file:{}?vfs={}", db_filename, vfs_name_for_opener);
-                let conn = rusqlite::Connection::open_with_flags(
-                    &vfs_uri,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                        | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-                ).map_err(|e| haqlite::HaQLiteError::DatabaseError(
-                    format!("turbolite conn open for '{}': {}", db_name_for_opener, e)
-                ))?;
-                // Apply pragmas based on durability.
-                if is_cloud {
-                    conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;")
+        let connection_opener: Arc<
+            dyn Fn() -> Result<rusqlite::Connection, haqlite::HaQLiteError> + Send + Sync,
+        > = Arc::new(move || {
+            let vfs_uri = format!("file:{}?vfs={}", db_filename, vfs_name_for_opener);
+            let conn = rusqlite::Connection::open_with_flags(
+                &vfs_uri,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
+            .map_err(|e| {
+                haqlite::HaQLiteError::DatabaseError(format!(
+                    "turbolite conn open for '{}': {}",
+                    db_name_for_opener, e
+                ))
+            })?;
+            // Apply pragmas based on durability.
+            if is_cloud {
+                conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;")
                         .map_err(|e| haqlite::HaQLiteError::DatabaseError(format!("journal pragma: {e}")))?;
-                } else {
-                    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")
+            } else {
+                conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")
                         .map_err(|e| haqlite::HaQLiteError::DatabaseError(format!("journal pragma: {e}")))?;
-                }
-                Ok(conn)
-            });
+            }
+            Ok(conn)
+        });
 
-        let shared_vfs_for_flush = shared_vfs.clone();
-        let on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>> = Some(Arc::new(move || {
-            shared_vfs_for_flush.flush_to_storage()
-                .map_err(|e| anyhow::anyhow!("turbolite flush: {e}"))
-        }));
+        let db_name_for_flush = db_name.clone();
+        let flush_runtime = tokio::runtime::Handle::current();
+        let on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>> =
+            Some(Arc::new(move || {
+                let replicator = replicator_for_flush.clone();
+                let db_name = db_name_for_flush.clone();
+                flush_runtime.spawn(async move {
+                    if let Err(e) = replicator.sync(&db_name).await {
+                        tracing::error!(
+                            "haqlite-turbolite: background sync/publish failed for '{}': {}",
+                            db_name,
+                            e
+                        );
+                    }
+                });
+                Ok(())
+            }));
 
         haqlite::database::open_with_coordinator(
             coordinator,
@@ -415,7 +568,7 @@ impl Builder {
             &db_name,
             schema,
             &address,
-            self.inner.get_forwarding_port(),
+            forwarding_mode,
             self.inner.get_forward_timeout(),
             self.inner.get_secret().map(|s| s.to_string()),
             self.inner.get_read_concurrency(),

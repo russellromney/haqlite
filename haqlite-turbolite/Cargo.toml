@@ -22,7 +22,7 @@ turbodb = { path = "../../hadb/turbodb", version = "0.4.0" }
 turbodb-manifest-cinch = { path = "../../hadb/turbodb-manifest-cinch", version = "0.4.0" }
 
 # Turbolite VFS
-turbolite = { path = "../../turbolite", version = "0.4.0", features = ["zstd"] }
+turbolite = { path = "../../turbolite", version = "0.4.0", features = ["zstd", "wal"] }
 
 # WAL sync (walrust is always present for Continuous/Checkpoint paths)
 walrust = { path = "../../walrust/crates/walrust-core", version = "0.3.1" }

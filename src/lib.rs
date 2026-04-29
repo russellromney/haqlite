@@ -34,20 +34,19 @@ pub mod replicator;
 pub mod serve;
 
 // Re-export HaQLite as the primary API.
-pub use database::{AuthorizerFactory, HaQLite, HaQLiteBuilder};
-pub use hadb::{Durability, HaMode, validate_mode_durability};
-pub use error::HaQLiteError;
 pub use client::{HaQLiteClient, HaQLiteClientBuilder};
+pub use database::{AuthorizerFactory, ForwardingMode, HaQLite, HaQLiteBuilder};
+pub use error::HaQLiteError;
 pub use forwarding::SqlValue;
+pub use hadb::{validate_mode_durability, Durability, HaMode};
 
 // Re-export rusqlite for query params.
 pub use rusqlite;
 
 // Re-export hadb types.
 pub use hadb::{
-    Coordinator, CoordinatorConfig, HaMetrics,
-    InMemoryLeaseStore, JoinResult, LeaseConfig, LeaseData, LeaseStore, MetricsSnapshot,
-    NodeRegistration, NodeRegistry, Role, RoleEvent,
+    Coordinator, CoordinatorConfig, HaMetrics, InMemoryLeaseStore, JoinResult, LeaseConfig,
+    LeaseData, LeaseStore, MetricsSnapshot, NodeRegistration, NodeRegistry, Role, RoleEvent,
 };
 
 // Re-export hadb-lease-s3 implementations.
@@ -58,9 +57,9 @@ pub use hadb_lease_cinch::{AtomicFence, AtomicFenceWriter, CinchLeaseStore};
 
 // Re-export SQLite-specific implementations.
 pub use follower_behavior::SqliteFollowerBehavior;
-pub use replicator::SqliteReplicator;
+pub use replicator::{ExternalSnapshotSqliteReplicator, SqliteReplicator};
 
 // Re-export walrust's WAL replication config so downstream crates don't need
 // a direct walrust dep. The storage trait is *not* re-exported — consumers
 // import `hadb_storage::StorageBackend` directly.
-pub use walrust::ReplicationConfig;
+pub use walrust::{ReplicationConfig, SnapshotOwnership};
