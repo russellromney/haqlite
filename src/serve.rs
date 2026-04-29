@@ -18,7 +18,7 @@ use hadb::{CoordinatorConfig, Role};
 use hadb_cli::SharedConfig;
 
 use crate::cli_config::ServeConfig;
-use crate::database::{HaQLite, HaMode};
+use crate::database::{HaMode, HaQLite};
 
 /// Shared state for HTTP handlers.
 pub struct AppState {
@@ -135,10 +135,12 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
             s3b = s3b.endpoint_url(ep);
         }
         let client = aws_sdk_s3::Client::from_conf(s3b.build());
-        let lease: std::sync::Arc<dyn hadb::LeaseStore> = std::sync::Arc::new(
-            crate::S3LeaseStore::new(client, shared.s3.bucket.clone())
+        let lease: std::sync::Arc<dyn hadb::LeaseStore> =
+            std::sync::Arc::new(crate::S3LeaseStore::new(client, shared.s3.bucket.clone()));
+        info!(
+            "Phase Lucid: using S3 lease store from CLI args (bucket={})",
+            shared.s3.bucket
         );
-        info!("Phase Lucid: using S3 lease store from CLI args (bucket={})", shared.s3.bucket);
         builder = builder.lease_store(lease);
     }
 
@@ -175,11 +177,8 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
     });
 
     // Build hrana protocol router (libSQL HTTP API).
-    let hrana_router = crate::hrana::build_hrana_router(
-        db.clone(),
-        serve.db_path.clone(),
-        serve.secret.clone(),
-    );
+    let hrana_router =
+        crate::hrana::build_hrana_router(db.clone(), serve.db_path.clone(), serve.secret.clone());
 
     // HTTP API server.
     // /health is unauthenticated (load balancer probes).
@@ -224,7 +223,10 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
 // ============================================================================
 
 /// Check bearer token auth. Returns Ok(()) if no secret configured or token matches.
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+fn check_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let secret = match &state.secret {
         Some(s) => s,
         None => return Ok(()),
@@ -235,9 +237,12 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, 
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "missing Authorization header"))?;
 
-    let token = header
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "invalid Authorization format (expected 'Bearer <token>')"))?;
+    let token = header.strip_prefix("Bearer ").ok_or_else(|| {
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid Authorization format (expected 'Bearer <token>')",
+        )
+    })?;
 
     if token != secret {
         return Err(error_response(StatusCode::UNAUTHORIZED, "invalid token"));
@@ -284,11 +289,13 @@ async fn handle_metrics(
             let snap = c.metrics().snapshot();
             let value = serde_json::to_value(snap).map_err(|e| {
                 error!("metrics serialization failed: {e}");
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, "metrics serialization failed")
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "metrics serialization failed",
+                )
             })?;
             Ok(Json(value))
         }
         None => Ok(Json(serde_json::json!({}))),
     }
 }
-

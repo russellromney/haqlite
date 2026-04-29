@@ -129,18 +129,15 @@ async fn handle_write(
         .ok_or(StatusCode::BAD_REQUEST)?;
     let seq = body.get("seq").and_then(|v| v.as_i64()).unwrap_or(0);
 
-    match state
-        .db
-        .execute(
-            "INSERT OR REPLACE INTO test_data (id, value, writer, seq) VALUES (?1, ?2, ?3, ?4)",
-            &[
-                SqlValue::Text(id.into()),
-                SqlValue::Text(value.into()),
-                SqlValue::Text(state.instance_id.clone()),
-                SqlValue::Integer(seq),
-            ],
-        )
-    {
+    match state.db.execute(
+        "INSERT OR REPLACE INTO test_data (id, value, writer, seq) VALUES (?1, ?2, ?3, ?4)",
+        &[
+            SqlValue::Text(id.into()),
+            SqlValue::Text(value.into()),
+            SqlValue::Text(state.instance_id.clone()),
+            SqlValue::Integer(seq),
+        ],
+    ) {
         Ok(rows) => Ok(Json(
             serde_json::json!({"ok": true, "rows_affected": rows, "node": state.instance_id}),
         )),
@@ -168,9 +165,7 @@ async fn handle_execute(
             .iter()
             .map(|v| match v {
                 serde_json::Value::String(s) => SqlValue::Text(s.clone()),
-                serde_json::Value::Number(n) => {
-                    SqlValue::Integer(n.as_i64().unwrap_or(0))
-                }
+                serde_json::Value::Number(n) => SqlValue::Integer(n.as_i64().unwrap_or(0)),
                 serde_json::Value::Null => SqlValue::Null,
                 _ => SqlValue::Text(v.to_string()),
             })
@@ -180,7 +175,9 @@ async fn handle_execute(
 
     match state.db.execute(sql, &params) {
         Ok(rows) => Ok(Json(serde_json::json!({"ok": true, "rows_affected": rows}))),
-        Err(e) => Ok(Json(serde_json::json!({"ok": false, "error": format!("{}", e)}))),
+        Err(e) => Ok(Json(
+            serde_json::json!({"ok": false, "error": format!("{}", e)}),
+        )),
     }
 }
 
@@ -222,14 +219,10 @@ async fn handle_query(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let sql = params.get("sql").ok_or(StatusCode::BAD_REQUEST)?;
-    let rows = state
-        .db
-        .query_values_fresh(sql, &[])
-        .await
-        .map_err(|e| {
-            error!("Query failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let rows = state.db.query_values_fresh(sql, &[]).await.map_err(|e| {
+        error!("Query failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let data: Vec<Vec<serde_json::Value>> = rows
         .iter()
@@ -264,7 +257,9 @@ async fn handle_count(
         })
         .unwrap_or(0);
 
-    Ok(Json(serde_json::json!({"count": count, "node": state.instance_id})))
+    Ok(Json(
+        serde_json::json!({"count": count, "node": state.instance_id}),
+    ))
 }
 
 /// GET /verify -- check data integrity (gaps, duplicates).
@@ -273,10 +268,7 @@ async fn handle_verify(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let rows = state
         .db
-        .query_values_fresh(
-            "SELECT id, value, writer FROM test_data ORDER BY id",
-            &[],
-        )
+        .query_values_fresh("SELECT id, value, writer FROM test_data ORDER BY id", &[])
         .await
         .map_err(|e| {
             error!("Verify failed: {}", e);
@@ -303,9 +295,7 @@ async fn handle_verify(
 }
 
 /// GET /dump -- return all rows (fresh read).
-async fn handle_dump(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+async fn handle_dump(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
     let rows = state
         .db
         .query_values_fresh(
@@ -339,7 +329,11 @@ async fn handle_dump(
 async fn handle_status(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let role = state.db.role().map(|r| format!("{}", r)).unwrap_or_else(|| "none".to_string());
+    let role = state
+        .db
+        .role()
+        .map(|r| format!("{}", r))
+        .unwrap_or_else(|| "none".to_string());
 
     let count = state
         .db
@@ -347,7 +341,13 @@ async fn handle_status(
         .await
         .ok()
         .and_then(|rows| rows.first().and_then(|r| r.first().cloned()))
-        .and_then(|v| if let SqlValue::Integer(n) = v { Some(n) } else { None })
+        .and_then(|v| {
+            if let SqlValue::Integer(n) = v {
+                Some(n)
+            } else {
+                None
+            }
+        })
         .unwrap_or(0);
 
     Ok(Json(serde_json::json!({
@@ -360,9 +360,7 @@ async fn handle_status(
 }
 
 /// GET /health
-async fn handle_health(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+async fn handle_health(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"ok": true, "node": state.instance_id}))
 }
 
@@ -405,9 +403,10 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let instance_id = args.instance.clone().unwrap_or_else(|| {
-        format!("node-{}", args.port)
-    });
+    let instance_id = args
+        .instance
+        .clone()
+        .unwrap_or_else(|| format!("node-{}", args.port));
 
     let mode = match args.topology.as_str() {
         "dedicated" => HaMode::Dedicated,
@@ -422,10 +421,18 @@ async fn main() -> Result<()> {
         .lease_ttl(args.lease_ttl);
 
     match args.durability.as_str() {
-        "replicated" => { builder = builder.durability(hadb::Durability::Replicated(Duration::from_secs(1))); }
-        "checkpoint" => { builder = builder.durability(hadb::Durability::Local); }
-        "continuous" => { builder = builder.durability(hadb::Durability::Replicated(Duration::from_secs(1))); }
-        "cloud" => { builder = builder.durability(hadb::Durability::SyncReplicated); }
+        "replicated" => {
+            builder = builder.durability(hadb::Durability::Replicated(Duration::from_secs(1)));
+        }
+        "checkpoint" => {
+            builder = builder.durability(hadb::Durability::Local);
+        }
+        "continuous" => {
+            builder = builder.durability(hadb::Durability::Replicated(Duration::from_secs(1)));
+        }
+        "cloud" => {
+            builder = builder.durability(hadb::Durability::SyncReplicated);
+        }
         other => anyhow::bail!(
             "unknown durability: {} (expected: replicated, checkpoint, continuous, cloud)",
             other
@@ -471,7 +478,9 @@ async fn main() -> Result<()> {
             // --renew-interval-ms and --follower-poll-ms are Dedicated-only and
             // flow through the dedicated builder setters.
             let coordinator_config = haqlite::CoordinatorConfig {
-                durability: hadb::Durability::Replicated(std::time::Duration::from_millis(args.sync_interval_ms)),
+                durability: hadb::Durability::Replicated(std::time::Duration::from_millis(
+                    args.sync_interval_ms,
+                )),
                 follower_pull_interval: std::time::Duration::from_millis(args.follower_pull_ms),
                 lease: None,
                 ..Default::default()
@@ -482,7 +491,9 @@ async fn main() -> Result<()> {
                 .address(&address)
                 .coordinator_config(coordinator_config)
                 .lease_renew_interval(std::time::Duration::from_millis(args.renew_interval_ms))
-                .lease_follower_poll_interval(std::time::Duration::from_millis(args.follower_poll_ms));
+                .lease_follower_poll_interval(std::time::Duration::from_millis(
+                    args.follower_poll_ms,
+                ));
         }
         HaMode::Shared => {
             builder = builder.write_timeout(std::time::Duration::from_secs(args.write_timeout));
@@ -562,8 +573,7 @@ async fn main() -> Result<()> {
 
     let server = axum::serve(listener, app);
 
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         _ = sigterm.recv() => info!("Received SIGTERM"),
         _ = tokio::signal::ctrl_c() => info!("Received SIGINT"),

@@ -188,10 +188,8 @@ impl HaQLiteClient {
             params: params.to_vec(),
         };
 
-        let result: forwarding::ExecuteResult = self
-            .ha_client
-            .forward("/haqlite/execute", &body)
-            .await?;
+        let result: forwarding::ExecuteResult =
+            self.ha_client.forward("/haqlite/execute", &body).await?;
 
         Ok(result.rows_affected)
     }
@@ -210,10 +208,8 @@ impl HaQLiteClient {
             params: params.to_vec(),
         };
 
-        let result: forwarding::QueryResult = self
-            .ha_client
-            .forward("/haqlite/query", &body)
-            .await?;
+        let result: forwarding::QueryResult =
+            self.ha_client.forward("/haqlite/query", &body).await?;
 
         Ok(result.rows)
     }
@@ -258,8 +254,10 @@ impl HaQLiteClient {
         )
         .map_err(|e| anyhow!("Failed to open read-replica DB: {}", e))?;
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
 
         let mut stmt = conn
             .prepare(sql)

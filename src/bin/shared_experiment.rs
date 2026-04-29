@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
 
-use haqlite::{Durability, HaQLite, HaMode, SqlValue};
+use haqlite::{Durability, HaMode, HaQLite, SqlValue};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS test_data (
     id TEXT PRIMARY KEY,
@@ -81,18 +81,27 @@ async fn handle_write(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let id = body.get("id").and_then(|v| v.as_str())
+    let id = body
+        .get("id")
+        .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
-    let value = body.get("value").and_then(|v| v.as_str())
+    let value = body
+        .get("value")
+        .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
 
     match state.db.execute(
         "INSERT OR REPLACE INTO test_data (id, value, writer) VALUES (?1, ?2, ?3)",
-        &[SqlValue::Text(id.into()), SqlValue::Text(value.into()),
-          SqlValue::Text(state.instance_id.clone())],
+        &[
+            SqlValue::Text(id.into()),
+            SqlValue::Text(value.into()),
+            SqlValue::Text(state.instance_id.clone()),
+        ],
     ) {
         Ok(rows) => Ok(Json(serde_json::json!({"ok": true, "rows_affected": rows}))),
-        Err(e) => Ok(Json(serde_json::json!({"ok": false, "error": format!("{}", e)}))),
+        Err(e) => Ok(Json(
+            serde_json::json!({"ok": false, "error": format!("{}", e)}),
+        )),
     }
 }
 
@@ -102,10 +111,14 @@ async fn handle_read(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let id = params.get("id").ok_or(StatusCode::BAD_REQUEST)?;
-    let rows = state.db.query_values_fresh(
-        "SELECT id, value, writer, created_at FROM test_data WHERE id = ?1",
-        &[SqlValue::Text(id.clone())],
-    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = state
+        .db
+        .query_values_fresh(
+            "SELECT id, value, writer, created_at FROM test_data WHERE id = ?1",
+            &[SqlValue::Text(id.clone())],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if let Some(row) = rows.first() {
         Ok(Json(serde_json::json!({
@@ -124,13 +137,22 @@ async fn handle_read(
 async fn handle_count(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let rows = state.db.query_values_fresh(
-        "SELECT COUNT(*) FROM test_data", &[],
-    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = state
+        .db
+        .query_values_fresh("SELECT COUNT(*) FROM test_data", &[])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let count = rows.first()
+    let count = rows
+        .first()
         .and_then(|r| r.first())
-        .and_then(|v| if let SqlValue::Integer(n) = v { Some(*n) } else { None })
+        .and_then(|v| {
+            if let SqlValue::Integer(n) = v {
+                Some(*n)
+            } else {
+                None
+            }
+        })
         .unwrap_or(0);
 
     Ok(Json(serde_json::json!({"count": count})))
@@ -140,9 +162,11 @@ async fn handle_count(
 async fn handle_verify(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let rows = state.db.query_values_fresh(
-        "SELECT id, value, writer FROM test_data ORDER BY id", &[],
-    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = state
+        .db
+        .query_values_fresh("SELECT id, value, writer FROM test_data ORDER BY id", &[])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let count = rows.len();
 
@@ -151,7 +175,9 @@ async fn handle_verify(
     let mut duplicates = 0;
     for row in &rows {
         if let SqlValue::Text(id) = &row[0] {
-            if !ids.insert(id.clone()) { duplicates += 1; }
+            if !ids.insert(id.clone()) {
+                duplicates += 1;
+            }
         }
     }
 
@@ -164,20 +190,26 @@ async fn handle_verify(
 }
 
 /// GET /dump — return all rows (fresh read).
-async fn handle_dump(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let rows = state.db.query_values_fresh(
-        "SELECT id, value, writer, created_at FROM test_data ORDER BY id", &[],
-    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+async fn handle_dump(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let rows = state
+        .db
+        .query_values_fresh(
+            "SELECT id, value, writer, created_at FROM test_data ORDER BY id",
+            &[],
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let data: Vec<serde_json::Value> = rows.iter().map(|row| {
-        serde_json::json!({
-            "id": row.get(0).map(|v| format!("{:?}", v)).unwrap_or_default(),
-            "value": row.get(1).map(|v| format!("{:?}", v)).unwrap_or_default(),
-            "writer": row.get(2).map(|v| format!("{:?}", v)).unwrap_or_default(),
+    let data: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get(0).map(|v| format!("{:?}", v)).unwrap_or_default(),
+                "value": row.get(1).map(|v| format!("{:?}", v)).unwrap_or_default(),
+                "writer": row.get(2).map(|v| format!("{:?}", v)).unwrap_or_default(),
+            })
         })
-    }).collect();
+        .collect();
 
     Ok(Json(serde_json::json!({"rows": data, "count": rows.len()})))
 }
@@ -196,14 +228,17 @@ struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let args = Args::parse();
-    let instance_id = args.instance.clone().unwrap_or_else(|| {
-        format!("node-{}", args.port)
-    });
+    let instance_id = args
+        .instance
+        .clone()
+        .unwrap_or_else(|| format!("node-{}", args.port));
 
     match args.durability.as_str() {
         "cloud" => {}
@@ -235,12 +270,17 @@ async fn main() -> Result<()> {
     }
 
     let db = Arc::new(
-        builder.open(args.db.to_str().expect("path"), SCHEMA).await?,
+        builder
+            .open(args.db.to_str().expect("path"), SCHEMA)
+            .await?,
     );
 
     info!("Database opened. Ready for writes.");
 
-    let state = AppState { db, instance_id: instance_id.clone() };
+    let state = AppState {
+        db,
+        instance_id: instance_id.clone(),
+    };
 
     let app = axum::Router::new()
         .route("/write", post(handle_write))

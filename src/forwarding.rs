@@ -93,7 +93,9 @@ fn check_auth(state: &ForwardingState, headers: &HeaderMap) -> Result<(), Status
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    let token = header.strip_prefix("Bearer ").ok_or(StatusCode::UNAUTHORIZED)?;
+    let token = header
+        .strip_prefix("Bearer ")
+        .ok_or(StatusCode::UNAUTHORIZED)?;
     if token != secret {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -121,15 +123,16 @@ pub(crate) async fn handle_forwarded_execute(
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let conn = conn_arc.lock();
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        req.params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = req
+        .params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
 
-    let rows_affected = conn
-        .execute(&req.sql, param_refs.as_slice())
-        .map_err(|e| {
-            tracing::error!("Forwarded execute failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let rows_affected = conn.execute(&req.sql, param_refs.as_slice()).map_err(|e| {
+        tracing::error!("Forwarded execute failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(Json(ExecuteResult {
         rows_affected: rows_affected as u64,
@@ -165,8 +168,11 @@ pub(crate) async fn handle_forwarded_query(
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let conn = conn_arc.lock();
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        req.params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = req
+        .params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let mut stmt = conn.prepare(&req.sql).map_err(|e| {
         tracing::error!("Forwarded query prepare failed: {}", e);

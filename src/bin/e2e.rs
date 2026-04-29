@@ -87,7 +87,11 @@ struct WriteRecord {
 }
 
 fn op_name(op: &WriteOp) -> &str {
-    match op { WriteOp::Insert { .. } => "insert", WriteOp::Update { .. } => "update", WriteOp::Delete { .. } => "delete" }
+    match op {
+        WriteOp::Insert { .. } => "insert",
+        WriteOp::Update { .. } => "update",
+        WriteOp::Delete { .. } => "delete",
+    }
 }
 
 /// Open a haqlite node using the PUBLIC API -- same as a user would.
@@ -111,7 +115,9 @@ async fn open_node(
         builder = builder.endpoint(ep);
     }
 
-    Ok(builder.open(db_path.to_str().expect("path"), SCHEMA).await?)
+    Ok(builder
+        .open(db_path.to_str().expect("path"), SCHEMA)
+        .await?)
 }
 
 /// Run a single worker: open, mix of inserts/updates/deletes, reads, close.
@@ -123,8 +129,10 @@ async fn run_worker(
 ) -> Vec<WriteRecord> {
     let instance_id = format!("worker-{}", worker_id);
     let n = WORKER_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .expect("time").as_nanos();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
     let tmp = std::env::temp_dir().join(format!("haqlite_e2e_{}_{}", ts, n));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("create dir");
@@ -148,26 +156,43 @@ async fn run_worker(
             WriteOp::Insert { id, payload }
         } else if seq % 5 == 3 && !my_ids.is_empty() {
             let id = my_ids[seq % my_ids.len()].clone();
-            WriteOp::Update { id, new_payload: format!("upd_{}_{}", instance_id, seq) }
+            WriteOp::Update {
+                id,
+                new_payload: format!("upd_{}_{}", instance_id, seq),
+            }
         } else if !my_ids.is_empty() {
-            WriteOp::Delete { id: my_ids.remove(0) }
+            WriteOp::Delete {
+                id: my_ids.remove(0),
+            }
         } else {
             let id = format!("{}-{}", instance_id, seq);
-            WriteOp::Insert { id, payload: format!("data_{}_{}", instance_id, seq) }
+            WriteOp::Insert {
+                id,
+                payload: format!("data_{}_{}", instance_id, seq),
+            }
         };
 
         let result = match &op {
             WriteOp::Insert { id, payload } => db.execute(
                 "INSERT INTO e2e (id, worker, seq, payload, op) VALUES (?1, ?2, ?3, ?4, 'insert')",
-                &[SqlValue::Text(id.clone()), SqlValue::Text(instance_id.clone()),
-                  SqlValue::Integer(seq as i64), SqlValue::Text(payload.clone())],
+                &[
+                    SqlValue::Text(id.clone()),
+                    SqlValue::Text(instance_id.clone()),
+                    SqlValue::Integer(seq as i64),
+                    SqlValue::Text(payload.clone()),
+                ],
             ),
             WriteOp::Update { id, new_payload } => db.execute(
                 "UPDATE e2e SET payload = ?1, op = 'update', seq = ?2 WHERE id = ?3",
-                &[SqlValue::Text(new_payload.clone()), SqlValue::Integer(seq as i64), SqlValue::Text(id.clone())],
+                &[
+                    SqlValue::Text(new_payload.clone()),
+                    SqlValue::Integer(seq as i64),
+                    SqlValue::Text(id.clone()),
+                ],
             ),
             WriteOp::Delete { id } => db.execute(
-                "DELETE FROM e2e WHERE id = ?1", &[SqlValue::Text(id.clone())],
+                "DELETE FROM e2e WHERE id = ?1",
+                &[SqlValue::Text(id.clone())],
             ),
         };
 
@@ -175,8 +200,17 @@ async fn run_worker(
         if let Err(ref e) = result {
             warn!("[{}] {} seq={} err: {}", instance_id, op_name(&op), seq, e);
         }
-        if succeeded { if let WriteOp::Insert { ref id, .. } = op { my_ids.push(id.clone()); } }
-        records.push(WriteRecord { op, worker: instance_id.clone(), seq, succeeded });
+        if succeeded {
+            if let WriteOp::Insert { ref id, .. } = op {
+                my_ids.push(id.clone());
+            }
+        }
+        records.push(WriteRecord {
+            op,
+            worker: instance_id.clone(),
+            seq,
+            succeeded,
+        });
 
         // Mid-flight read every 10 ops
         if seq % 10 == 5 {
@@ -188,7 +222,9 @@ async fn run_worker(
         }
     }
 
-    if let Err(e) = db.close().await { warn!("[{}] close: {}", instance_id, e); }
+    if let Err(e) = db.close().await {
+        warn!("[{}] close: {}", instance_id, e);
+    }
     records
 }
 
@@ -196,13 +232,17 @@ fn compute_expected(records: &[WriteRecord]) -> HashMap<String, Option<String>> 
     let mut state: HashMap<String, Option<String>> = HashMap::new();
     for r in records.iter().filter(|r| r.succeeded) {
         match &r.op {
-            WriteOp::Insert { id, payload } => { state.insert(id.clone(), Some(payload.clone())); }
+            WriteOp::Insert { id, payload } => {
+                state.insert(id.clone(), Some(payload.clone()));
+            }
             WriteOp::Update { id, new_payload } => {
                 if state.get(id).map(|v| v.is_some()).unwrap_or(false) {
                     state.insert(id.clone(), Some(new_payload.clone()));
                 }
             }
-            WriteOp::Delete { id } => { state.insert(id.clone(), None); }
+            WriteOp::Delete { id } => {
+                state.insert(id.clone(), None);
+            }
         }
     }
     state
@@ -211,17 +251,30 @@ fn compute_expected(records: &[WriteRecord]) -> HashMap<String, Option<String>> 
 async fn audit(prefix: &str, args: &Args, records: &[WriteRecord]) -> Result<()> {
     info!("=== AUDIT ===");
     let n = WORKER_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
     let tmp = std::env::temp_dir().join(format!("haqlite_e2e_audit_{}_{}", ts, n));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
 
     let mut db = open_node(&tmp, prefix, "auditor", args).await?;
-    let rows = db.query_values_fresh("SELECT id, worker, seq, payload, op FROM e2e ORDER BY id", &[]).await?;
+    let rows = db
+        .query_values_fresh(
+            "SELECT id, worker, seq, payload, op FROM e2e ORDER BY id",
+            &[],
+        )
+        .await?;
 
     let ok = records.iter().filter(|r| r.succeeded).count();
     let err = records.iter().filter(|r| !r.succeeded).count();
-    info!("Attempts: {} ({} ok, {} err). DB rows: {}", records.len(), ok, err, rows.len());
+    info!(
+        "Attempts: {} ({} ok, {} err). DB rows: {}",
+        records.len(),
+        ok,
+        err,
+        rows.len()
+    );
 
     let mut visible: HashMap<String, String> = HashMap::new();
     for row in &rows {
@@ -246,15 +299,18 @@ async fn audit(prefix: &str, args: &Args, records: &[WriteRecord]) -> Result<()>
                 }
                 _ => {}
             },
-            None => if visible.contains_key(id) {
-                error!("VIOLATION: '{}' should be deleted", id);
-                violations += 1;
-            },
+            None => {
+                if visible.contains_key(id) {
+                    error!("VIOLATION: '{}' should be deleted", id);
+                    violations += 1;
+                }
+            }
         }
     }
     // A phantom is a row that NO worker attempted to write (not even as an Err).
     // Rows from Err writes may or may not be visible -- that's expected.
-    let all_attempted_ids: std::collections::HashSet<_> = records.iter()
+    let all_attempted_ids: std::collections::HashSet<_> = records
+        .iter()
         .filter_map(|r| match &r.op {
             WriteOp::Insert { id, .. } => Some(id.clone()),
             WriteOp::Update { id, .. } => Some(id.clone()),
@@ -272,7 +328,9 @@ async fn audit(prefix: &str, args: &Args, records: &[WriteRecord]) -> Result<()>
     info!("Expected {} rows, got {}.", expected_rows, rows.len());
 
     db.close().await?;
-    if violations > 0 { anyhow::bail!("{} violations", violations); }
+    if violations > 0 {
+        anyhow::bail!("{} violations", violations);
+    }
     info!("=== AUDIT PASSED ===");
     Ok(())
 }
@@ -280,8 +338,10 @@ async fn audit(prefix: &str, args: &Args, records: &[WriteRecord]) -> Result<()>
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let args = Args::parse();
@@ -290,11 +350,15 @@ async fn main() -> Result<()> {
         other => anyhow::bail!("unknown durability: {} (expected: cloud)", other),
     };
 
-    let run_id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
     let prefix = format!("e2e/cloud/{}/", run_id);
 
-    info!("=== haqlite e2e: shared + cloud | {} workers x {} ops ===",
-        args.workers, args.writes_per_worker);
+    info!(
+        "=== haqlite e2e: shared + cloud | {} workers x {} ops ===",
+        args.workers, args.writes_per_worker
+    );
     info!("Bucket: {}, Prefix: {}", args.bucket, prefix);
 
     let start = Instant::now();

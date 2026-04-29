@@ -46,8 +46,12 @@ pub enum HaQLiteError {
 impl fmt::Display for HaQLiteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LeaderClientError { status, body } => write!(f, "Leader client error ({status}): {body}"),
-            Self::LeaderServerError { status, body } => write!(f, "Leader server error ({status}): {body}"),
+            Self::LeaderClientError { status, body } => {
+                write!(f, "Leader client error ({status}): {body}")
+            }
+            Self::LeaderServerError { status, body } => {
+                write!(f, "Leader server error ({status}): {body}")
+            }
             Self::LeaderResponseParseError(msg) => write!(f, "Leader response parse error: {msg}"),
             Self::LeaderConnectionError(msg) => write!(f, "Leader connection error: {msg}"),
             Self::NotLeader => write!(f, "Not leader and no leader address available"),
@@ -78,13 +82,19 @@ mod tests {
 
     #[test]
     fn test_display_leader_client_error() {
-        let err = HaQLiteError::LeaderClientError { status: 400, body: "bad request".into() };
+        let err = HaQLiteError::LeaderClientError {
+            status: 400,
+            body: "bad request".into(),
+        };
         assert_eq!(err.to_string(), "Leader client error (400): bad request");
     }
 
     #[test]
     fn test_display_leader_server_error() {
-        let err = HaQLiteError::LeaderServerError { status: 500, body: "internal".into() };
+        let err = HaQLiteError::LeaderServerError {
+            status: 500,
+            body: "internal".into(),
+        };
         assert_eq!(err.to_string(), "Leader server error (500): internal");
     }
 
@@ -97,7 +107,10 @@ mod tests {
     #[test]
     fn test_display_leader_connection_error() {
         let err = HaQLiteError::LeaderConnectionError("connection refused".into());
-        assert_eq!(err.to_string(), "Leader connection error: connection refused");
+        assert_eq!(
+            err.to_string(),
+            "Leader connection error: connection refused"
+        );
     }
 
     #[test]
@@ -109,7 +122,10 @@ mod tests {
     #[test]
     fn test_display_not_leader() {
         let err = HaQLiteError::NotLeader;
-        assert_eq!(err.to_string(), "Not leader and no leader address available");
+        assert_eq!(
+            err.to_string(),
+            "Not leader and no leader address available"
+        );
     }
 
     #[test]
@@ -138,8 +154,7 @@ mod tests {
 
     #[test]
     fn test_error_trait() {
-        let err: Box<dyn std::error::Error> =
-            Box::new(HaQLiteError::DatabaseError("test".into()));
+        let err: Box<dyn std::error::Error> = Box::new(HaQLiteError::DatabaseError("test".into()));
         assert!(err.to_string().contains("test"));
     }
 
@@ -166,8 +181,14 @@ mod tests {
     #[test]
     fn test_match_exhaustive() {
         let errors: Vec<HaQLiteError> = vec![
-            HaQLiteError::LeaderClientError { status: 400, body: "test".into() },
-            HaQLiteError::LeaderServerError { status: 500, body: "test".into() },
+            HaQLiteError::LeaderClientError {
+                status: 400,
+                body: "test".into(),
+            },
+            HaQLiteError::LeaderServerError {
+                status: 500,
+                body: "test".into(),
+            },
             HaQLiteError::LeaderResponseParseError("test".into()),
             HaQLiteError::LeaderConnectionError("test".into()),
             HaQLiteError::NotLeader,

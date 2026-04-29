@@ -91,10 +91,7 @@ pub async fn discover_ltx_files(
 
 /// Discover all database names by listing S3 objects under prefix and extracting
 /// the first path component after the prefix.
-pub async fn discover_databases(
-    storage: &dyn StorageBackend,
-    prefix: &str,
-) -> Result<Vec<String>> {
+pub async fn discover_databases(storage: &dyn StorageBackend, prefix: &str) -> Result<Vec<String>> {
     let prefix = normalize_prefix(prefix);
     let keys = storage.list(&prefix, None).await?;
     let mut dbs = std::collections::BTreeSet::new();
@@ -203,10 +200,7 @@ pub async fn verify_database(
 ) -> Result<VerifyResult> {
     let files = discover_ltx_files(storage, prefix, name).await?;
     if files.is_empty() {
-        return Err(anyhow!(
-            "No changeset files found for database '{}'",
-            name
-        ));
+        return Err(anyhow!("No changeset files found for database '{}'", name));
     }
 
     let snapshots = files.iter().filter(|f| f.is_snapshot).count();
@@ -227,43 +221,39 @@ pub async fn verify_database(
             .next_back()
             .unwrap_or(&file.key)
             .to_string();
-        match storage.get(&file.key).await.and_then(|opt| {
-            opt.ok_or_else(|| anyhow::anyhow!("key {} not found", file.key))
-        }) {
-            Ok(data) => {
-                match walrust::hadb_changeset::physical::decode(&data) {
-                    Ok(changeset) => {
-                        if changeset.header.seq != file.seq {
-                            file_results.push((
-                                filename,
-                                VerifyFileResult::SeqMismatch {
-                                    expected_seq: file.seq,
-                                    header_seq: changeset.header.seq,
-                                },
-                            ));
-                        } else {
-                            verified_count += 1;
-                            total_size += data.len() as u64;
-                            file_results.push((
-                                filename,
-                                VerifyFileResult::Ok {
-                                    seq: file.seq,
-                                    size_bytes: data.len() as u64,
-                                },
-                            ));
-                        }
-                    }
-                    Err(e) => {
+        match storage
+            .get(&file.key)
+            .await
+            .and_then(|opt| opt.ok_or_else(|| anyhow::anyhow!("key {} not found", file.key)))
+        {
+            Ok(data) => match walrust::hadb_changeset::physical::decode(&data) {
+                Ok(changeset) => {
+                    if changeset.header.seq != file.seq {
                         file_results.push((
                             filename,
-                            VerifyFileResult::ChecksumFailed(e.to_string()),
+                            VerifyFileResult::SeqMismatch {
+                                expected_seq: file.seq,
+                                header_seq: changeset.header.seq,
+                            },
+                        ));
+                    } else {
+                        verified_count += 1;
+                        total_size += data.len() as u64;
+                        file_results.push((
+                            filename,
+                            VerifyFileResult::Ok {
+                                seq: file.seq,
+                                size_bytes: data.len() as u64,
+                            },
                         ));
                     }
                 }
-            }
+                Err(e) => {
+                    file_results.push((filename, VerifyFileResult::ChecksumFailed(e.to_string())));
+                }
+            },
             Err(e) => {
-                file_results
-                    .push((filename, VerifyFileResult::DownloadFailed(e.to_string())));
+                file_results.push((filename, VerifyFileResult::DownloadFailed(e.to_string())));
             }
         }
     }
@@ -347,10 +337,7 @@ pub async fn plan_compact(
     };
 
     // Find stale incrementals: those with seq < oldest kept snapshot's seq.
-    let oldest_kept_seq = keep_snapshots
-        .last()
-        .map(|s| s.seq)
-        .unwrap_or(u64::MAX);
+    let oldest_kept_seq = keep_snapshots.last().map(|s| s.seq).unwrap_or(u64::MAX);
     let delete_stale_incrementals: Vec<_> = incrementals
         .into_iter()
         .filter(|i| i.seq < oldest_kept_seq)
@@ -364,16 +351,13 @@ pub async fn plan_compact(
 }
 
 /// Execute compaction: delete old snapshots and stale incrementals from S3.
-pub async fn execute_compact(
-    storage: &dyn StorageBackend,
-    plan: &CompactPlan,
-) -> Result<usize> {
-    let mut keys: Vec<String> = plan.delete_snapshots.iter().map(|s| s.key.clone()).collect();
-    keys.extend(
-        plan.delete_stale_incrementals
-            .iter()
-            .map(|s| s.key.clone()),
-    );
+pub async fn execute_compact(storage: &dyn StorageBackend, plan: &CompactPlan) -> Result<usize> {
+    let mut keys: Vec<String> = plan
+        .delete_snapshots
+        .iter()
+        .map(|s| s.key.clone())
+        .collect();
+    keys.extend(plan.delete_stale_incrementals.iter().map(|s| s.key.clone()));
     if keys.is_empty() {
         return Ok(0);
     }

@@ -57,8 +57,7 @@ pub async fn lease_store_from_env(
         let base_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .load()
             .await;
-        let mut s3_builder = aws_sdk_s3::config::Builder::from(&base_config)
-            .force_path_style(true);
+        let mut s3_builder = aws_sdk_s3::config::Builder::from(&base_config).force_path_style(true);
         if let Some(ref ep) = s3_endpoint {
             s3_builder = s3_builder.endpoint_url(ep);
         }
@@ -74,7 +73,10 @@ pub async fn lease_store_from_env(
     if url.starts_with("http://") || url.starts_with("https://") {
         let parsed = parse_url_params(&url);
         let token = parsed.params.get("token").cloned().unwrap_or_default();
-        tracing::info!("haqlite::env: using Cinch HTTP lease store: {}", parsed.base);
+        tracing::info!(
+            "haqlite::env: using Cinch HTTP lease store: {}",
+            parsed.base
+        );
         return Ok(Arc::new(hadb_lease_cinch::CinchLeaseStore::new(
             &parsed.base,
             &token,
@@ -177,7 +179,10 @@ mod tests {
     async fn lease_store_unsupported_scheme_errors() {
         std::env::set_var("HAQLITE_LEASE_URL", "ftp://nope");
         let err = err_msg(lease_store_from_env("b", None).await);
-        assert!(err.contains("Unsupported HAQLITE_LEASE_URL scheme"), "got: {err}");
+        assert!(
+            err.contains("Unsupported HAQLITE_LEASE_URL scheme"),
+            "got: {err}"
+        );
         unset_lease();
     }
 

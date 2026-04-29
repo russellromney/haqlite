@@ -161,7 +161,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let elapsed = start.elapsed().as_secs_f64();
-    let rate = if elapsed > 0.0 { writes as f64 / elapsed } else { 0.0 };
+    let rate = if elapsed > 0.0 {
+        writes as f64 / elapsed
+    } else {
+        0.0
+    };
     info!(
         "Writer done: {} writes, {} errors, {:.1}s elapsed, {:.0} writes/s",
         writes, errors, elapsed, rate
@@ -242,14 +246,24 @@ async fn main() -> anyhow::Result<()> {
                 let metrics_url = format!("{}/metrics", node);
                 if let Ok(resp) = http.get(&metrics_url).send().await {
                     if let Ok(body) = resp.json::<serde_json::Value>().await {
-                        let p = body.get("last_promotion_duration_us")
-                            .and_then(|v| v.as_u64()).unwrap_or(0);
-                        let c = body.get("last_catchup_duration_us")
-                            .and_then(|v| v.as_u64()).unwrap_or(0);
-                        let n = body.get("promotions_succeeded")
-                            .and_then(|v| v.as_u64()).unwrap_or(0);
-                        if p > promotion_us { promotion_us = p; }
-                        if c > catchup_us { catchup_us = c; }
+                        let p = body
+                            .get("last_promotion_duration_us")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let c = body
+                            .get("last_catchup_duration_us")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let n = body
+                            .get("promotions_succeeded")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if p > promotion_us {
+                            promotion_us = p;
+                        }
+                        if c > catchup_us {
+                            catchup_us = c;
+                        }
                         promotions += n;
                     }
                 }
@@ -259,8 +273,7 @@ async fn main() -> anyhow::Result<()> {
         println!("# sync_interval_ms\twrites\terrors\telapsed_s\twrites_per_s\tpromotion_us\tcatchup_us\tpromotions");
         println!(
             "{}\t{}\t{}\t{:.1}\t{:.0}\t{}\t{}\t{}",
-            args.interval_ms, writes, errors, elapsed, rate,
-            promotion_us, catchup_us, promotions
+            args.interval_ms, writes, errors, elapsed, rate, promotion_us, catchup_us, promotions
         );
     }
 

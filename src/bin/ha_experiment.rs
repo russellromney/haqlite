@@ -101,19 +101,14 @@ async fn handle_write(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // Get next ID.
     let id: i64 = db
-        .query_row(
-            "SELECT COALESCE(MAX(id), 0) + 1 FROM test_data",
-            &[],
-            |r| r.get(0),
-        )
+        .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM test_data", &[], |r| {
+            r.get(0)
+        })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     db.execute(
         "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
-        &[
-            SqlValue::Integer(id),
-            SqlValue::Text(format!("row-{}", id)),
-        ],
+        &[SqlValue::Integer(id), SqlValue::Text(format!("row-{}", id))],
     )
     .map_err(|e| {
         error!("Write failed: {}", e);
@@ -153,9 +148,7 @@ async fn handle_status(
 }
 
 /// GET /metrics — haqlite HA metrics snapshot.
-async fn handle_metrics(
-    State(db): State<Arc<HaQLite>>,
-) -> Json<serde_json::Value> {
+async fn handle_metrics(State(db): State<Arc<HaQLite>>) -> Json<serde_json::Value> {
     match db.coordinator() {
         Some(c) => {
             let snap = c.metrics().snapshot();
@@ -283,8 +276,7 @@ async fn main() -> Result<()> {
 
     // Build coordinator config from CLI args.
     let instance_id = args.instance.clone().unwrap_or_else(|| {
-        std::env::var("FLY_MACHINE_ID")
-            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
+        std::env::var("FLY_MACHINE_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
     });
     let address = format!("http://localhost:{}", forwarding_port);
 
@@ -293,7 +285,9 @@ async fn main() -> Result<()> {
     // the HaQLite builder patches the lease store + instance id + address
     // into the LeaseConfig at finalize-time without clobbering timing.
     let coordinator_config = CoordinatorConfig {
-        durability: hadb::Durability::Replicated(std::time::Duration::from_millis(args.sync_interval_ms)),
+        durability: hadb::Durability::Replicated(std::time::Duration::from_millis(
+            args.sync_interval_ms,
+        )),
         follower_pull_interval: std::time::Duration::from_millis(args.follower_pull_ms),
         lease: None,
         ..Default::default()
@@ -317,11 +311,7 @@ async fn main() -> Result<()> {
         builder = builder.secret(secret);
     }
 
-    let db = Arc::new(
-        builder
-            .open(args.db.to_str().unwrap(), SCHEMA)
-            .await?,
-    );
+    let db = Arc::new(builder.open(args.db.to_str().unwrap(), SCHEMA).await?);
 
     let role = db.role().unwrap_or(Role::Follower);
     info!("*** THIS INSTANCE IS THE {} ***", role);

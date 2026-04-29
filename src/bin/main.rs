@@ -66,7 +66,11 @@ impl CliBackend for HaqliteBackend {
         )
         .await?;
         let txid = walrust::sync::restore(
-            &storage, prefix, &args.name, &args.output, args.point_in_time.as_deref(),
+            &storage,
+            prefix,
+            &args.name,
+            &args.output,
+            args.point_in_time.as_deref(),
         )
         .await?;
         println!(
@@ -80,9 +84,11 @@ impl CliBackend for HaqliteBackend {
 
     async fn list(&self, _shared: &SharedConfig, args: &ListArgs) -> Result<()> {
         let prefix = resolve_prefix(&args.s3);
-        let storage =
-            hadb_storage_s3::S3Storage::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
-                .await?;
+        let storage = hadb_storage_s3::S3Storage::from_env(
+            args.s3.bucket.clone(),
+            args.s3.endpoint.as_deref(),
+        )
+        .await?;
         let dbs = ops::list_databases(&storage, prefix).await?;
         if dbs.is_empty() {
             println!("No databases found.");
@@ -104,15 +110,14 @@ impl CliBackend for HaqliteBackend {
 
     async fn verify(&self, _shared: &SharedConfig, args: &VerifyArgs) -> Result<()> {
         let prefix = resolve_prefix(&args.s3);
-        let storage =
-            hadb_storage_s3::S3Storage::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
-                .await?;
+        let storage = hadb_storage_s3::S3Storage::from_env(
+            args.s3.bucket.clone(),
+            args.s3.endpoint.as_deref(),
+        )
+        .await?;
         let result = ops::verify_database(&storage, prefix, &args.name).await?;
 
-        println!(
-            "Verifying '{}': {} files",
-            args.name, result.total_files
-        );
+        println!("Verifying '{}': {} files", args.name, result.total_files);
         println!();
 
         for (filename, file_result) in &result.file_results {
@@ -120,12 +125,19 @@ impl CliBackend for HaqliteBackend {
                 VerifyFileResult::Ok { seq, size_bytes } => {
                     println!(
                         "  OK   {} (seq {}, {:.1} KB)",
-                        filename, seq, *size_bytes as f64 / 1024.0
+                        filename,
+                        seq,
+                        *size_bytes as f64 / 1024.0
                     );
                 }
-                VerifyFileResult::SeqMismatch { expected_seq, header_seq } => {
-                    println!("  WARN {} seq mismatch: filename {}, header {}",
-                        filename, expected_seq, header_seq);
+                VerifyFileResult::SeqMismatch {
+                    expected_seq,
+                    header_seq,
+                } => {
+                    println!(
+                        "  WARN {} seq mismatch: filename {}, header {}",
+                        filename, expected_seq, header_seq
+                    );
                 }
                 VerifyFileResult::ChecksumFailed(e) => {
                     println!("  FAIL {} checksum: {}", filename, e);
@@ -152,9 +164,12 @@ impl CliBackend for HaqliteBackend {
             println!("All checks passed.");
             Ok(())
         } else {
-            let issue_count = result.file_results.iter()
+            let issue_count = result
+                .file_results
+                .iter()
                 .filter(|(_, r)| !matches!(r, VerifyFileResult::Ok { .. }))
-                .count() + result.continuity_issues.len();
+                .count()
+                + result.continuity_issues.len();
             println!("{} issue(s) found.", issue_count);
             Err(anyhow!("Integrity issues detected"))
         }
@@ -162,9 +177,11 @@ impl CliBackend for HaqliteBackend {
 
     async fn compact(&self, _shared: &SharedConfig, args: &CompactArgs) -> Result<()> {
         let prefix = resolve_prefix(&args.s3);
-        let storage =
-            hadb_storage_s3::S3Storage::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
-                .await?;
+        let storage = hadb_storage_s3::S3Storage::from_env(
+            args.s3.bucket.clone(),
+            args.s3.endpoint.as_deref(),
+        )
+        .await?;
         let plan = ops::plan_compact(&storage, prefix, &args.name, args.keep).await?;
 
         if plan.keep_snapshots.is_empty() && plan.delete_snapshots.is_empty() {
@@ -176,7 +193,8 @@ impl CliBackend for HaqliteBackend {
         if total_deletes == 0 {
             println!(
                 "Only {} snapshots exist (keeping {}). Nothing to delete.",
-                plan.keep_snapshots.len(), args.keep
+                plan.keep_snapshots.len(),
+                args.keep
             );
             return Ok(());
         }
@@ -219,9 +237,11 @@ impl CliBackend for HaqliteBackend {
 
     async fn replicate(&self, _shared: &SharedConfig, args: &ReplicateArgs) -> Result<()> {
         let prefix = resolve_prefix(&args.s3);
-        let storage =
-            hadb_storage_s3::S3Storage::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
-                .await?;
+        let storage = hadb_storage_s3::S3Storage::from_env(
+            args.s3.bucket.clone(),
+            args.s3.endpoint.as_deref(),
+        )
+        .await?;
         println!(
             "Replicating '{}' -> {} (interval: {}s)",
             args.source,
@@ -242,14 +262,15 @@ impl CliBackend for HaqliteBackend {
 
     async fn snapshot(&self, _shared: &SharedConfig, args: &SnapshotArgs) -> Result<()> {
         let prefix = resolve_prefix(&args.s3);
-        let storage =
-            hadb_storage_s3::S3Storage::from_env(args.s3.bucket.clone(), args.s3.endpoint.as_deref())
-                .await?;
+        let storage = hadb_storage_s3::S3Storage::from_env(
+            args.s3.bucket.clone(),
+            args.s3.endpoint.as_deref(),
+        )
+        .await?;
         let result = ops::snapshot_database(&storage, prefix, &args.database).await?;
         println!(
             "Snapshot uploaded for '{}' (seq {})",
-            result.db_name,
-            result.seq
+            result.db_name, result.seq
         );
         Ok(())
     }

@@ -3,8 +3,8 @@
 //! WAL-based (walrust): for Replicated and Eventual durability
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -117,7 +117,9 @@ impl FollowerBehavior for SqliteFollowerBehavior {
         .await?;
         tracing::info!(
             "SqliteFollowerBehavior '{}': caught up seq {} -> {}",
-            db_name, position, new_seq
+            db_name,
+            position,
+            new_seq
         );
         Ok(())
     }

@@ -70,11 +70,12 @@ impl HranaBackend for HaqliteHranaBackend {
             }
         };
 
-        let conn =
-            rusqlite::Connection::open_with_flags(&self.db_path, flags).map_err(|e| HranaError {
+        let conn = rusqlite::Connection::open_with_flags(&self.db_path, flags).map_err(|e| {
+            HranaError {
                 message: format!("Failed to open connection: {e}"),
                 code: "INTERNAL".to_string(),
-            })?;
+            }
+        })?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| HranaError {
                 message: format!("PRAGMA journal_mode failed: {e}"),
@@ -145,8 +146,14 @@ async fn handle_hrana_cursor(
     State(state): State<Arc<HranaState>>,
     headers: HeaderMap,
     Json(request): Json<CursorRequest>,
-) -> Result<(StatusCode, [(axum::http::header::HeaderName, &'static str); 1], String), (StatusCode, Json<serde_json::Value>)>
-{
+) -> Result<
+    (
+        StatusCode,
+        [(axum::http::header::HeaderName, &'static str); 1],
+        String,
+    ),
+    (StatusCode, Json<serde_json::Value>),
+> {
     let token = extract_bearer_token(&headers);
     match handle_cursor(
         &state.backend,
