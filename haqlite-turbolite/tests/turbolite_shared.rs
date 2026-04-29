@@ -1,4 +1,4 @@
-//! Phase Zenith-e: Turbolite + Shared mode integration tests.
+//! Phase Zenith-e: Turbolite + SharedWriter mode integration tests.
 //!
 //! Uses turbolite local storage (no cloud/S3 needed).
 //! Tests the per-write lease cycle with turbolite as the storage engine.
@@ -21,7 +21,7 @@ use turbolite::tiered::{
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT);";
 
-/// Build a Shared mode HaQLite backed by turbolite (local storage).
+/// Build a SharedWriter mode HaQLite backed by turbolite (local storage).
 async fn build_turbolite_shared(
     cache_dir: &std::path::Path,
     db_name: &str,
@@ -52,7 +52,7 @@ async fn build_turbolite_shared(
     let db_path = cache_dir.join(format!("{}.db", db_name));
     Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
@@ -62,7 +62,7 @@ async fn build_turbolite_shared(
         .write_timeout(Duration::from_secs(2))
         .open(db_path.to_str().expect("valid path"), SCHEMA)
         .await
-        .expect("open turbolite shared mode")
+        .expect("open turbolite sharedwriter mode")
 }
 
 // ============================================================================

@@ -80,7 +80,7 @@ async fn build_turbolite_dedicated(
     let db_path = cache_dir.join(format!("{}.db", db_name));
     Builder::new()
         .prefix("test/")
-        .mode(Mode::Writer)
+        .mode(Mode::SingleWriter)
         .durability(durability)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
@@ -90,7 +90,7 @@ async fn build_turbolite_dedicated(
         .manifest_poll_interval(Duration::from_millis(50))
         .open(db_path.to_str().expect("valid path"), SCHEMA)
         .await
-        .expect("open turbolite dedicated")
+        .expect("open turbolite singlewriter")
 }
 
 async fn build_walrust_dedicated(
@@ -105,14 +105,14 @@ async fn build_walrust_dedicated(
     let db_path = cache_dir.join(format!("{}.db", db_name));
     haqlite::HaQLite::builder()
         .prefix("test/")
-        .mode(haqlite::HaMode::Dedicated)
+        .mode(haqlite::HaMode::SingleWriter)
         .durability(durability)
         .lease_store(lease_store)
         .walrust_storage(walrust_storage)
         .instance_id(instance_id)
         .open(db_path.to_str().expect("valid path"), SCHEMA)
         .await
-        .expect("open walrust dedicated")
+        .expect("open walrust singlewriter")
 }
 
 // ============================================================================
@@ -558,7 +558,7 @@ async fn cloud_opens_without_walrust_storage() {
 
     let mut db = Builder::new()
         .prefix("test/")
-        .mode(Mode::Writer)
+        .mode(Mode::SingleWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease)
         .manifest_store(manifest)

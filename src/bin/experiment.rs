@@ -1,18 +1,18 @@
 //! Unified HA experiment binary -- HTTP server for all mode combinations.
 //!
 //! Supports all 4 valid haqlite configurations:
-//!   Dedicated + Replicated  (classic walrust HA)
-//!   Dedicated + Synchronous (walrust HA)
-//!   Dedicated + Eventual    (walrust HA)
-//!   Shared + Synchronous    (not supported in base haqlite)
+//!   SingleWriter + Replicated  (classic walrust HA)
+//!   SingleWriter + Synchronous (walrust HA)
+//!   SingleWriter + Eventual    (walrust HA)
+//!   SharedWriter + Synchronous    (not supported in base haqlite)
 //!
 //! Usage:
-//!   # Shared + Synchronous (2 nodes)
-//!   haqlite-experiment --topology shared --durability synchronous \
+//!   # SharedWriter + Synchronous (2 nodes)
+//!   haqlite-experiment --topology sharedwriter --durability synchronous \
 //!     --port 9001 --instance node-1 --prefix "exp-123/"
 //!
-//!   # Dedicated + Replicated (leader)
-//!   haqlite-experiment --topology dedicated --durability replicated \
+//!   # SingleWriter + Replicated (leader)
+//!   haqlite-experiment --topology singlewriter --durability replicated \
 //!     --port 9001 --instance node-1 --prefix "exp-456/"
 //!
 //!   # Then hit HTTP endpoints from Python e2e tests.
@@ -41,8 +41,8 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS test_data (
 #[command(name = "haqlite-experiment")]
 #[command(about = "Unified HA experiment for all haqlite mode combinations")]
 struct Args {
-    /// Topology: dedicated or shared
-    #[arg(long, default_value = "shared")]
+    /// Topology: singlewriter or sharedwriter
+    #[arg(long, default_value = "sharedwriter")]
     topology: String,
 
     /// Durability: replicated, synchronous, or eventual
@@ -77,31 +77,31 @@ struct Args {
     #[arg(long, default_value = "30")]
     lease_ttl: u64,
 
-    /// Shared secret for write forwarding auth (Dedicated mode)
+    /// Shared secret for write forwarding auth (SingleWriter mode)
     #[arg(long, env = "HAQLITE_SECRET")]
     secret: Option<String>,
 
-    /// WAL sync interval in milliseconds (Dedicated mode)
+    /// WAL sync interval in milliseconds (SingleWriter mode)
     #[arg(long, default_value = "1000")]
     sync_interval_ms: u64,
 
-    /// Lease renew interval in milliseconds (Dedicated mode)
+    /// Lease renew interval in milliseconds (SingleWriter mode)
     #[arg(long, default_value = "2000")]
     renew_interval_ms: u64,
 
-    /// Follower poll interval in milliseconds (Dedicated mode)
+    /// Follower poll interval in milliseconds (SingleWriter mode)
     #[arg(long, default_value = "1000")]
     follower_poll_ms: u64,
 
-    /// Follower pull interval in milliseconds (Dedicated mode)
+    /// Follower pull interval in milliseconds (SingleWriter mode)
     #[arg(long, default_value = "1000")]
     follower_pull_ms: u64,
 
-    /// Number of initial rows to seed (leader only, Dedicated mode)
+    /// Number of initial rows to seed (leader only, SingleWriter mode)
     #[arg(long, default_value = "0")]
     seed_rows: u32,
 
-    /// Write timeout in seconds (Shared mode)
+    /// Write timeout in seconds (SharedWriter mode)
     #[arg(long, default_value = "30")]
     write_timeout: u64,
 
@@ -409,9 +409,12 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| format!("node-{}", args.port));
 
     let mode = match args.topology.as_str() {
-        "dedicated" => HaMode::Dedicated,
-        "shared" => HaMode::Shared,
-        other => anyhow::bail!("unknown topology: {} (expected: dedicated, shared)", other),
+        "singlewriter" | "dedicated" => HaMode::SingleWriter,
+        "sharedwriter" | "shared" => HaMode::SharedWriter,
+        other => anyhow::bail!(
+            "unknown topology: {} (expected: singlewriter, sharedwriter)",
+            other
+        ),
     };
 
     let mut builder = HaQLite::builder()
@@ -473,10 +476,10 @@ async fn main() -> Result<()> {
     }
 
     match mode {
-        HaMode::Dedicated => {
+        HaMode::SingleWriter => {
             // --lease-ttl is applied above on the builder (covers both modes).
-            // --renew-interval-ms and --follower-poll-ms are Dedicated-only and
-            // flow through the dedicated builder setters.
+            // --renew-interval-ms and --follower-poll-ms are SingleWriter-only and
+            // flow through the singlewriter builder setters.
             let coordinator_config = haqlite::CoordinatorConfig {
                 durability: hadb::Durability::Replicated(std::time::Duration::from_millis(
                     args.sync_interval_ms,
@@ -495,7 +498,7 @@ async fn main() -> Result<()> {
                     args.follower_poll_ms,
                 ));
         }
-        HaMode::Shared => {
+        HaMode::SharedWriter => {
             builder = builder.write_timeout(std::time::Duration::from_secs(args.write_timeout));
         }
     }
@@ -512,8 +515,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "shared-writer".to_string());
     info!("Database opened. Role: {}", role_str);
 
-    // Seed rows if requested (Dedicated leader only)
-    if mode == HaMode::Dedicated && args.seed_rows > 0 {
+    // Seed rows if requested (SingleWriter leader only)
+    if mode == HaMode::SingleWriter && args.seed_rows > 0 {
         if db.role() == Some(haqlite::Role::Leader) {
             let count = db
                 .query_values_fresh("SELECT COUNT(*) FROM test_data", &[])

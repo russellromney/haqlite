@@ -2,12 +2,12 @@
 //!
 //! These tests pin the new contract:
 //! - `lease_store()` must be called for any HA mode.
-//! - `manifest_store()` must be called for HaMode::Shared (and Dedicated+Sync,
+//! - `manifest_store()` must be called for SingleWriter+Sync,
 //!   which is exercised by cinch-cloud's e2e tests since constructing an
 //!   in-memory walrust `StorageBackend` here would require pulling in
 //!   walrust's private test helpers).
-//! - turbolite page storage (`turbolite_storage` / `turbolite_http` /
-//!   `turbolite_vfs`) must be configured for HaMode::Shared.
+//! - SharedWriter is visible in the API but intentionally fails clearly until
+//!   the real implementation lands.
 //! - The env-var helpers live in `haqlite::env::*` for callers that want
 //!   them by name.
 //!
@@ -24,7 +24,6 @@ mod common;
 
 use common::InMemoryStorage;
 use hadb::InMemoryLeaseStore;
-use haqlite::HaQLite;
 use haqlite_turbolite::{Builder, Mode};
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,10 +53,10 @@ fn dummy_turbolite_vfs(tmp: &TempDir) -> (SharedTurboliteVfs, String) {
         ..Default::default()
     };
     let vfs = TurboliteVfs::new_local(config).expect("create VFS");
-    let shared = SharedTurboliteVfs::new(vfs);
+    let shared_vfs = SharedTurboliteVfs::new(vfs);
     let name = format!("test_{}", uuid::Uuid::new_v4());
-    turbolite::tiered::register_shared(&name, shared.clone()).expect("register");
-    (shared, name)
+    turbolite::tiered::register_shared(&name, shared_vfs.clone()).expect("register");
+    (shared_vfs, name)
 }
 
 #[tokio::test]
@@ -74,11 +73,9 @@ async fn dedicated_without_lease_or_walrust_errors_clearly() {
         .await;
 
     let err = err_msg(result);
-    // Walrust is checked before lease for Dedicated mode, so the walrust message wins.
-    // Either is acceptable proof that the silent fallback is gone.
     assert!(
-        err.contains("walrust storage") || err.contains("lease_store()"),
-        "expected lease/walrust error, got: {err}"
+        err.contains("manifest_store()"),
+        "expected manifest_store() error, got: {err}"
     );
 }
 
@@ -93,7 +90,7 @@ async fn shared_without_lease_errors_clearly() {
     let result = Builder::new()
         .prefix("p/")
         .instance_id("test-1")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .turbolite_vfs(vfs, &vfs_name)
         .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -101,8 +98,8 @@ async fn shared_without_lease_errors_clearly() {
 
     let err = err_msg(result);
     assert!(
-        err.contains("lease_store()"),
-        "expected lease_store() error, got: {err}"
+        err.contains("SharedWriter mode not yet implemented"),
+        "expected SharedWriter implementation-stub error, got: {err}"
     );
 }
 
@@ -119,7 +116,7 @@ async fn shared_without_manifest_errors_clearly() {
     let result = Builder::new()
         .prefix("p/")
         .instance_id("test-1")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .turbolite_vfs(vfs, &vfs_name)
         .lease_store(lease)
@@ -128,8 +125,8 @@ async fn shared_without_manifest_errors_clearly() {
 
     let err = err_msg(result);
     assert!(
-        err.contains("manifest_store()") && err.contains("Shared"),
-        "expected Shared+manifest_store() error, got: {err}"
+        err.contains("SharedWriter mode not yet implemented"),
+        "expected SharedWriter implementation-stub error, got: {err}"
     );
 }
 
@@ -146,7 +143,7 @@ async fn shared_without_turbolite_errors_clearly() {
     let result = Builder::new()
         .prefix("p/")
         .instance_id("test-1")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease)
         .manifest_store(manifest)
@@ -155,10 +152,8 @@ async fn shared_without_turbolite_errors_clearly() {
 
     let err = err_msg(result);
     assert!(
-        err.contains("turbolite_http")
-            && err.contains("turbolite_storage")
-            && err.contains("turbolite_vfs"),
-        "expected error to list all three turbolite options, got: {err}"
+        err.contains("SharedWriter mode not yet implemented"),
+        "expected SharedWriter implementation-stub error, got: {err}"
     );
 }
 
@@ -190,10 +185,12 @@ async fn lease_timing_setters_reach_coordinator() {
         .await
         .expect("open");
 
-    let coord = db.coordinator().expect("dedicated mode has a coordinator");
+    let coord = db
+        .coordinator()
+        .expect("singlewriter mode has a coordinator");
     let cfg = coord
         .lease_config()
-        .expect("LeaseConfig must be present on Dedicated mode");
+        .expect("LeaseConfig must be present on SingleWriter mode");
     assert_eq!(cfg.ttl_secs, 30, "lease_ttl should reach the Coordinator");
     assert_eq!(
         cfg.renew_interval,
@@ -248,7 +245,9 @@ async fn caller_lease_config_timing_is_preserved() {
         .await
         .expect("open");
 
-    let coord = db.coordinator().expect("dedicated mode has a coordinator");
+    let coord = db
+        .coordinator()
+        .expect("singlewriter mode has a coordinator");
     let cfg = coord.lease_config().expect("LeaseConfig must be present");
     assert_eq!(cfg.ttl_secs, 17);
     assert_eq!(cfg.renew_interval, Duration::from_millis(9_000));

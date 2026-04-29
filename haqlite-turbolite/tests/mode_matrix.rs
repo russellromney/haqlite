@@ -131,7 +131,7 @@ async fn run_mode_sync(enc: &Encoding) {
     let (vfs_a, vfs_name_a) = build_node(tmp_a.path(), "a");
     let mut db_a = Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone())
@@ -145,7 +145,7 @@ async fn run_mode_sync(enc: &Encoding) {
     let (vfs_b, vfs_name_b) = build_node(tmp_b.path(), "b");
     let mut db_b = Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone())

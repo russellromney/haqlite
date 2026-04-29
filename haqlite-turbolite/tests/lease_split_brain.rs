@@ -1,6 +1,6 @@
 //! Siege 4: Lease expiration and split-brain prevention tests.
 //!
-//! Prove: at most one writer succeeds at any time in Shared mode,
+//! Prove: at most one writer succeeds at any time in SharedWriter mode,
 //! even when leases expire due to slow S3 operations.
 //!
 //! Requires turbolite-cloud feature (multi-node catch-up needs S3 turbolite).
@@ -113,7 +113,7 @@ impl hadb_storage::StorageBackend for SlowStorage {
     }
 }
 
-/// Helper: build a shared-mode HaQLite node with S3-backed turbolite VFS.
+/// Helper: build a sharedwriter-mode HaQLite node with S3-backed turbolite VFS.
 /// Uses Synchronous durability (S3Primary, no walrust).
 async fn build_node(
     tmp: &TempDir,
@@ -146,7 +146,7 @@ async fn build_node(
     let db_path = tmp.path().join(format!("{}.db", name));
     Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
@@ -157,7 +157,7 @@ async fn build_node(
         .lease_ttl(lease_ttl)
         .open(db_path.to_str().unwrap(), SCHEMA)
         .await
-        .expect("open shared mode")
+        .expect("open sharedwriter mode")
 }
 
 /// Helper: count rows via query_values.

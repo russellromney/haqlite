@@ -17,7 +17,7 @@ use hadb::Replicator;
 pub struct SqliteReplicator {
     inner: Arc<walrust::Replicator>,
     /// When true, `add()` skips the initial snapshot upload.
-    /// Used for Dedicated+Synchronous where remote storage handles durability
+    /// Used for SingleWriter+Synchronous where remote storage handles durability
     /// and the local SQLite file may be empty (data is in S3 page groups).
     skip_snapshot_on_add: bool,
 }
@@ -35,7 +35,7 @@ impl SqliteReplicator {
         }
     }
 
-    /// Skip snapshot upload on `add()`. For Dedicated+Synchronous where
+    /// Skip snapshot upload on `add()`. For SingleWriter+Synchronous where
     /// remote storage handles durability and the local SQLite file has no data.
     pub fn with_skip_snapshot(mut self, skip: bool) -> Self {
         self.skip_snapshot_on_add = skip;

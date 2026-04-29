@@ -1,6 +1,6 @@
 //! Split-brain and concurrent writer tests for haqlite + S3-backed turbolite.
 //!
-//! Multi-node shared mode requires S3-backed turbolite for catch-up.
+//! Multi-node sharedwriter mode requires S3-backed turbolite for catch-up.
 //! These tests need the turbolite-cloud feature and S3 credentials.
 
 #![cfg(feature = "turbolite-cloud")]
@@ -43,7 +43,7 @@ fn unique_prefix(name: &str) -> String {
     )
 }
 
-/// Build an S3-backed turbolite shared mode node.
+/// Build an S3-backed turbolite sharedwriter mode node.
 async fn build_tl_node(
     cache_dir: &std::path::Path,
     db_name: &str,
@@ -75,7 +75,7 @@ async fn build_tl_node(
     let db_path = cache_dir.join(format!("{}.db", db_name));
     Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
@@ -86,7 +86,7 @@ async fn build_tl_node(
         .lease_ttl(lease_ttl)
         .open(db_path.to_str().expect("path"), SCHEMA)
         .await
-        .expect("open S3-backed turbolite shared mode")
+        .expect("open S3-backed turbolite sharedwriter mode")
 }
 
 fn has_key(rows: &[Vec<SqlValue>], key: &str) -> bool {

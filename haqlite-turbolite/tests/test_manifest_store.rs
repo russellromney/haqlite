@@ -1,11 +1,11 @@
 //! Tests for pluggable ManifestStore in HaQLiteBuilder.
 //!
 //! Verifies that:
-//! 1. Dedicated mode passes manifest_store to Coordinator (not None)
-//! 2. Dedicated mode without manifest_store still works (backward compat)
-//! 3. Shared mode manifest is published on write
-//! 4. Shared mode sequential writes increment manifest version
-//! 5. Two shared-mode writers see each other's data via manifest
+//! 1. SingleWriter mode passes manifest_store to Coordinator (not None)
+//! 2. SingleWriter mode without manifest_store still works (backward compat)
+//! 3. SharedWriter mode manifest is published on write
+//! 4. SharedWriter mode sequential writes increment manifest version
+//! 5. Two sharedwriter-mode writers see each other's data via manifest
 
 mod common;
 
@@ -78,7 +78,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS manifest_test (
 );";
 
 // ============================================================================
-// Dedicated mode
+// SingleWriter mode
 // ============================================================================
 
 #[tokio::test]
@@ -91,7 +91,7 @@ async fn dedicated_mode_with_manifest_store() {
 
     let mut db = Builder::new()
         .prefix("test/")
-        .mode(Mode::Writer)
+        .mode(Mode::SingleWriter)
         .lease_store(lease_store)
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
         .walrust_storage(storage)
@@ -99,7 +99,7 @@ async fn dedicated_mode_with_manifest_store() {
         .forwarding_port(19201)
         .open(db_path.to_str().expect("path"), SCHEMA)
         .await
-        .expect("open dedicated mode with manifest store");
+        .expect("open singlewriter mode with manifest store");
 
     db.execute_async(
         "INSERT INTO manifest_test (id, value) VALUES (?1, ?2)",
@@ -125,14 +125,14 @@ async fn dedicated_mode_without_manifest_store_still_works() {
 
     let mut db = Builder::new()
         .prefix("test/")
-        .mode(Mode::Writer)
+        .mode(Mode::SingleWriter)
         .lease_store(lease_store)
         .walrust_storage(storage)
         .instance_id("test-node")
         .forwarding_port(19202)
         .open(db_path.to_str().expect("path"), SCHEMA)
         .await
-        .expect("open dedicated mode without manifest store");
+        .expect("open singlewriter mode without manifest store");
 
     db.execute_async(
         "INSERT INTO manifest_test (id, value) VALUES (?1, ?2)",
@@ -150,7 +150,7 @@ async fn dedicated_mode_without_manifest_store_still_works() {
 }
 
 // ============================================================================
-// Shared mode: manifest_store required and actually used
+// SharedWriter mode: manifest_store required and actually used
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
@@ -164,7 +164,7 @@ async fn shared_mode_manifest_published_on_write() {
     let (vfs, vfs_name) = make_local_vfs(tmp.path());
     let mut db = Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
@@ -174,7 +174,7 @@ async fn shared_mode_manifest_published_on_write() {
         .write_timeout(Duration::from_secs(5))
         .open(db_path.to_str().expect("path"), SCHEMA)
         .await
-        .expect("open shared mode");
+        .expect("open sharedwriter mode");
 
     // Before write: no manifest
     let meta = manifest_store
@@ -186,7 +186,7 @@ async fn shared_mode_manifest_published_on_write() {
     // Write triggers manifest publish
     db.execute_async(
         "INSERT INTO manifest_test (id, value) VALUES (?1, ?2)",
-        &[SqlValue::Integer(1), SqlValue::Text("shared".into())],
+        &[SqlValue::Integer(1), SqlValue::Text("sharedwriter".into())],
     )
     .await
     .expect("insert");
@@ -212,7 +212,7 @@ async fn shared_mode_sequential_writes_increment_manifest_version() {
     let (vfs, vfs_name) = make_local_vfs(tmp.path());
     let mut db = Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
@@ -264,7 +264,7 @@ async fn shared_mode_two_writers_see_each_others_data() {
     let (vfs1, vfs_name1) = make_s3_vfs(tmp1.path(), &s3_prefix);
     let db1 = Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
@@ -291,7 +291,7 @@ async fn shared_mode_two_writers_see_each_others_data() {
     let (vfs2, vfs_name2) = make_s3_vfs(tmp2.path(), &s3_prefix);
     let mut db2 = Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)

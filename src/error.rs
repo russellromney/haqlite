@@ -36,7 +36,7 @@ pub enum HaQLiteError {
     /// Engine is closed (semaphore closed, tasks aborted).
     EngineClosed,
 
-    /// Lease contention in Shared mode (could not acquire lease within timeout).
+    /// Lease contention in SharedWriter mode (could not acquire lease within timeout).
     LeaseContention(String),
 
     /// Configuration error (missing required stores, invalid settings).

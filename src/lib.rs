@@ -38,7 +38,7 @@ pub use client::{HaQLiteClient, HaQLiteClientBuilder};
 pub use database::{AuthorizerFactory, ForwardingMode, HaQLite, HaQLiteBuilder};
 pub use error::HaQLiteError;
 pub use forwarding::SqlValue;
-pub use hadb::{validate_mode_durability, Durability, HaMode};
+pub use hadb::{validate_mode_durability, validate_mode_role, Durability, HaMode};
 
 // Re-export rusqlite for query params.
 pub use rusqlite;

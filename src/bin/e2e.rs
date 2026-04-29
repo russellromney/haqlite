@@ -105,7 +105,7 @@ async fn open_node(
 
     let mut builder = HaQLite::builder()
         .prefix(prefix)
-        .mode(HaMode::Dedicated)
+        .mode(HaMode::SingleWriter)
         .durability(hadb::Durability::Replicated(Duration::from_secs(1)))
         .instance_id(instance_id)
         .lease_ttl(args.lease_ttl)
@@ -356,7 +356,7 @@ async fn main() -> Result<()> {
     let prefix = format!("e2e/cloud/{}/", run_id);
 
     info!(
-        "=== haqlite e2e: shared + cloud | {} workers x {} ops ===",
+        "=== haqlite e2e: SharedWriter + Cloud | {} workers x {} ops ===",
         args.workers, args.writes_per_worker
     );
     info!("Bucket: {}, Prefix: {}", args.bucket, prefix);

@@ -1,6 +1,6 @@
-//! Phase Crest: Shared mode integration tests.
+//! Phase Crest: SharedWriter mode integration tests.
 //!
-//! Multi-node shared mode requires S3-backed turbolite for catch-up
+//! Multi-node sharedwriter mode requires S3-backed turbolite for catch-up
 //! (set_manifest evicts groups, next read fetches from S3).
 //!
 //! Requires turbolite-cloud feature.
@@ -49,7 +49,7 @@ fn unique_prefix(name: &str) -> String {
     )
 }
 
-/// Build a Shared mode HaQLite with S3-backed turbolite (Synchronous durability).
+/// Build a SharedWriter mode HaQLite with S3-backed turbolite (Synchronous durability).
 async fn build_shared(
     tmp: &TempDir,
     db_name: &str,
@@ -79,7 +79,7 @@ async fn build_shared(
     let db_path = tmp.path().join(format!("{}.db", db_name));
     Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
@@ -89,7 +89,7 @@ async fn build_shared(
         .write_timeout(Duration::from_secs(2))
         .open(db_path.to_str().unwrap(), SCHEMA)
         .await
-        .expect("open shared mode")
+        .expect("open sharedwriter mode")
 }
 
 // ============================================================================
@@ -176,7 +176,7 @@ async fn shared_sequential_writes_increment_manifest() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_mode_no_forwarding_server() {
-    // Shared mode should not start a forwarding server.
+    // SharedWriter mode should not start a forwarding server.
     // We verify by checking the HaQLite opens successfully without binding a port.
     let tmp = TempDir::new().unwrap();
     let prefix = unique_prefix("shared_mode_no_forwarding_server");
@@ -195,7 +195,7 @@ async fn shared_mode_no_forwarding_server() {
 }
 
 // ============================================================================
-// Dedicated mode backward compat
+// SingleWriter mode backward compat
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
@@ -208,7 +208,7 @@ async fn dedicated_local_mode_still_works() {
     let rows = db
         .execute(
             "INSERT INTO t VALUES (?1, ?2)",
-            &[SqlValue::Integer(1), SqlValue::Text("dedicated".into())],
+            &[SqlValue::Integer(1), SqlValue::Text("singlewriter".into())],
         )
         .await
         .unwrap();
@@ -217,7 +217,7 @@ async fn dedicated_local_mode_still_works() {
     let val: String = db
         .query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0))
         .unwrap();
-    assert_eq!(val, "dedicated");
+    assert_eq!(val, "singlewriter");
 }
 
 // ============================================================================
@@ -235,7 +235,7 @@ async fn shared_two_nodes_a_writes_b_reads_fresh() {
 
     let db_a = build_shared(
         &tmp_a,
-        "shared",
+        "sharedwriter",
         &prefix,
         lease_store.clone(),
         manifest_store.clone(),
@@ -244,7 +244,7 @@ async fn shared_two_nodes_a_writes_b_reads_fresh() {
     .await;
     let db_b = build_shared(
         &tmp_b,
-        "shared",
+        "sharedwriter",
         &prefix,
         lease_store.clone(),
         manifest_store.clone(),
@@ -262,7 +262,7 @@ async fn shared_two_nodes_a_writes_b_reads_fresh() {
 
     // Manifest should show v1
     let meta = manifest_store
-        .meta("test/shared/_manifest")
+        .meta("test/sharedwriter/_manifest")
         .await
         .unwrap()
         .unwrap();
@@ -292,7 +292,7 @@ async fn shared_two_nodes_sequential_writes() {
 
     let db_a = build_shared(
         &tmp_a,
-        "shared",
+        "sharedwriter",
         &prefix,
         lease_store.clone(),
         manifest_store.clone(),
@@ -303,7 +303,7 @@ async fn shared_two_nodes_sequential_writes() {
     // A writes row 1
     db_a.execute("INSERT INTO t VALUES (1, 'a1')", &[]).unwrap();
     let meta = manifest_store
-        .meta("test/shared/_manifest")
+        .meta("test/sharedwriter/_manifest")
         .await
         .unwrap()
         .unwrap();
@@ -313,7 +313,7 @@ async fn shared_two_nodes_sequential_writes() {
     // A writes row 2
     db_a.execute("INSERT INTO t VALUES (2, 'a2')", &[]).unwrap();
     let meta = manifest_store
-        .meta("test/shared/_manifest")
+        .meta("test/sharedwriter/_manifest")
         .await
         .unwrap()
         .unwrap();
@@ -328,7 +328,7 @@ async fn shared_two_nodes_sequential_writes() {
     // B opens (restores from A's snapshot + changesets) and writes row 3
     let db_b = build_shared(
         &tmp_b,
-        "shared",
+        "sharedwriter",
         &prefix,
         lease_store.clone(),
         manifest_store.clone(),
@@ -338,7 +338,7 @@ async fn shared_two_nodes_sequential_writes() {
     db_b.execute("INSERT INTO t VALUES (3, 'b1')", &[]).unwrap();
 
     let meta = manifest_store
-        .meta("test/shared/_manifest")
+        .meta("test/sharedwriter/_manifest")
         .await
         .unwrap()
         .unwrap();
@@ -365,7 +365,7 @@ async fn shared_failover_lease_expires_other_node_writes() {
     {
         let db_a = build_shared(
             &tmp_a,
-            "shared",
+            "sharedwriter",
             &prefix,
             lease_store.clone(),
             manifest_store.clone(),
@@ -380,7 +380,7 @@ async fn shared_failover_lease_expires_other_node_writes() {
     // Node B should be able to write (lease was released by A)
     let db_b = build_shared(
         &tmp_b,
-        "shared",
+        "sharedwriter",
         &prefix,
         lease_store.clone(),
         manifest_store.clone(),
@@ -391,7 +391,7 @@ async fn shared_failover_lease_expires_other_node_writes() {
         .unwrap();
 
     let meta = manifest_store
-        .meta("test/shared/_manifest")
+        .meta("test/sharedwriter/_manifest")
         .await
         .unwrap()
         .unwrap();
@@ -855,7 +855,7 @@ async fn test_write_timeout_lease_contention() {
     let db_path = tmp.path().join("contention.db");
     let mut db = Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
@@ -966,7 +966,7 @@ async fn test_fresh_read_consistency() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fresh_read_empty_database() {
-    // Shared mode: schema is applied by the first write (via execute_shared).
+    // SharedWriter mode: schema is applied by the first write (via execute_shared).
     // Fresh reads before any write should fail because the table doesn't exist
     // yet (no writer has created the schema). This is correct: readers catch up
     // from the manifest store, and an empty manifest has no schema/pages.

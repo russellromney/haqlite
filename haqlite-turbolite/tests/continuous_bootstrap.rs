@@ -174,7 +174,7 @@ async fn continuous_open_publishes_hybrid_manifest_for_fresh_database() {
     let (vfs, vfs_name) = make_remote_vfs(tmp.path(), tiered_storage);
     let _db = Builder::new()
         .prefix("test/")
-        .mode(Mode::Writer)
+        .mode(Mode::SingleWriter)
         .durability(turbodb::Durability::Continuous {
             checkpoint: Default::default(),
             replication_interval: Duration::from_millis(50),
@@ -217,7 +217,7 @@ async fn continuous_open_retries_first_manifest_create_race() {
     let (vfs, vfs_name) = make_remote_vfs(tmp.path(), tiered_storage);
     let _db = Builder::new()
         .prefix("test/")
-        .mode(Mode::Writer)
+        .mode(Mode::SingleWriter)
         .durability(turbodb::Durability::Continuous {
             checkpoint: Default::default(),
             replication_interval: Duration::from_millis(50),
@@ -259,7 +259,7 @@ async fn continuous_open_accepts_same_writer_manifest_when_meta_lags() {
     let (vfs, vfs_name) = make_remote_vfs(tmp.path(), tiered_storage);
     let _db = Builder::new()
         .prefix("test/")
-        .mode(Mode::Writer)
+        .mode(Mode::SingleWriter)
         .durability(turbodb::Durability::Continuous {
             checkpoint: Default::default(),
             replication_interval: Duration::from_millis(50),

@@ -281,7 +281,7 @@ async fn main() -> Result<()> {
     let address = format!("http://localhost:{}", forwarding_port);
 
     // Lease timing knobs (--lease-ttl, --renew-interval-ms,
-    // --follower-poll-ms) flow through the dedicated builder setters below;
+    // --follower-poll-ms) flow through the singlewriter builder setters below;
     // the HaQLite builder patches the lease store + instance id + address
     // into the LeaseConfig at finalize-time without clobbering timing.
     let coordinator_config = CoordinatorConfig {

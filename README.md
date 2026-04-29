@@ -148,7 +148,7 @@ let db = HaQLite::builder()
     .address("http://node1.internal:18080")   // default: auto-detected
     .forwarding_port(18080)                   // internal HTTP port (default: 18080)
     .secret("my-auth-token")                  // inter-node forwarding auth
-    .mode(HaMode::Dedicated)                  // Dedicated (default) or Shared
+    .mode(HaMode::SingleWriter)               // SingleWriter (default) or SharedWriter
     .coordinator_config(config)               // override lease/sync timing
     .open("/data/my.db", schema)
     .await?;
@@ -169,9 +169,10 @@ let db = Builder::new()
     .await?;
 ```
 
-`haqlite-turbolite` wraps base `haqlite` and injects a turbolite VFS for page-level tiering. Two modes:
-- `Mode::Writer` (default) — Single writer with lease-per-database. Maps to haqlite's Dedicated mode.
-- `Mode::MultiWriter` (experimental) — Multiple writers with per-write lease acquisition. Requires Cloud durability.
+`haqlite-turbolite` wraps base `haqlite` and injects a turbolite VFS for page-level tiering. Modes and roles use the canonical `hadb` vocabulary:
+- `Mode::SingleWriter` (default) — one persistent lease holder. Runtime role is assigned as `Role::Leader` or `Role::Follower`.
+- `Mode::SharedWriter` — visible in the API for the future per-write lease topology, but not implemented yet.
+- `Role::Client` — visible in the API for future read-only replicas that never claim leases.
 
 ## Local mode (no HA)
 

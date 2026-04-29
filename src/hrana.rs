@@ -64,9 +64,15 @@ impl HranaBackend for HaqliteHranaBackend {
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                     | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
             }
-            Some(Role::Follower) => {
+            Some(Role::Follower) | Some(Role::Client) => {
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                     | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            }
+            Some(Role::LatentWriter) => {
+                return Err(HranaError {
+                    message: "LatentWriter mode not yet implemented in hrana".to_string(),
+                    code: "INTERNAL".to_string(),
+                });
             }
         };
 

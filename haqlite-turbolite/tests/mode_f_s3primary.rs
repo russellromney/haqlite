@@ -1,4 +1,4 @@
-//! Mode F: haqlite shared + turbolite S3Primary multiwriter.
+//! Mode F: haqlite sharedwriter + turbolite S3Primary multiwriter.
 //!
 //! Every commit uploads dirty subframes to S3. No WAL, no walrust.
 //! Catch-up is set_manifest only (page groups in S3 = full state).
@@ -50,9 +50,9 @@ fn unique_prefix(name: &str) -> String {
     )
 }
 
-/// Build a Mode F node: turbolite S3Primary + haqlite shared.
+/// Build a Mode F node: turbolite S3Primary + haqlite sharedwriter.
 /// Each node gets its own S3 prefix (turbolite is single-writer per VFS).
-/// Coordination via shared lease_store + manifest_store.
+/// Coordination via sharedwriter lease_store + manifest_store.
 async fn build_mode_f_node(
     cache_dir: &std::path::Path,
     db_name: &str,
@@ -89,7 +89,7 @@ async fn build_mode_f_node(
     // interfere with multiwriter catch-up.
     Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)

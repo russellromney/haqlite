@@ -54,7 +54,7 @@ fn unique_prefix(name: &str) -> String {
     )
 }
 
-/// Build a shared-mode node with Cloud durability.
+/// Build a sharedwriter-mode node with Cloud durability.
 async fn build_node(
     cache_dir: &std::path::Path,
     s3_prefix: &str,
@@ -84,7 +84,7 @@ async fn build_node(
     let db_path = cache_dir.join("e2e.db");
     let mut builder = Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
@@ -276,7 +276,7 @@ async fn e2e_synchronous_four_nodes_concurrent() {
 
 // Eventual + Shared is an invalid configuration (haqlite rejects it at open time).
 // Multi-writer requires every write to be durable to S3 so each writer sees the
-// latest state. Eventual durability with Dedicated mode (single leader + followers)
+// latest state. Eventual durability with SingleWriter mode (single leader + followers)
 // is tested in ha_database.rs.
 
 // ============================================================================
@@ -327,7 +327,7 @@ async fn e2e_write_fails_without_lease() {
 
     let db = Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)

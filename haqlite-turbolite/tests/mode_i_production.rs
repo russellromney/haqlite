@@ -50,7 +50,7 @@ fn unique_prefix(name: &str) -> String {
     )
 }
 
-/// Build a Mode I node: turbolite Durable + walrust + haqlite shared.
+/// Build a Mode I node: turbolite Durable + walrust + haqlite sharedwriter.
 async fn build_mode_i_node(
     cache_dir: &std::path::Path,
     db_name: &str,
@@ -83,7 +83,7 @@ async fn build_mode_i_node(
     let db_path = cache_dir.join(format!("{}.db", db_name));
     Builder::new()
         .prefix("test/")
-        .mode(Mode::MultiWriter)
+        .mode(Mode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)

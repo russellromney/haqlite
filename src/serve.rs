@@ -65,7 +65,7 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
 
     // The HaQLite builder patches the lease store / instance id / address
     // into whatever `LeaseConfig` we provide here; it preserves our timing
-    // policy. Lease timing knobs flow through the dedicated builder
+    // policy. Lease timing knobs flow through the singlewriter builder
     // setters below (`.lease_ttl()`, `.lease_renew_interval()`,
     // `.lease_follower_poll_interval()`), so the coordinator config here
     // just carries non-lease fields.
@@ -81,9 +81,11 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
         .unwrap_or_else(|_| serve.mode.clone())
         .to_lowercase();
     let ha_mode = match mode_str.as_str() {
-        "dedicated" => HaMode::Dedicated,
-        "shared" => HaMode::Shared,
-        other => anyhow::bail!("invalid HAQLITE_MODE '{other}' (expected 'dedicated' or 'shared')"),
+        "singlewriter" | "dedicated" => HaMode::SingleWriter,
+        "sharedwriter" | "shared" => HaMode::SharedWriter,
+        other => anyhow::bail!(
+            "invalid HAQLITE_MODE '{other}' (expected 'singlewriter' or 'sharedwriter')"
+        ),
     };
 
     // Build HaQLite.

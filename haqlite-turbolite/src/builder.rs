@@ -3,32 +3,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use hadb::{LeaseStore, NoOpReplicator, Replicator};
+use hadb::{LeaseStore, NoOpReplicator, Replicator, Role};
 use haqlite::{ForwardingMode, HaQLite, HaQLiteBuilder};
 use turbodb::ManifestStore;
 use turbolite::tiered::SharedTurboliteVfs;
 
-/// Coordination topology for tiered HA SQLite.
-///
-/// Today only `Writer` (single-writer, lease-protected) ships. The enum is
-/// kept as the future-proof shape for additional coordination topologies
-/// (multi-writer with per-write lease, read-only replica, etc.) — adding a
-/// new variant later is non-breaking, removing the enum and re-introducing
-/// it would force every caller to add a `.mode(...)` call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// Single writer with lease-per-database (production default).
-    /// Maps to haqlite's Dedicated mode.
-    Writer,
-}
-
-impl std::fmt::Display for Mode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Mode::Writer => write!(f, "Writer"),
-        }
-    }
-}
+/// Canonical coordination topology for tiered HA SQLite.
+pub use hadb::HaMode as Mode;
 
 #[derive(Debug, Clone)]
 enum CinchHttpConfig {
@@ -82,6 +63,7 @@ impl CinchHttpConfig {
 pub struct Builder {
     inner: HaQLiteBuilder,
     mode: Mode,
+    role: Option<Role>,
     turbolite_durability: turbodb::Durability,
     turbolite_http: Option<CinchHttpConfig>,
     manifest_http: Option<CinchHttpConfig>,
@@ -109,7 +91,8 @@ impl Builder {
     pub fn new() -> Self {
         Self {
             inner: HaQLiteBuilder::new(),
-            mode: Mode::Writer,
+            mode: Mode::SingleWriter,
+            role: None,
             turbolite_durability: turbodb::Durability::default(),
             turbolite_http: None,
             manifest_http: None,
@@ -195,6 +178,11 @@ impl Builder {
 
     pub fn mode(mut self, mode: Mode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    pub fn role(mut self, role: Role) -> Self {
+        self.role = Some(role);
         self
     }
 
@@ -304,8 +292,27 @@ impl Builder {
     }
 
     pub async fn open(self, db_path: &str, schema: &str) -> Result<HaQLite> {
-        match self.mode {
-            Mode::Writer => self.open_writer(db_path, schema).await,
+        let role_for_validation = self.role.unwrap_or(match self.mode {
+            Mode::SingleWriter => Role::Leader,
+            Mode::SharedWriter => Role::LatentWriter,
+        });
+        hadb::validate_mode_role(self.mode, role_for_validation)
+            .map_err(|e| anyhow::anyhow!("invalid mode/role combination: {e}"))?;
+
+        match (self.mode, self.role) {
+            (Mode::SingleWriter, None | Some(Role::Leader) | Some(Role::Follower)) => {
+                self.open_writer(db_path, schema).await
+            }
+            (Mode::SingleWriter, Some(Role::Client)) | (Mode::SharedWriter, Some(Role::Client)) => {
+                anyhow::bail!("Client mode not yet implemented in haqlite-turbolite")
+            }
+            (Mode::SharedWriter, None | Some(Role::LatentWriter)) => {
+                anyhow::bail!("SharedWriter mode not yet implemented in haqlite-turbolite")
+            }
+            (Mode::SingleWriter, Some(Role::LatentWriter))
+            | (Mode::SharedWriter, Some(Role::Leader | Role::Follower)) => {
+                unreachable!("mode/role validation should reject this combination")
+            }
         }
     }
 
@@ -372,7 +379,7 @@ impl Builder {
                 }
                 Arc::new(store)
             } else {
-                anyhow::bail!("Turbolite-backed Writer mode requires manifest_store()");
+                anyhow::bail!("Turbolite-backed SingleWriter mode requires manifest_store()");
             };
 
         let (shared_vfs, vfs_name) = if let Some((ref vfs, ref name)) = self.turbolite_vfs {

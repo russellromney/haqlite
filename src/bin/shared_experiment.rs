@@ -245,7 +245,7 @@ async fn main() -> Result<()> {
         other => anyhow::bail!("unknown durability: {} (expected: cloud)", other),
     };
 
-    info!("=== haqlite shared-mode experiment ===");
+    info!("=== haqlite shared-writer mode experiment ===");
     info!("Instance: {}", instance_id);
     info!("Bucket: {}", args.bucket);
     info!("Prefix: {}", args.prefix);
@@ -260,7 +260,7 @@ async fn main() -> Result<()> {
 
     let mut builder = HaQLite::builder()
         .prefix(&args.prefix)
-        .mode(HaMode::Dedicated)
+        .mode(HaMode::SingleWriter)
         .durability(hadb::Durability::Replicated(Duration::from_secs(1)))
         .instance_id(&instance_id)
         .lease_ttl(args.lease_ttl);

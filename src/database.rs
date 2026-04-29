@@ -60,8 +60,10 @@ const DEFAULT_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 const ROLE_LEADER: u8 = 0;
 const ROLE_FOLLOWER: u8 = 1;
+const ROLE_CLIENT: u8 = 2;
+const ROLE_LATENT_WRITER: u8 = 3;
 
-/// How a dedicated-mode leader accepts forwarded writes from followers.
+/// How a singlewriter-mode leader accepts forwarded writes from followers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardingMode {
     /// Use haqlite's built-in HTTP forwarding server on the given port.
@@ -84,7 +86,7 @@ impl ForwardingMode {
 
 // Re-export canonical mode/durability types from hadb.
 // Shared across haqlite and hakuzu for consistent validation.
-pub use hadb::{validate_mode_durability, Durability, HaMode};
+pub use hadb::{validate_mode_durability, validate_mode_role, Durability, HaMode};
 
 /// Builder for creating an HA SQLite instance.
 ///
@@ -117,6 +119,7 @@ pub struct HaQLiteBuilder {
     read_concurrency: usize,
     lease_store: Option<Arc<dyn hadb::LeaseStore>>,
     mode: HaMode,
+    role: Option<Role>,
     durability: Option<hadb::Durability>,
     manifest_poll_interval: Option<Duration>,
     write_timeout: Option<Duration>,
@@ -148,7 +151,8 @@ impl HaQLiteBuilder {
             secret: None,
             read_concurrency: DEFAULT_READ_CONCURRENCY,
             lease_store: None,
-            mode: HaMode::Dedicated,
+            mode: HaMode::SingleWriter,
+            role: None,
             durability: None,
             manifest_poll_interval: None,
             write_timeout: None,
@@ -254,9 +258,20 @@ impl HaQLiteBuilder {
         )))
     }
 
-    /// Set the coordination topology. Default: `HaMode::Dedicated`.
+    /// Set the coordination topology. Default: `HaMode::SingleWriter`.
     pub fn mode(mut self, mode: HaMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    /// Set a self-declared role.
+    ///
+    /// Leave unset for the normal SingleWriter path, where the lease outcome
+    /// assigns `Leader` or `Follower`. `Client` and `LatentWriter` are visible
+    /// in the type system now, but their base-haqlite implementations are not
+    /// wired yet and will fail clearly during `open()`.
+    pub fn role(mut self, role: Role) -> Self {
+        self.role = Some(role);
         self
     }
 
@@ -267,35 +282,35 @@ impl HaQLiteBuilder {
         self
     }
 
-    /// Shared mode manifest polling interval. Default: 1s.
-    /// Manifest polling interval for Shared mode. Default: 1s.
+    /// SharedWriter mode manifest polling interval. Default: 1s.
+    /// Manifest polling interval for SharedWriter mode. Default: 1s.
     pub fn manifest_poll_interval(mut self, interval: Duration) -> Self {
         self.manifest_poll_interval = Some(interval);
         self
     }
 
-    /// Write timeout for lease acquisition in Shared mode. Default: 5s.
+    /// Write timeout for lease acquisition in SharedWriter mode. Default: 5s.
     pub fn write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = Some(timeout);
         self
     }
 
-    /// Lease TTL in seconds. Applies to both Dedicated mode (fed into the
-    /// Coordinator's `LeaseConfig`) and Shared mode (used for lease acquisition
+    /// Lease TTL in seconds. Applies to both SingleWriter mode (fed into the
+    /// Coordinator's `LeaseConfig`) and SharedWriter mode (used for lease acquisition
     /// during writes). Default: 5.
     pub fn lease_ttl(mut self, ttl_secs: u64) -> Self {
         self.lease_ttl = Some(ttl_secs);
         self
     }
 
-    /// Lease renewal interval (Dedicated mode). How often the leader refreshes
+    /// Lease renewal interval (SingleWriter mode). How often the leader refreshes
     /// its lease in the backing store. Default: 2s.
     pub fn lease_renew_interval(mut self, interval: Duration) -> Self {
         self.lease_renew_interval = Some(interval);
         self
     }
 
-    /// Follower poll interval (Dedicated mode). How often followers check the
+    /// Follower poll interval (SingleWriter mode). How often followers check the
     /// lease for leader death. Default: 1s.
     pub fn lease_follower_poll_interval(mut self, interval: Duration) -> Self {
         self.lease_follower_poll_interval = Some(interval);
@@ -368,6 +383,9 @@ impl HaQLiteBuilder {
     pub fn get_mode(&self) -> HaMode {
         self.mode
     }
+    pub fn get_role(&self) -> Option<Role> {
+        self.role
+    }
     pub fn get_durability(&self) -> Option<hadb::Durability> {
         self.durability
     }
@@ -397,6 +415,32 @@ impl HaQLiteBuilder {
     ///
     /// `schema` is run once on first open (e.g. CREATE TABLE IF NOT EXISTS ...).
     pub async fn open(self, db_path: &str, schema: &str) -> Result<HaQLite> {
+        let role_for_validation = self.role.unwrap_or(match self.mode {
+            HaMode::SingleWriter => Role::Leader,
+            HaMode::SharedWriter => Role::LatentWriter,
+        });
+        validate_mode_role(self.mode, role_for_validation)
+            .map_err(|e| anyhow::anyhow!("invalid mode/role combination: {e}"))?;
+
+        match (self.mode, self.role) {
+            (HaMode::SingleWriter, Some(Role::Client)) => {
+                anyhow::bail!("Client mode not yet implemented in base haqlite")
+            }
+            (HaMode::SharedWriter, Some(Role::Client)) => {
+                anyhow::bail!("Client mode not yet implemented in base haqlite")
+            }
+            (HaMode::SharedWriter, None | Some(Role::LatentWriter)) => {
+                anyhow::bail!(
+                    "SharedWriter not implemented in base haqlite - would require sync WAL replication before commit ack"
+                )
+            }
+            (HaMode::SingleWriter, None | Some(Role::Leader) | Some(Role::Follower)) => {}
+            (HaMode::SingleWriter, Some(Role::LatentWriter))
+            | (HaMode::SharedWriter, Some(Role::Leader | Role::Follower)) => {
+                unreachable!("mode/role validation should reject this combination")
+            }
+        }
+
         let db_path = PathBuf::from(db_path);
         let db_name = db_path
             .file_stem()
@@ -417,7 +461,7 @@ impl HaQLiteBuilder {
 
         let walrust_storage = self
             .walrust_storage
-            .ok_or_else(|| anyhow::anyhow!("Dedicated mode requires walrust storage"))?;
+            .ok_or_else(|| anyhow::anyhow!("SingleWriter mode requires walrust storage"))?;
 
         let lease_store: Arc<dyn hadb::LeaseStore> = self.lease_store.ok_or_else(|| {
             anyhow::anyhow!(
@@ -552,11 +596,11 @@ pub struct HaQLiteInner {
     pub follower_caught_up: Arc<AtomicBool>,
     /// Current follower replay position (TXID).
     pub follower_replay_position: Arc<AtomicU64>,
-    // Shared mode fields
+    // SharedWriter mode fields
     pub mode: HaMode,
-    /// Direct lease store access (Shared mode, bypasses Coordinator).
+    /// Direct lease store access (SharedWriter mode, bypasses Coordinator).
     pub shared_lease_store: Option<Arc<dyn hadb::LeaseStore>>,
-    /// Direct replicator access (Shared mode).
+    /// Direct replicator access (SharedWriter mode).
     pub shared_replicator: Option<Arc<SqliteReplicator>>,
     /// Walrust storage backend for pull_incremental.
     pub shared_walrust_storage: Option<Arc<dyn hadb_storage::StorageBackend>>,
@@ -564,13 +608,13 @@ pub struct HaQLiteInner {
     pub shared_prefix: String,
     /// Instance ID for this node.
     pub shared_instance_id: String,
-    /// Serializes all writes in Shared mode.
+    /// Serializes all writes in SharedWriter mode.
     pub write_mutex: tokio::sync::Mutex<()>,
     /// Cached manifest version for freshness checks.
     pub cached_manifest_version: AtomicU64,
     /// Write timeout for lease acquisition.
     pub write_timeout: Duration,
-    /// Lease TTL for shared mode leases.
+    /// Lease TTL for shared-writer mode leases.
     pub lease_ttl: u64,
     /// Schema SQL to apply on first write (deferred from open for S3Primary compat).
     pub schema_sql: Option<String>,
@@ -709,6 +753,8 @@ impl HaQLiteInner {
         match self.role.load(Ordering::SeqCst) {
             ROLE_LEADER => Some(Role::Leader),
             ROLE_FOLLOWER => Some(Role::Follower),
+            ROLE_CLIENT => Some(Role::Client),
+            ROLE_LATENT_WRITER => Some(Role::LatentWriter),
             _ => None,
         }
     }
@@ -719,6 +765,8 @@ impl HaQLiteInner {
             match role {
                 Role::Leader => ROLE_LEADER,
                 Role::Follower => ROLE_FOLLOWER,
+                Role::Client => ROLE_CLIENT,
+                Role::LatentWriter => ROLE_LATENT_WRITER,
             },
             Ordering::SeqCst,
         );
@@ -862,7 +910,7 @@ impl HaQLite {
             read_semaphore: tokio::sync::Semaphore::new(DEFAULT_READ_CONCURRENCY),
             follower_caught_up: Arc::new(AtomicBool::new(true)),
             follower_replay_position: Arc::new(AtomicU64::new(0)),
-            mode: HaMode::Dedicated,
+            mode: HaMode::SingleWriter,
             shared_lease_store: None,
             shared_replicator: None,
             shared_walrust_storage: None,
@@ -959,7 +1007,7 @@ impl HaQLite {
     ///
     /// Execute SQL. Synchronous on the leader (the common path).
     /// On a follower: blocks on HTTP forwarding to the leader.
-    /// In shared mode: blocks on lease acquisition + S3 commit.
+    /// In shared-writer mode: blocks on lease acquisition + S3 commit.
     pub fn execute(
         &self,
         sql: &str,
@@ -970,7 +1018,7 @@ impl HaQLite {
             .map(|p| p as &dyn rusqlite::types::ToSql)
             .collect();
         match self.inner.mode {
-            HaMode::Dedicated => {
+            HaMode::SingleWriter => {
                 let role = self.inner.current_role();
                 match role {
                     Some(Role::Leader) | None => self.execute_local_raw(sql, &param_refs),
@@ -984,16 +1032,23 @@ impl HaQLite {
                             handle.block_on(self.execute_forwarded(sql, params))
                         })
                     }
+                    Some(Role::Client) => Err(HaQLiteError::ConfigurationError(
+                        "Client mode not yet implemented in base haqlite".into(),
+                    )),
+                    Some(Role::LatentWriter) => Err(HaQLiteError::ConfigurationError(
+                        "LatentWriter requires SharedWriter mode".into(),
+                    )),
                 }
             }
-            HaMode::Shared => Err(HaQLiteError::ConfigurationError(
-                "Shared mode not supported in base haqlite. Use the tiered-storage crate.".into(),
+            HaMode::SharedWriter => Err(HaQLiteError::ConfigurationError(
+                "SharedWriter mode not supported in base haqlite. Use the tiered-storage crate."
+                    .into(),
             )),
         }
     }
 
     /// Async execute for callers already in an async context.
-    /// Equivalent to `execute()` but avoids the `block_on` for follower/shared paths.
+    /// Equivalent to `execute()` but avoids the `block_on` for follower/shared-writer paths.
     ///
     /// The returned future is Send, so it can be used with `tokio::spawn`.
     pub async fn execute_async(
@@ -1002,7 +1057,7 @@ impl HaQLite {
         params: &[SqlValue],
     ) -> std::result::Result<u64, HaQLiteError> {
         match self.inner.mode {
-            HaMode::Dedicated => {
+            HaMode::SingleWriter => {
                 let role = self.inner.current_role();
                 match role {
                     Some(Role::Leader) | None => {
@@ -1015,21 +1070,28 @@ impl HaQLite {
                         self.execute_local_raw(sql, &param_refs)
                     }
                     Some(Role::Follower) => self.execute_forwarded(sql, params).await,
+                    Some(Role::Client) => Err(HaQLiteError::ConfigurationError(
+                        "Client mode not yet implemented in base haqlite".into(),
+                    )),
+                    Some(Role::LatentWriter) => Err(HaQLiteError::ConfigurationError(
+                        "LatentWriter requires SharedWriter mode".into(),
+                    )),
                 }
             }
-            HaMode::Shared => Err(HaQLiteError::ConfigurationError(
-                "Shared mode not supported in base haqlite. Use the tiered-storage crate.".into(),
+            HaMode::SharedWriter => Err(HaQLiteError::ConfigurationError(
+                "SharedWriter mode not supported in base haqlite. Use the tiered-storage crate."
+                    .into(),
             )),
         }
     }
 
     /// Query a single row from local state. Does NOT catch up from manifest.
     ///
-    /// **In Shared mode, this may return stale data.** If another node has written
+    /// **In SharedWriter mode, this may return stale data.** If another node has written
     /// since this node last caught up, `query_row_local` will not see those writes.
-    /// Use [`query_row_fresh`] for consistency in Shared mode.
+    /// Use [`query_row_fresh`] for consistency in SharedWriter mode.
     ///
-    /// In Dedicated mode: leader reads from persistent connection, follower opens
+    /// In SingleWriter mode: leader reads from persistent connection, follower opens
     /// a fresh read-only connection (sees walrust LTX updates).
     pub fn query_row_local<T, F>(
         &self,
@@ -1074,6 +1136,12 @@ impl HaQLite {
                 conn.query_row(sql, params, f)
                     .map_err(|e| HaQLiteError::DatabaseError(format!("query_row failed: {e}")))
             }
+            Some(Role::Client) => Err(HaQLiteError::ConfigurationError(
+                "Client mode not yet implemented in base haqlite".into(),
+            )),
+            Some(Role::LatentWriter) => Err(HaQLiteError::ConfigurationError(
+                "LatentWriter requires SharedWriter mode".into(),
+            )),
         }
     }
 
@@ -1095,7 +1163,7 @@ impl HaQLite {
 
     /// Query rows from local state. Does NOT catch up from manifest.
     ///
-    /// **In Shared mode, this may return stale data.** Use [`query_values_fresh`] for consistency.
+    /// **In SharedWriter mode, this may return stale data.** Use [`query_values_fresh`] for consistency.
     ///
     /// Returns all matching rows. Each row is a Vec of column values.
     /// Returns an empty Vec if no rows match (not an error).
@@ -1163,6 +1231,12 @@ impl HaQLite {
                 })?;
                 query_with(&conn)
             }
+            Some(Role::Client) => Err(HaQLiteError::ConfigurationError(
+                "Client mode not yet implemented in base haqlite".into(),
+            )),
+            Some(Role::LatentWriter) => Err(HaQLiteError::ConfigurationError(
+                "LatentWriter requires SharedWriter mode".into(),
+            )),
         }
     }
 
@@ -1241,6 +1315,7 @@ impl HaQLite {
         match self.inner.current_role() {
             Some(Role::Leader) | None => true,
             Some(Role::Follower) => self.inner.follower_caught_up.load(Ordering::SeqCst),
+            Some(Role::Client) | Some(Role::LatentWriter) => false,
         }
     }
 
@@ -1330,7 +1405,7 @@ impl HaQLite {
     }
 
     /// Read with freshness guarantee: checks manifest and catches up before querying.
-    /// In Dedicated mode, this is equivalent to `query_row_local()`.
+    /// In SingleWriter mode, this is equivalent to `query_row_local()`.
     pub async fn query_row_fresh<T, F>(
         &self,
         sql: &str,
@@ -1634,6 +1709,9 @@ pub async fn open_with_coordinator(
         role: AtomicU8::new(match initial_role {
             Role::Leader => ROLE_LEADER,
             Role::Follower => ROLE_FOLLOWER,
+            Role::Client | Role::LatentWriter => {
+                unreachable!("Coordinator join only yields Leader or Follower")
+            }
         }),
         conn: arc_swap::ArcSwapOption::new(None),
         leader_address: RwLock::new(leader_addr),
@@ -1642,7 +1720,7 @@ pub async fn open_with_coordinator(
         read_semaphore: tokio::sync::Semaphore::new(read_concurrency),
         follower_caught_up: caught_up,
         follower_replay_position: position,
-        mode: HaMode::Dedicated,
+        mode: HaMode::SingleWriter,
         shared_lease_store: None,
         shared_replicator: None,
         shared_walrust_storage: None,
@@ -1759,7 +1837,7 @@ pub async fn run_role_listener(
 }
 
 // ============================================================================
-// Shared mode: open + manifest poller
+// SharedWriter mode: open + manifest poller
 // ============================================================================
 
 #[allow(clippy::too_many_arguments)]

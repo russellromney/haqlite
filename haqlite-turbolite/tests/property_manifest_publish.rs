@@ -41,10 +41,10 @@ proptest! {
     // Single-writer only (local VFS), so only 1 possible value. 5 cases
     // for variance in the proptest seed, not 256.
     #![proptest_config(proptest::prelude::ProptestConfig::with_cases(5))]
-    /// Test Shared mode write path: lease acquire, execute, release.
+    /// Test SharedWriter mode write path: lease acquire, execute, release.
     ///
     /// Uses local-only VFS (no S3), so only single-writer is valid.
-    /// Multi-writer coordination needs shared storage (S3 or HTTP) so
+    /// Multi-writer coordination needs sharedwriter storage (S3 or HTTP) so
     /// writers can see each other's manifests via xSync. That requires
     /// /v1/sync/pages endpoints and will be tested as an integration
     /// test against a running storage gateway.
@@ -63,10 +63,10 @@ proptest! {
             for i in 0..num_writers {
                 let tmp = TempDir::new().unwrap();
                 let (vfs, vfs_name) = make_local_vfs(tmp.path());
-                let db_path = tmp.path().join("shared.db");
+                let db_path = tmp.path().join("sharedwriter.db");
                 let mut db = Builder::new()
                     .prefix("test/")
-                    .mode(Mode::MultiWriter)
+                    .mode(Mode::SharedWriter)
                     .durability(turbodb::Durability::Cloud)
                     .lease_store(lease_store.clone())
                     .manifest_store(manifest_store.clone())
@@ -77,7 +77,7 @@ proptest! {
                     .write_timeout(Duration::from_secs(3))
                     .open(db_path.to_str().unwrap(), SCHEMA)
                     .await
-                    .expect("open shared");
+                    .expect("open sharedwriter");
                 dbs.push((Arc::new(db), tmp));
             }
 

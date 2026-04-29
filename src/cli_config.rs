@@ -44,7 +44,7 @@ pub struct ServeConfig {
     #[serde(default = "default_follower_pull_ms")]
     pub follower_pull_ms: u64,
 
-    /// Coordination mode: "dedicated" (default) or "shared".
+    /// Coordination mode: "singlewriter" (default) or "sharedwriter".
     #[serde(default = "default_mode")]
     pub mode: String,
 }
@@ -65,5 +65,5 @@ fn default_follower_pull_ms() -> u64 {
     1000
 }
 fn default_mode() -> String {
-    "dedicated".to_string()
+    "singlewriter".to_string()
 }

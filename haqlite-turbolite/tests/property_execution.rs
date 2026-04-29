@@ -180,7 +180,7 @@ proptest! {
             let db_path = tmp.path().join("shared_serial.db");
             let mut db = Builder::new()
                 .prefix("test/")
-                .mode(Mode::MultiWriter)
+                .mode(Mode::SharedWriter)
                 .durability(turbodb::Durability::Cloud)
                 .lease_store(lease_store)
                 .manifest_store(manifest_store)
@@ -191,12 +191,12 @@ proptest! {
                 .write_timeout(Duration::from_secs(5))
                 .open(db_path.to_str().unwrap(), SCHEMA)
                 .await
-                .expect("open shared mode");
+                .expect("open sharedwriter mode");
 
             let db = Arc::new(db);
 
             // execute_async's future is Send (param_refs scoped to sync branch).
-            // Run writes sequentially to test Shared mode lease contention.
+            // Run writes sequentially to test SharedWriter mode lease contention.
             let mut successes = 0u64;
             for i in 0..num_writes {
                 let id = i as i64;

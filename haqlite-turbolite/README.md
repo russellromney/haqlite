@@ -18,7 +18,7 @@ use haqlite_turbolite::{Builder, Mode};
 use turbodb::Durability;
 
 let db = Builder::new()
-    .mode(Mode::Writer)                        // single-writer with lease
+    .mode(Mode::SingleWriter)                        // single-writer with lease
     .durability(Durability::default())          // Continuous (page checkpoints + 1s log shipping)
     .lease_store(my_lease_store)
     .manifest_store(my_manifest_store)
@@ -36,12 +36,16 @@ let db = Builder::new()
 |---|---|---|---|---|
 | `Checkpoint` | on checkpoint trigger (time/commits/WAL bytes) | never | checkpoint interval | dev, single-node, desktop apps |
 | `Continuous` (default) | on checkpoint | 1s cadence | ≤ 1s | production tiered HA |
-| `Cloud` | every commit, before ack | n/a (pages are the replication) | 0 | multi-writer (`Mode::MultiWriter`) |
+| `Cloud` | every commit, before ack | n/a (pages are the replication) | 0 | multi-writer (`Mode::SharedWriter`) |
 
 ## Modes
 
-- `Mode::Writer` — single persistent writer, lease-protected. Production default.
-- `Mode::MultiWriter` — multiple writers, per-write lease acquisition. Experimental; requires `Durability::Cloud`.
+- `Mode::SingleWriter` — single persistent writer, lease-protected. Production default.
+- `Mode::SharedWriter` — planned per-write lease topology. Visible in the API, but not implemented yet.
+
+## Roles
+
+Roles are a separate axis from mode. In `SingleWriter`, the lease outcome assigns `Role::Leader` or `Role::Follower`. `Role::Client` is reserved for future read-only replicas that never claim a lease.
 
 ## Rollback detection
 
