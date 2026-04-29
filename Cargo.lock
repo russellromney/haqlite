@@ -1839,6 +1839,7 @@ dependencies = [
  "hadb-storage-local",
  "hadb-storage-s3",
  "haqlite",
+ "proptest",
  "reqwest",
  "rmp-serde",
  "rusqlite",
@@ -4217,6 +4218,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "hadb-lease",
  "hadb-storage",
  "reqwest",
  "rmp-serde",
@@ -4245,6 +4247,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "atty",
+ "cc",
  "clap",
  "clap_complete",
  "file-guard",
@@ -4252,6 +4255,7 @@ dependencies = [
  "fs2",
  "hadb-storage",
  "hadb-storage-local",
+ "hadb-storage-s3",
  "libc",
  "libsqlite3-sys",
  "once_cell",
@@ -4268,6 +4272,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ureq",
+ "walrust",
  "zstd",
 ]
 
