@@ -30,6 +30,50 @@ impl std::fmt::Display for Mode {
     }
 }
 
+#[derive(Debug, Clone)]
+enum CinchHttpConfig {
+    Public {
+        endpoint: String,
+        token: String,
+    },
+    Internal {
+        endpoint: String,
+        database_id: String,
+    },
+}
+
+impl CinchHttpConfig {
+    fn endpoint(&self) -> &str {
+        match self {
+            Self::Public { endpoint, .. } | Self::Internal { endpoint, .. } => endpoint,
+        }
+    }
+
+    fn manifest_store(&self) -> turbodb_manifest_cinch::CinchManifestStore {
+        match self {
+            Self::Public { endpoint, token } => {
+                turbodb_manifest_cinch::CinchManifestStore::new(endpoint, token)
+            }
+            Self::Internal {
+                endpoint,
+                database_id,
+            } => turbodb_manifest_cinch::CinchManifestStore::new_internal(endpoint, database_id),
+        }
+    }
+
+    fn storage(&self, prefix: &str) -> hadb_storage_cinch::CinchHttpStorage {
+        match self {
+            Self::Public { endpoint, token } => {
+                hadb_storage_cinch::CinchHttpStorage::new(endpoint, token, prefix)
+            }
+            Self::Internal {
+                endpoint,
+                database_id,
+            } => hadb_storage_cinch::CinchHttpStorage::new_internal(endpoint, database_id, prefix),
+        }
+    }
+}
+
 /// Builder for tiered HA SQLite with turbolite VFS.
 ///
 /// Wraps haqlite's walrust HA layer and injects turbolite for page-level
@@ -39,8 +83,8 @@ pub struct Builder {
     inner: HaQLiteBuilder,
     mode: Mode,
     turbolite_durability: turbodb::Durability,
-    turbolite_http: Option<(String, String)>,
-    manifest_http: Option<(String, String)>,
+    turbolite_http: Option<CinchHttpConfig>,
+    manifest_http: Option<CinchHttpConfig>,
     turbolite_storage: Option<Arc<dyn hadb_storage::StorageBackend>>,
     turbolite_vfs: Option<(SharedTurboliteVfs, String)>,
     manifest_store: Option<Arc<dyn ManifestStore>>,
@@ -160,7 +204,20 @@ impl Builder {
     }
 
     pub fn turbolite_http(mut self, endpoint: &str, token: &str) -> Self {
-        self.turbolite_http = Some((endpoint.to_string(), token.to_string()));
+        self.turbolite_http = Some(CinchHttpConfig::Public {
+            endpoint: endpoint.to_string(),
+            token: token.to_string(),
+        });
+        self
+    }
+
+    /// Use grabby's internal NoAuth sync API for turbolite page/WAL storage.
+    /// Requests carry `database_id` as a query parameter instead of Bearer auth.
+    pub fn turbolite_http_internal(mut self, endpoint: &str, database_id: &str) -> Self {
+        self.turbolite_http = Some(CinchHttpConfig::Internal {
+            endpoint: endpoint.to_string(),
+            database_id: database_id.to_string(),
+        });
         self
     }
 
@@ -181,7 +238,21 @@ impl Builder {
     }
 
     pub fn manifest_endpoint(mut self, endpoint: &str, token: &str) -> Self {
-        self.manifest_http = Some((endpoint.to_string(), token.to_string()));
+        self.manifest_http = Some(CinchHttpConfig::Public {
+            endpoint: endpoint.to_string(),
+            token: token.to_string(),
+        });
+        self.manifest_store = None;
+        self
+    }
+
+    /// Use grabby's internal NoAuth manifest API for system DB manifests.
+    /// Requests carry `database_id` as a query parameter instead of Bearer auth.
+    pub fn manifest_endpoint_internal(mut self, endpoint: &str, database_id: &str) -> Self {
+        self.manifest_http = Some(CinchHttpConfig::Internal {
+            endpoint: endpoint.to_string(),
+            database_id: database_id.to_string(),
+        });
         self.manifest_store = None;
         self
     }
@@ -255,7 +326,7 @@ impl Builder {
             self.rollback_token.as_ref(),
         ) {
             let storage_url = match self.turbolite_http {
-                Some((ref ep, _)) => ep.clone(),
+                Some(ref cfg) => cfg.endpoint().to_string(),
                 None => {
                     anyhow::bail!("with_rollback_detection requires .turbolite_http() to be set")
                 }
@@ -294,8 +365,8 @@ impl Builder {
         let manifest_store: Arc<dyn turbodb::ManifestStore> =
             if let Some(store) = self.manifest_store.clone() {
                 store
-            } else if let Some((ref endpoint, ref token)) = self.manifest_http.clone() {
-                let mut store = turbodb_manifest_cinch::CinchManifestStore::new(endpoint, token);
+            } else if let Some(ref cfg) = self.manifest_http {
+                let mut store = cfg.manifest_store();
                 if let Some((fence, _)) = &shared_fence {
                     store = store.with_fence(fence.clone());
                 }
@@ -322,14 +393,13 @@ impl Builder {
                 ..Default::default()
             };
             let rt_handle = tokio::runtime::Handle::current();
-            let vfs = if let Some((ref ep, ref tok)) = self.turbolite_http {
+            let vfs = if let Some(ref cfg) = self.turbolite_http {
                 let fence = shared_fence
                     .as_ref()
                     .map(|(fence, _)| fence.clone())
                     .expect("turbolite_http implies shared fence");
-                let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(
-                    hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "pages").with_fence(fence),
-                );
+                let storage: Arc<dyn hadb_storage::StorageBackend> =
+                    Arc::new(cfg.storage("pages").with_fence(fence));
                 turbolite::tiered::TurboliteVfs::with_backend(tl_config, storage, rt_handle)
                     .map_err(|e| anyhow::anyhow!("turbolite VFS (HTTP): {e}"))?
             } else if let Some(ref storage) = self.turbolite_storage {
@@ -350,15 +420,12 @@ impl Builder {
                     let storage: Arc<dyn hadb_storage::StorageBackend> =
                         if let Some(storage) = self.inner.get_walrust_storage().cloned() {
                             storage
-                        } else if let Some((ref ep, ref tok)) = self.turbolite_http {
+                        } else if let Some(ref cfg) = self.turbolite_http {
                             let fence = shared_fence
                                 .as_ref()
                                 .map(|(fence, _)| fence.clone())
                                 .expect("turbolite_http implies shared fence");
-                            Arc::new(
-                                hadb_storage_cinch::CinchHttpStorage::new(ep, tok, "wal")
-                                    .with_fence(fence),
-                            )
+                            Arc::new(cfg.storage("wal").with_fence(fence))
                         } else {
                             anyhow::bail!(
                                 "Continuous durability requires walrust storage. \
@@ -368,6 +435,15 @@ impl Builder {
                     Some(storage)
                 }
                 turbodb::Durability::Checkpoint { .. } | turbodb::Durability::Cloud => None,
+            };
+        let walrust_prefix =
+            if self.inner.get_walrust_storage().is_none() && self.turbolite_http.is_some() {
+                // Cinch's HTTP sync API already scopes WAL objects by Bearer token
+                // or internal `database_id`; adding the builder prefix again would
+                // make walrust paths look like `/v1/sync/wal/{database_id}/...`.
+                ""
+            } else {
+                self.inner.get_prefix()
             };
 
         // Pick replicator. Three sources, in priority order:
@@ -404,7 +480,7 @@ impl Builder {
                                 .as_ref()
                                 .expect("continuous durability validated walrust storage")
                                 .clone(),
-                            self.inner.get_prefix(),
+                            walrust_prefix,
                             walrust::ReplicationConfig {
                                 sync_interval: replication_interval,
                                 snapshot_interval,
@@ -421,7 +497,7 @@ impl Builder {
                         self.inner.get_prefix(),
                         &db_name,
                         instance_id.clone(),
-                        self.inner.get_prefix().to_string(),
+                        walrust_prefix.to_string(),
                         walrust_storage
                             .as_ref()
                             .expect("continuous durability validated walrust storage")
@@ -455,7 +531,7 @@ impl Builder {
                                 .as_ref()
                                 .expect("continuous durability validated walrust storage")
                                 .clone(),
-                            self.inner.get_prefix().to_string(),
+                            walrust_prefix.to_string(),
                         );
                 }
             }
