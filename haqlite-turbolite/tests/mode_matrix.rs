@@ -13,8 +13,8 @@ use std::time::Duration;
 use hadb::InMemoryLeaseStore;
 use haqlite::{HaQLite, SqlValue};
 use haqlite_turbolite::{Builder, Mode};
-use turbodb_manifest_mem::MemManifestStore;
 use tempfile::TempDir;
+use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT)";
@@ -36,20 +36,34 @@ struct Encoding {
 }
 
 const TEST_KEY: [u8; 32] = [
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-    0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
 ];
 
 fn encodings() -> Vec<Encoding> {
     let mut v = vec![
-        Encoding { name: "plain", compression_level: 0, encryption_key: None },
-        Encoding { name: "zstd", compression_level: 3, encryption_key: None },
+        Encoding {
+            name: "plain",
+            compression_level: 0,
+            encryption_key: None,
+        },
+        Encoding {
+            name: "zstd",
+            compression_level: 3,
+            encryption_key: None,
+        },
     ];
     // Encryption requires the feature
-    v.push(Encoding { name: "encrypted", compression_level: 0, encryption_key: Some(TEST_KEY) });
-    v.push(Encoding { name: "zstd_enc", compression_level: 3, encryption_key: Some(TEST_KEY) });
+    v.push(Encoding {
+        name: "encrypted",
+        compression_level: 0,
+        encryption_key: Some(TEST_KEY),
+    });
+    v.push(Encoding {
+        name: "zstd_enc",
+        compression_level: 3,
+        encryption_key: Some(TEST_KEY),
+    });
     v
 }
 
@@ -58,8 +72,7 @@ fn encodings() -> Vec<Encoding> {
 // ============================================================================
 
 fn test_bucket() -> String {
-    std::env::var("TIERED_TEST_BUCKET")
-        .expect("TIERED_TEST_BUCKET required")
+    std::env::var("TIERED_TEST_BUCKET").expect("TIERED_TEST_BUCKET required")
 }
 
 fn endpoint_url() -> Option<String> {
@@ -117,32 +130,40 @@ async fn run_mode_sync(enc: &Encoding) {
     // the second VFS would have a stale view of S3.
     let (vfs_a, vfs_name_a) = build_node(tmp_a.path(), "a");
     let mut db_a = Builder::new()
-        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
+        .prefix("test/")
+        .mode(Mode::MultiWriter)
+        .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone())
         .turbolite_vfs(vfs_a, &vfs_name_a)
         .instance_id("node-a")
         .write_timeout(Duration::from_secs(10))
         .open(tmp_a.path().join("t.db").to_str().expect("p"), SCHEMA)
-        .await.expect("open a");
+        .await
+        .expect("open a");
 
     let (vfs_b, vfs_name_b) = build_node(tmp_b.path(), "b");
     let mut db_b = Builder::new()
-        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
+        .prefix("test/")
+        .mode(Mode::MultiWriter)
+        .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone())
         .turbolite_vfs(vfs_b, &vfs_name_b)
         .instance_id("node-b")
         .write_timeout(Duration::from_secs(10))
         .open(tmp_b.path().join("t.db").to_str().expect("p"), SCHEMA)
-        .await.expect("open b");
+        .await
+        .expect("open b");
 
     // Node A writes 5 rows
     for i in 0..5 {
         db_a.execute(
             "INSERT INTO t VALUES (?1, ?2)",
             &[SqlValue::Integer(i), SqlValue::Text(format!("a_{}", i))],
-        ).await.expect("insert a");
+        )
+        .await
+        .expect("insert a");
     }
 
     // Node B writes 5 rows (catches up via S3 manifest)
@@ -150,13 +171,23 @@ async fn run_mode_sync(enc: &Encoding) {
         db_b.execute(
             "INSERT INTO t VALUES (?1, ?2)",
             &[SqlValue::Integer(i), SqlValue::Text(format!("b_{}", i))],
-        ).await.expect("insert b");
+        )
+        .await
+        .expect("insert b");
     }
 
     // Verify all 10 visible
-    let rows = db_b.query_values_fresh("SELECT id FROM t ORDER BY id", &[])
-        .await.expect("query");
-    assert_eq!(rows.len(), 10, "[Mode Sync/{}] expected 10 rows, got {}", enc.name, rows.len());
+    let rows = db_b
+        .query_values_fresh("SELECT id FROM t ORDER BY id", &[])
+        .await
+        .expect("query");
+    assert_eq!(
+        rows.len(),
+        10,
+        "[Mode Sync/{}] expected 10 rows, got {}",
+        enc.name,
+        rows.len()
+    );
 
     db_a.close().await.expect("close a");
     db_b.close().await.expect("close b");

@@ -23,13 +23,13 @@
 mod common;
 
 use common::InMemoryStorage;
+use hadb::InMemoryLeaseStore;
 use haqlite::HaQLite;
 use haqlite_turbolite::{Builder, Mode};
-use turbodb_manifest_mem::MemManifestStore;
-use hadb::InMemoryLeaseStore;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
+use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 /// `unwrap_err()` won't compile because `HaQLite` doesn't implement `Debug`.
@@ -92,7 +92,9 @@ async fn shared_without_lease_errors_clearly() {
 
     let result = Builder::new()
         .prefix("p/")
-        .instance_id("test-1").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
+        .instance_id("test-1")
+        .mode(Mode::MultiWriter)
+        .durability(turbodb::Durability::Cloud)
         .turbolite_vfs(vfs, &vfs_name)
         .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .await;
@@ -116,7 +118,9 @@ async fn shared_without_manifest_errors_clearly() {
 
     let result = Builder::new()
         .prefix("p/")
-        .instance_id("test-1").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
+        .instance_id("test-1")
+        .mode(Mode::MultiWriter)
+        .durability(turbodb::Durability::Cloud)
         .turbolite_vfs(vfs, &vfs_name)
         .lease_store(lease)
         .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -141,7 +145,9 @@ async fn shared_without_turbolite_errors_clearly() {
 
     let result = Builder::new()
         .prefix("p/")
-        .instance_id("test-1").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
+        .instance_id("test-1")
+        .mode(Mode::MultiWriter)
+        .durability(turbodb::Durability::Cloud)
         .lease_store(lease)
         .manifest_store(manifest)
         .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -185,7 +191,9 @@ async fn lease_timing_setters_reach_coordinator() {
         .expect("open");
 
     let coord = db.coordinator().expect("dedicated mode has a coordinator");
-    let cfg = coord.lease_config().expect("LeaseConfig must be present on Dedicated mode");
+    let cfg = coord
+        .lease_config()
+        .expect("LeaseConfig must be present on Dedicated mode");
     assert_eq!(cfg.ttl_secs, 30, "lease_ttl should reach the Coordinator");
     assert_eq!(
         cfg.renew_interval,
@@ -247,8 +255,14 @@ async fn caller_lease_config_timing_is_preserved() {
     assert_eq!(cfg.follower_poll_interval, Duration::from_millis(4_000));
     assert_eq!(cfg.required_expired_reads, 2);
     assert_eq!(cfg.max_consecutive_renewal_errors, 4);
-    assert_eq!(cfg.instance_id, "caller-instance", "builder patches in instance_id");
-    assert_eq!(cfg.address, "http://127.0.0.1:19091", "builder patches in address");
+    assert_eq!(
+        cfg.instance_id, "caller-instance",
+        "builder patches in instance_id"
+    );
+    assert_eq!(
+        cfg.address, "http://127.0.0.1:19091",
+        "builder patches in address"
+    );
 }
 
 #[tokio::test]

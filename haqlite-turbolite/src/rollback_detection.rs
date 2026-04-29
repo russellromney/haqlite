@@ -17,11 +17,7 @@ impl RollbackDetector {
         }
     }
 
-    pub async fn check_and_repair(
-        &self,
-        database_id: &str,
-        db_path: &Path,
-    ) -> Result<bool> {
+    pub async fn check_and_repair(&self, database_id: &str, db_path: &Path) -> Result<bool> {
         let parent = db_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("db_path has no parent: {}", db_path.display()))?;
@@ -29,10 +25,9 @@ impl RollbackDetector {
         let local_manifest_path = cache_dir.join("manifest.msgpack");
 
         let local_epoch_opt = match std::fs::read(&local_manifest_path) {
-            Ok(bytes) => Some(
-                decode_manifest_epoch(&bytes)
-                    .context("decode local manifest epoch")?,
-            ),
+            Ok(bytes) => {
+                Some(decode_manifest_epoch(&bytes).context("decode local manifest epoch")?)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
                 return Err(anyhow::Error::new(e).context(format!(
@@ -63,9 +58,7 @@ impl RollbackDetector {
         };
 
         match local_epoch_opt {
-            Some(local_epoch) if local_epoch == remote_epoch => {
-                Ok(false)
-            }
+            Some(local_epoch) if local_epoch == remote_epoch => Ok(false),
             Some(local_epoch) => {
                 tracing::warn!(
                     database_id = %database_id,
@@ -158,15 +151,10 @@ fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn seed_remote_manifest(
-    cache_dir: &Path,
-    manifest_path: &Path,
-    bytes: &[u8],
-) -> Result<()> {
+fn seed_remote_manifest(cache_dir: &Path, manifest_path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("create cache dir {}", cache_dir.display()))?;
-    std::fs::write(manifest_path, bytes).with_context(|| {
-        format!("pre-seed remote manifest at {}", manifest_path.display())
-    })?;
+    std::fs::write(manifest_path, bytes)
+        .with_context(|| format!("pre-seed remote manifest at {}", manifest_path.display()))?;
     Ok(())
 }

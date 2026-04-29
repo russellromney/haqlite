@@ -3,7 +3,6 @@
 //! Uses turbolite local storage (no cloud/S3 needed).
 //! Tests the per-write lease cycle with turbolite as the storage engine.
 
-
 mod common;
 
 use std::sync::Arc;
@@ -33,7 +32,10 @@ async fn build_turbolite_shared(
 ) -> HaQLite {
     let config = TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        compression: CompressionConfig { level: 1, ..Default::default() },
+        compression: CompressionConfig {
+            level: 1,
+            ..Default::default()
+        },
         cache: CacheConfig {
             pages_per_group: 4, // small for testing
             sub_pages_per_frame: 2,
@@ -45,12 +47,13 @@ async fn build_turbolite_shared(
     let shared_vfs = SharedTurboliteVfs::new(vfs);
     let vfs_for_register = shared_vfs.clone();
 
-    turbolite::tiered::register_shared(vfs_name, vfs_for_register)
-        .expect("register turbolite VFS");
+    turbolite::tiered::register_shared(vfs_name, vfs_for_register).expect("register turbolite VFS");
 
     let db_path = cache_dir.join(format!("{}.db", db_name));
     Builder::new()
-        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
+        .prefix("test/")
+        .mode(Mode::MultiWriter)
+        .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, vfs_name)
@@ -139,7 +142,10 @@ async fn turbolite_shared_manifest_published_after_write() {
         .await
         .expect("get call")
         .expect("manifest should exist");
-    assert!(!manifest.payload.is_empty(), "turbolite payload should be non-empty");
+    assert!(
+        !manifest.payload.is_empty(),
+        "turbolite payload should be non-empty"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -224,7 +230,11 @@ async fn turbolite_shared_manifest_has_turbolite_fields() {
     std::fs::create_dir_all(&fresh_cache).expect("cache dir");
     let fresh_config = TurboliteConfig {
         cache_dir: fresh_cache.clone(),
-        cache: CacheConfig { pages_per_group: 4, sub_pages_per_frame: 2, ..Default::default() },
+        cache: CacheConfig {
+            pages_per_group: 4,
+            sub_pages_per_frame: 2,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let rt_handle = tokio::runtime::Handle::current();
@@ -234,7 +244,10 @@ async fn turbolite_shared_manifest_has_turbolite_fields() {
     let walrust = fresh_vfs
         .set_manifest_bytes(&manifest.payload)
         .expect("set_manifest_bytes");
-    assert!(walrust.is_none(), "pure turbolite payload has no walrust fields");
+    assert!(
+        walrust.is_none(),
+        "pure turbolite payload has no walrust fields"
+    );
     let tl = fresh_vfs.manifest();
     assert!(tl.page_size > 0, "page_size should be > 0");
     assert_eq!(tl.pages_per_group, 4, "should match config");
@@ -262,7 +275,10 @@ async fn turbolite_manifest_bytes_round_trip_preserves_epoch_and_change_counter(
     std::fs::create_dir_all(&cache_dir).expect("cache dir");
     let config = TurboliteConfig {
         cache_dir: cache_dir.clone(),
-        cache: CacheConfig { pages_per_group: 4, ..Default::default() },
+        cache: CacheConfig {
+            pages_per_group: 4,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let rt_handle = tokio::runtime::Handle::current();
@@ -305,14 +321,19 @@ async fn turbolite_manifest_bytes_round_trip_preserves_epoch_and_change_counter(
     std::fs::create_dir_all(&cache_b).expect("cache b");
     let config_b = TurboliteConfig {
         cache_dir: cache_b.clone(),
-        cache: CacheConfig { pages_per_group: 4, ..Default::default() },
+        cache: CacheConfig {
+            pages_per_group: 4,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let rt_handle_b = tokio::runtime::Handle::current();
     let backend_b: Arc<dyn hadb_storage::StorageBackend> =
         Arc::new(hadb_storage_local::LocalStorage::new(&cache_b));
     let vfs_b = TurboliteVfs::with_backend(config_b, backend_b, rt_handle_b).expect("vfs b");
-    let walrust = vfs_b.set_manifest_bytes(&bytes).expect("set_manifest_bytes");
+    let walrust = vfs_b
+        .set_manifest_bytes(&bytes)
+        .expect("set_manifest_bytes");
     assert!(walrust.is_none());
     let got = vfs_b.manifest();
     assert_eq!(got.epoch, 9, "epoch must survive manifest round-trip");
@@ -344,8 +365,10 @@ async fn turbolite_shared_empty_table_read() {
     .await;
 
     // Schema is deferred to first write. Do a no-op write to create the table.
-    db.execute("INSERT INTO t VALUES (1, 'init')", &[]).expect("init write");
-    db.execute("DELETE FROM t WHERE id = 1", &[]).expect("cleanup");
+    db.execute("INSERT INTO t VALUES (1, 'init')", &[])
+        .expect("init write");
+    db.execute("DELETE FROM t WHERE id = 1", &[])
+        .expect("cleanup");
 
     // Read from empty table
     let count: i64 = db
@@ -371,12 +394,9 @@ async fn turbolite_shared_manifest_writer_id_set() {
     )
     .await;
 
-    db.execute_async(
-        "INSERT INTO t (id, val) VALUES (1, 'x')",
-        &[],
-    )
-    .await
-    .expect("insert");
+    db.execute_async("INSERT INTO t (id, val) VALUES (1, 'x')", &[])
+        .await
+        .expect("insert");
 
     let manifest = manifest_store
         .get("test/test/_manifest")

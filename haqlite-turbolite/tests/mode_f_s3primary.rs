@@ -18,8 +18,8 @@ use std::time::Duration;
 use hadb::InMemoryLeaseStore;
 use haqlite::{HaQLite, SqlValue};
 use haqlite_turbolite::{Builder, Mode};
-use turbodb_manifest_mem::MemManifestStore;
 use tempfile::TempDir;
+use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)";
@@ -32,8 +32,7 @@ fn unique_vfs(prefix: &str) -> String {
 }
 
 fn test_bucket() -> String {
-    std::env::var("TIERED_TEST_BUCKET")
-        .expect("TIERED_TEST_BUCKET required")
+    std::env::var("TIERED_TEST_BUCKET").expect("TIERED_TEST_BUCKET required")
 }
 
 fn endpoint_url() -> Option<String> {
@@ -80,8 +79,7 @@ async fn build_mode_f_node(
     };
     let vfs = TurboliteVfs::new(config).expect("create VFS");
     let shared_vfs = SharedTurboliteVfs::new(vfs);
-    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone())
-        .expect("register VFS");
+    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
 
     let db_path = cache_dir.join(format!("{}.db", db_name));
     let db_path_str = db_path.to_str().expect("path");
@@ -90,7 +88,9 @@ async fn build_mode_f_node(
     // Don't do external schema creation -- it triggers S3Primary uploads that
     // interfere with multiwriter catch-up.
     Builder::new()
-        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
+        .prefix("test/")
+        .mode(Mode::MultiWriter)
+        .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, &vfs_name)
@@ -125,13 +125,27 @@ async fn mode_f_baseline_sequential() {
     let manifest_store = Arc::new(MemManifestStore::new());
 
     let mut db_a = build_mode_f_node(
-        tmp_a.path(), "mf_seq", &prefix, lease_store.clone(), manifest_store.clone(),
-        "node-a", 5, 10,
-    ).await;
+        tmp_a.path(),
+        "mf_seq",
+        &prefix,
+        lease_store.clone(),
+        manifest_store.clone(),
+        "node-a",
+        5,
+        10,
+    )
+    .await;
     let mut db_b = build_mode_f_node(
-        tmp_b.path(), "mf_seq", &prefix, lease_store.clone(), manifest_store.clone(),
-        "node-b", 5, 10,
-    ).await;
+        tmp_b.path(),
+        "mf_seq",
+        &prefix,
+        lease_store.clone(),
+        manifest_store.clone(),
+        "node-b",
+        5,
+        10,
+    )
+    .await;
 
     // Node A writes
     db_a.execute("INSERT OR REPLACE INTO kv VALUES ('k1', 'from_a')", &[])
@@ -168,15 +182,29 @@ async fn mode_f_concurrent_no_data_loss() {
 
     let db_a = Arc::new(tokio::sync::Mutex::new(
         build_mode_f_node(
-            tmp_a.path(), "mf_conc", &prefix, lease_store.clone(), manifest_store.clone(),
-            "node-a", 5, 10,
-        ).await,
+            tmp_a.path(),
+            "mf_conc",
+            &prefix,
+            lease_store.clone(),
+            manifest_store.clone(),
+            "node-a",
+            5,
+            10,
+        )
+        .await,
     ));
     let db_b = Arc::new(tokio::sync::Mutex::new(
         build_mode_f_node(
-            tmp_b.path(), "mf_conc", &prefix, lease_store.clone(), manifest_store.clone(),
-            "node-b", 5, 10,
-        ).await,
+            tmp_b.path(),
+            "mf_conc",
+            &prefix,
+            lease_store.clone(),
+            manifest_store.clone(),
+            "node-b",
+            5,
+            10,
+        )
+        .await,
     ));
 
     let a_successes = Arc::new(AtomicU64::new(0));
@@ -188,11 +216,19 @@ async fn mode_f_concurrent_no_data_loss() {
         tokio::spawn(async move {
             let db = db.lock().await;
             for i in 0..10 {
-                match db.execute(
-                    "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
-                    &[SqlValue::Text(format!("a_{}", i)), SqlValue::Text(format!("val_a_{}", i))],
-                ).await {
-                    Ok(_) => { successes.fetch_add(1, Ordering::Relaxed); }
+                match db
+                    .execute(
+                        "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
+                        &[
+                            SqlValue::Text(format!("a_{}", i)),
+                            SqlValue::Text(format!("val_a_{}", i)),
+                        ],
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        successes.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(e) => eprintln!("node-a write {} failed: {}", i, e),
                 }
             }
@@ -205,11 +241,19 @@ async fn mode_f_concurrent_no_data_loss() {
         tokio::spawn(async move {
             let db = db.lock().await;
             for i in 0..10 {
-                match db.execute(
-                    "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
-                    &[SqlValue::Text(format!("b_{}", i)), SqlValue::Text(format!("val_b_{}", i))],
-                ).await {
-                    Ok(_) => { successes.fetch_add(1, Ordering::Relaxed); }
+                match db
+                    .execute(
+                        "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
+                        &[
+                            SqlValue::Text(format!("b_{}", i)),
+                            SqlValue::Text(format!("val_b_{}", i)),
+                        ],
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        successes.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(e) => eprintln!("node-b write {} failed: {}", i, e),
                 }
             }
@@ -221,7 +265,10 @@ async fn mode_f_concurrent_no_data_loss() {
 
     let a_count = a_successes.load(Ordering::Relaxed);
     let b_count = b_successes.load(Ordering::Relaxed);
-    eprintln!("node-a: {} successes, node-b: {} successes", a_count, b_count);
+    eprintln!(
+        "node-a: {} successes, node-b: {} successes",
+        a_count, b_count
+    );
 
     assert!(a_count > 0, "node-a should succeed");
     assert!(b_count > 0, "node-b should succeed");
@@ -232,9 +279,13 @@ async fn mode_f_concurrent_no_data_loss() {
         .await
         .expect("query");
     assert_eq!(
-        rows.len() as u64, a_count + b_count,
+        rows.len() as u64,
+        a_count + b_count,
         "total rows ({}) should equal total successes ({}+{}={})",
-        rows.len(), a_count, b_count, a_count + b_count,
+        rows.len(),
+        a_count,
+        b_count,
+        a_count + b_count,
     );
 }
 
@@ -251,9 +302,16 @@ async fn mode_f_four_nodes() {
     for node_id in 0..4 {
         let tmp = TempDir::new().expect("tmp");
         let db = build_mode_f_node(
-            tmp.path(), "mf_stress", &prefix, lease_store.clone(), manifest_store.clone(),
-            &format!("node-{}", node_id), 2, 10,
-        ).await;
+            tmp.path(),
+            "mf_stress",
+            &prefix,
+            lease_store.clone(),
+            manifest_store.clone(),
+            &format!("node-{}", node_id),
+            2,
+            10,
+        )
+        .await;
         tmps.push(tmp);
         dbs.push(db);
     }
@@ -262,14 +320,19 @@ async fn mode_f_four_nodes() {
     let mut total = 0u64;
     for (node_id, db) in dbs.iter().enumerate() {
         for i in 0..5 {
-            match db.execute(
-                "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
-                &[
-                    SqlValue::Text(format!("n{}_{}", node_id, i)),
-                    SqlValue::Text(format!("val_{}_{}", node_id, i)),
-                ],
-            ).await {
-                Ok(_) => { total += 1; }
+            match db
+                .execute(
+                    "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
+                    &[
+                        SqlValue::Text(format!("n{}_{}", node_id, i)),
+                        SqlValue::Text(format!("val_{}_{}", node_id, i)),
+                    ],
+                )
+                .await
+            {
+                Ok(_) => {
+                    total += 1;
+                }
                 Err(e) => eprintln!("node-{} write {} failed: {}", node_id, i, e),
             }
         }
@@ -286,9 +349,16 @@ async fn mode_f_four_nodes() {
     // Fresh reader
     let tmp_reader = TempDir::new().expect("tmp");
     let mut reader = build_mode_f_node(
-        tmp_reader.path(), "mf_stress", &prefix, lease_store.clone(), manifest_store.clone(),
-        "reader", 5, 10,
-    ).await;
+        tmp_reader.path(),
+        "mf_stress",
+        &prefix,
+        lease_store.clone(),
+        manifest_store.clone(),
+        "reader",
+        5,
+        10,
+    )
+    .await;
 
     let rows = reader
         .query_values_fresh("SELECT key FROM kv ORDER BY key", &[])

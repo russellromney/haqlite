@@ -18,8 +18,8 @@ use common::InMemoryStorage;
 use hadb::InMemoryLeaseStore;
 use haqlite::{HaQLite, SqlValue};
 use haqlite_turbolite::{Builder, Mode};
-use turbodb_manifest_mem::MemManifestStore;
 use tempfile::TempDir;
+use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)";
@@ -78,12 +78,13 @@ async fn build_mode_i_node(
     };
     let vfs = TurboliteVfs::new(config).expect("create VFS");
     let shared_vfs = SharedTurboliteVfs::new(vfs);
-    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone())
-        .expect("register VFS");
+    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
 
     let db_path = cache_dir.join(format!("{}.db", db_name));
     Builder::new()
-        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
+        .prefix("test/")
+        .mode(Mode::MultiWriter)
+        .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .walrust_storage(walrust_storage)
@@ -120,13 +121,29 @@ async fn mode_i_baseline_sequential() {
     let manifest_store = Arc::new(MemManifestStore::new());
 
     let mut db_a = build_mode_i_node(
-        tmp_a.path(), "mi_seq", &prefix, walrust_storage.clone(),
-        lease_store.clone(), manifest_store.clone(), "node-a", 5, 10,
-    ).await;
+        tmp_a.path(),
+        "mi_seq",
+        &prefix,
+        walrust_storage.clone(),
+        lease_store.clone(),
+        manifest_store.clone(),
+        "node-a",
+        5,
+        10,
+    )
+    .await;
     let mut db_b = build_mode_i_node(
-        tmp_b.path(), "mi_seq", &prefix, walrust_storage.clone(),
-        lease_store.clone(), manifest_store.clone(), "node-b", 5, 10,
-    ).await;
+        tmp_b.path(),
+        "mi_seq",
+        &prefix,
+        walrust_storage.clone(),
+        lease_store.clone(),
+        manifest_store.clone(),
+        "node-b",
+        5,
+        10,
+    )
+    .await;
 
     // Node A writes
     db_a.execute("INSERT OR REPLACE INTO kv VALUES ('k1', 'from_a')", &[])
@@ -164,15 +181,31 @@ async fn mode_i_concurrent_no_data_loss() {
 
     let db_a = Arc::new(tokio::sync::Mutex::new(
         build_mode_i_node(
-            tmp_a.path(), "mi_conc", &prefix, walrust_storage.clone(),
-            lease_store.clone(), manifest_store.clone(), "node-a", 5, 10,
-        ).await,
+            tmp_a.path(),
+            "mi_conc",
+            &prefix,
+            walrust_storage.clone(),
+            lease_store.clone(),
+            manifest_store.clone(),
+            "node-a",
+            5,
+            10,
+        )
+        .await,
     ));
     let db_b = Arc::new(tokio::sync::Mutex::new(
         build_mode_i_node(
-            tmp_b.path(), "mi_conc", &prefix, walrust_storage.clone(),
-            lease_store.clone(), manifest_store.clone(), "node-b", 5, 10,
-        ).await,
+            tmp_b.path(),
+            "mi_conc",
+            &prefix,
+            walrust_storage.clone(),
+            lease_store.clone(),
+            manifest_store.clone(),
+            "node-b",
+            5,
+            10,
+        )
+        .await,
     ));
 
     let a_successes = Arc::new(AtomicU64::new(0));
@@ -184,11 +217,19 @@ async fn mode_i_concurrent_no_data_loss() {
         tokio::spawn(async move {
             let db = db.lock().await;
             for i in 0..10 {
-                match db.execute(
-                    "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
-                    &[SqlValue::Text(format!("a_{}", i)), SqlValue::Text(format!("val_a_{}", i))],
-                ).await {
-                    Ok(_) => { successes.fetch_add(1, Ordering::Relaxed); }
+                match db
+                    .execute(
+                        "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
+                        &[
+                            SqlValue::Text(format!("a_{}", i)),
+                            SqlValue::Text(format!("val_a_{}", i)),
+                        ],
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        successes.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(e) => eprintln!("node-a write {} failed: {}", i, e),
                 }
             }
@@ -201,11 +242,19 @@ async fn mode_i_concurrent_no_data_loss() {
         tokio::spawn(async move {
             let db = db.lock().await;
             for i in 0..10 {
-                match db.execute(
-                    "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
-                    &[SqlValue::Text(format!("b_{}", i)), SqlValue::Text(format!("val_b_{}", i))],
-                ).await {
-                    Ok(_) => { successes.fetch_add(1, Ordering::Relaxed); }
+                match db
+                    .execute(
+                        "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
+                        &[
+                            SqlValue::Text(format!("b_{}", i)),
+                            SqlValue::Text(format!("val_b_{}", i)),
+                        ],
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        successes.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(e) => eprintln!("node-b write {} failed: {}", i, e),
                 }
             }
@@ -217,7 +266,10 @@ async fn mode_i_concurrent_no_data_loss() {
 
     let a_count = a_successes.load(Ordering::Relaxed);
     let b_count = b_successes.load(Ordering::Relaxed);
-    eprintln!("node-a: {} successes, node-b: {} successes", a_count, b_count);
+    eprintln!(
+        "node-a: {} successes, node-b: {} successes",
+        a_count, b_count
+    );
 
     assert!(a_count > 0, "node-a should succeed");
     assert!(b_count > 0, "node-b should succeed");
@@ -228,8 +280,12 @@ async fn mode_i_concurrent_no_data_loss() {
         .await
         .expect("query");
     assert_eq!(
-        rows.len() as u64, a_count + b_count,
+        rows.len() as u64,
+        a_count + b_count,
         "total rows ({}) should equal total successes ({}+{}={})",
-        rows.len(), a_count, b_count, a_count + b_count,
+        rows.len(),
+        a_count,
+        b_count,
+        a_count + b_count,
     );
 }

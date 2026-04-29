@@ -81,18 +81,30 @@ impl StorageBackend for InMemoryStorage {
     async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
         let mut map = self.objects.lock().await;
         if map.contains_key(key) {
-            return Ok(CasResult { success: false, etag: None });
+            return Ok(CasResult {
+                success: false,
+                etag: None,
+            });
         }
         map.insert(key.to_string(), data.to_vec());
-        Ok(CasResult { success: true, etag: Some("mem".into()) })
+        Ok(CasResult {
+            success: true,
+            etag: Some("mem".into()),
+        })
     }
 
     async fn put_if_match(&self, key: &str, data: &[u8], _etag: &str) -> Result<CasResult> {
         let mut map = self.objects.lock().await;
         if !map.contains_key(key) {
-            return Ok(CasResult { success: false, etag: None });
+            return Ok(CasResult {
+                success: false,
+                etag: None,
+            });
         }
         map.insert(key.to_string(), data.to_vec());
-        Ok(CasResult { success: true, etag: Some("mem".into()) })
+        Ok(CasResult {
+            success: true,
+            etag: Some("mem".into()),
+        })
     }
 }

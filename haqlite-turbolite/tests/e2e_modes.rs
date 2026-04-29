@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use haqlite::{HaQLite, InMemoryLeaseStore, SqlValue};
 use haqlite_turbolite::{Builder, Mode};
-use turbodb_manifest_mem::MemManifestStore;
 use tempfile::TempDir;
+use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 mod common;
@@ -44,8 +44,14 @@ fn endpoint_url() -> Option<String> {
 }
 
 fn unique_prefix(name: &str) -> String {
-    format!("test/e2e/{}/{}", name, std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).expect("time").as_nanos())
+    format!(
+        "test/e2e/{}/{}",
+        name,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    )
 }
 
 /// Build a shared-mode node with Cloud durability.
@@ -77,7 +83,9 @@ async fn build_node(
 
     let db_path = cache_dir.join("e2e.db");
     let mut builder = Builder::new()
-        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
+        .prefix("test/")
+        .mode(Mode::MultiWriter)
+        .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, &vfs_name)
@@ -89,7 +97,8 @@ async fn build_node(
         builder = builder.walrust_storage(ws);
     }
 
-    builder.open(db_path.to_str().expect("path"), SCHEMA)
+    builder
+        .open(db_path.to_str().expect("path"), SCHEMA)
         .await
         .expect("open node")
 }
@@ -107,40 +116,76 @@ async fn e2e_synchronous_two_nodes_sequential() {
 
     let tmp_a = TempDir::new().expect("tmp");
     let db_a = build_node(
-        tmp_a.path(), &prefix,
-        lease_store.clone(), manifest_store.clone(), None, "node-a",
-    ).await;
+        tmp_a.path(),
+        &prefix,
+        lease_store.clone(),
+        manifest_store.clone(),
+        None,
+        "node-a",
+    )
+    .await;
 
     let tmp_b = TempDir::new().expect("tmp");
     let db_b = build_node(
-        tmp_b.path(), &prefix,
-        lease_store.clone(), manifest_store.clone(), None, "node-b",
-    ).await;
+        tmp_b.path(),
+        &prefix,
+        lease_store.clone(),
+        manifest_store.clone(),
+        None,
+        "node-b",
+    )
+    .await;
 
     // Node A writes 5 items
     for i in 0..5 {
         db_a.execute(
             "INSERT INTO items (id, node, value) VALUES (?1, ?2, ?3)",
-            &[SqlValue::Integer(i), SqlValue::Text("a".into()), SqlValue::Text(format!("val_{}", i))],
-        ).await.expect("node-a write");
+            &[
+                SqlValue::Integer(i),
+                SqlValue::Text("a".into()),
+                SqlValue::Text(format!("val_{}", i)),
+            ],
+        )
+        .await
+        .expect("node-a write");
     }
 
     // Node B writes 5 items
     for i in 5..10 {
         db_b.execute(
             "INSERT INTO items (id, node, value) VALUES (?1, ?2, ?3)",
-            &[SqlValue::Integer(i), SqlValue::Text("b".into()), SqlValue::Text(format!("val_{}", i))],
-        ).await.expect("node-b write");
+            &[
+                SqlValue::Integer(i),
+                SqlValue::Text("b".into()),
+                SqlValue::Text(format!("val_{}", i)),
+            ],
+        )
+        .await
+        .expect("node-b write");
     }
 
     // Both nodes see all 10 items via fresh read
-    let rows_a = db_a.query_values_fresh("SELECT id FROM items ORDER BY id", &[])
-        .await.expect("query a");
-    let rows_b = db_b.query_values_fresh("SELECT id FROM items ORDER BY id", &[])
-        .await.expect("query b");
+    let rows_a = db_a
+        .query_values_fresh("SELECT id FROM items ORDER BY id", &[])
+        .await
+        .expect("query a");
+    let rows_b = db_b
+        .query_values_fresh("SELECT id FROM items ORDER BY id", &[])
+        .await
+        .expect("query b");
 
-    assert_eq!(rows_a.len(), 10, "node-a should see all 10 items, got {}", rows_a.len());
-    assert_eq!(rows_b.len(), 10, "node-b should see all 10 items, got {}", rows_b.len());
+    assert_eq!(
+        rows_a.len(),
+        10,
+        "node-a should see all 10 items, got {}",
+        rows_a.len()
+    );
+    assert_eq!(
+        rows_b.len(),
+        10,
+        "node-b should see all 10 items, got {}",
+        rows_b.len()
+    );
 }
 
 /// Four nodes write concurrently, all data preserved.
@@ -156,9 +201,14 @@ async fn e2e_synchronous_four_nodes_concurrent() {
     for i in 0..4 {
         let tmp = TempDir::new().expect("tmp");
         let db = build_node(
-            tmp.path(), &prefix,
-            lease_store.clone(), manifest_store.clone(), None, &format!("node-{}", i),
-        ).await;
+            tmp.path(),
+            &prefix,
+            lease_store.clone(),
+            manifest_store.clone(),
+            None,
+            &format!("node-{}", i),
+        )
+        .await;
         tmps.push(tmp);
         dbs.push(Arc::new(tokio::sync::Mutex::new(db)));
     }
@@ -173,18 +223,28 @@ async fn e2e_synchronous_four_nodes_concurrent() {
             let db = db.lock().await;
             for i in 0..5 {
                 let id = (node_id * 5 + i) as i64;
-                match db.execute(
-                    "INSERT INTO items (id, node, value) VALUES (?1, ?2, ?3)",
-                    &[SqlValue::Integer(id), SqlValue::Text(format!("n{}", node_id)),
-                      SqlValue::Text(format!("val_{}", id))],
-                ).await {
-                    Ok(_) => { s.fetch_add(1, Ordering::Relaxed); }
+                match db
+                    .execute(
+                        "INSERT INTO items (id, node, value) VALUES (?1, ?2, ?3)",
+                        &[
+                            SqlValue::Integer(id),
+                            SqlValue::Text(format!("n{}", node_id)),
+                            SqlValue::Text(format!("val_{}", id)),
+                        ],
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        s.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(e) => eprintln!("node-{} write {} failed: {}", node_id, i, e),
                 }
             }
         }));
     }
-    for h in handles { h.await.expect("join"); }
+    for h in handles {
+        h.await.expect("join");
+    }
 
     let total = successes.load(Ordering::Relaxed);
     assert!(total > 0, "at least one write should succeed");
@@ -192,14 +252,26 @@ async fn e2e_synchronous_four_nodes_concurrent() {
     // Fresh reader verifies all successful writes are visible
     let tmp_reader = TempDir::new().expect("tmp");
     let reader = build_node(
-        tmp_reader.path(), &prefix,
-        lease_store.clone(), manifest_store.clone(), None, "reader",
-    ).await;
+        tmp_reader.path(),
+        &prefix,
+        lease_store.clone(),
+        manifest_store.clone(),
+        None,
+        "reader",
+    )
+    .await;
 
-    let rows = reader.query_values_fresh("SELECT id FROM items ORDER BY id", &[])
-        .await.expect("query");
-    assert_eq!(rows.len() as u64, total,
-        "reader should see {} rows (all successes), got {}", total, rows.len());
+    let rows = reader
+        .query_values_fresh("SELECT id FROM items ORDER BY id", &[])
+        .await
+        .expect("query");
+    assert_eq!(
+        rows.len() as u64,
+        total,
+        "reader should see {} rows (all successes), got {}",
+        total,
+        rows.len()
+    );
 }
 
 // Eventual + Shared is an invalid configuration (haqlite rejects it at open time).
@@ -229,8 +301,12 @@ async fn e2e_write_fails_without_lease() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_millis() as u64,
         "ttl_secs": 300,
-    })).expect("json");
-    lease_store.write_if_not_exists(lease_key, lease_data).await.expect("seed lease");
+    }))
+    .expect("json");
+    lease_store
+        .write_if_not_exists(lease_key, lease_data)
+        .await
+        .expect("seed lease");
 
     // Build a node with very short write timeout
     let tmp = TempDir::new().expect("tmp");
@@ -250,7 +326,9 @@ async fn e2e_write_fails_without_lease() {
     turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("reg");
 
     let db = Builder::new()
-        .prefix("test/").mode(Mode::MultiWriter).durability(turbodb::Durability::Cloud)
+        .prefix("test/")
+        .mode(Mode::MultiWriter)
+        .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .turbolite_vfs(shared_vfs, &vfs_name)
@@ -260,12 +338,18 @@ async fn e2e_write_fails_without_lease() {
         .await
         .expect("open");
 
-    let result = db.execute(
-        "INSERT INTO items (id, node, value) VALUES (1, 'blocked', 'should_fail')", &[],
-    ).await;
+    let result = db
+        .execute(
+            "INSERT INTO items (id, node, value) VALUES (1, 'blocked', 'should_fail')",
+            &[],
+        )
+        .await;
 
     assert!(result.is_err(), "write without lease should fail");
     let err_str = format!("{}", result.unwrap_err());
-    assert!(err_str.contains("lease") || err_str.contains("Lease"),
-        "error should mention lease, got: {}", err_str);
+    assert!(
+        err_str.contains("lease") || err_str.contains("Lease"),
+        "error should mention lease, got: {}",
+        err_str
+    );
 }

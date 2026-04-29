@@ -15,7 +15,9 @@ use hadb::InMemoryLeaseStore;
 use haqlite::{HaQLite, SqlValue};
 use haqlite_turbolite::{Builder, Mode};
 use turbodb_manifest_mem::MemManifestStore;
-use turbolite::tiered::{CacheConfig, CompressionConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{
+    CacheConfig, CompressionConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs,
+};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT);";
 
@@ -57,7 +59,10 @@ async fn build_turbolite_dedicated(
 ) -> HaQLite {
     let config = TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        compression: CompressionConfig { level: 1, ..Default::default() },
+        compression: CompressionConfig {
+            level: 1,
+            ..Default::default()
+        },
         cache: CacheConfig {
             pages_per_group: 4,
             sub_pages_per_frame: 2,
@@ -70,10 +75,13 @@ async fn build_turbolite_dedicated(
     turbolite::tiered::register_shared(vfs_name, shared_vfs.clone())
         .expect("register turbolite VFS");
 
-    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(common::InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> =
+        Arc::new(common::InMemoryStorage::new());
     let db_path = cache_dir.join(format!("{}.db", db_name));
     Builder::new()
-        .prefix("test/").mode(Mode::Writer).durability(durability)
+        .prefix("test/")
+        .mode(Mode::Writer)
+        .durability(durability)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
         .walrust_storage(walrust_storage)
@@ -92,7 +100,8 @@ async fn build_walrust_dedicated(
     lease_store: Arc<InMemoryLeaseStore>,
     instance_id: &str,
 ) -> HaQLite {
-    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(common::InMemoryStorage::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> =
+        Arc::new(common::InMemoryStorage::new());
     let db_path = cache_dir.join(format!("{}.db", db_name));
     haqlite::HaQLite::builder()
         .prefix("test/")
@@ -118,23 +127,40 @@ async fn close_reopen_checkpoint_survives() {
     let vfs = format!("flotilla_ckpt_{}", std::process::id());
 
     let mut db = build_turbolite_dedicated(
-        tmp.path(), "ckpt", turbodb::Durability::Checkpoint(turbodb::CheckpointConfig::default()),
-        lease.clone(), manifest.clone(), "node-1", &vfs,
-    ).await;
+        tmp.path(),
+        "ckpt",
+        turbodb::Durability::Checkpoint(turbodb::CheckpointConfig::default()),
+        lease.clone(),
+        manifest.clone(),
+        "node-1",
+        &vfs,
+    )
+    .await;
 
-    db.execute_async("INSERT INTO t (id, val) VALUES (1, 'checkpoint')", &[]).await.unwrap();
+    db.execute_async("INSERT INTO t (id, val) VALUES (1, 'checkpoint')", &[])
+        .await
+        .unwrap();
     {
         let conn = db.connection().expect("get conn");
         let c = conn.lock();
-        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint");
+        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint");
     }
     db.close().await.unwrap();
 
     let mut db2 = build_turbolite_dedicated(
-        tmp.path(), "ckpt", turbodb::Durability::Checkpoint(turbodb::CheckpointConfig::default()),
-        lease, manifest, "node-1", &vfs,
-    ).await;
-    let val: String = db2.query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0)).unwrap();
+        tmp.path(),
+        "ckpt",
+        turbodb::Durability::Checkpoint(turbodb::CheckpointConfig::default()),
+        lease,
+        manifest,
+        "node-1",
+        &vfs,
+    )
+    .await;
+    let val: String = db2
+        .query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0))
+        .unwrap();
     assert_eq!(val, "checkpoint");
     db2.close().await.unwrap();
 }
@@ -147,23 +173,40 @@ async fn close_reopen_continuous_survives() {
     let vfs = format!("flotilla_cont_{}", std::process::id());
 
     let mut db = build_turbolite_dedicated(
-        tmp.path(), "cont", turbodb::Durability::default(),
-        lease.clone(), manifest.clone(), "node-1", &vfs,
-    ).await;
+        tmp.path(),
+        "cont",
+        turbodb::Durability::default(),
+        lease.clone(),
+        manifest.clone(),
+        "node-1",
+        &vfs,
+    )
+    .await;
 
-    db.execute_async("INSERT INTO t (id, val) VALUES (1, 'continuous')", &[]).await.unwrap();
+    db.execute_async("INSERT INTO t (id, val) VALUES (1, 'continuous')", &[])
+        .await
+        .unwrap();
     {
         let conn = db.connection().expect("get conn");
         let c = conn.lock();
-        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint");
+        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint");
     }
     db.close().await.unwrap();
 
     let mut db2 = build_turbolite_dedicated(
-        tmp.path(), "cont", turbodb::Durability::default(),
-        lease, manifest, "node-1", &vfs,
-    ).await;
-    let val: String = db2.query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0)).unwrap();
+        tmp.path(),
+        "cont",
+        turbodb::Durability::default(),
+        lease,
+        manifest,
+        "node-1",
+        &vfs,
+    )
+    .await;
+    let val: String = db2
+        .query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0))
+        .unwrap();
     assert_eq!(val, "continuous");
     db2.close().await.unwrap();
 }
@@ -176,18 +219,34 @@ async fn close_reopen_cloud_survives() {
     let vfs = format!("flotilla_cloud_{}", std::process::id());
 
     let mut db = build_turbolite_dedicated(
-        tmp.path(), "cloud", turbodb::Durability::Cloud,
-        lease.clone(), manifest.clone(), "node-1", &vfs,
-    ).await;
+        tmp.path(),
+        "cloud",
+        turbodb::Durability::Cloud,
+        lease.clone(),
+        manifest.clone(),
+        "node-1",
+        &vfs,
+    )
+    .await;
 
-    db.execute_async("INSERT INTO t (id, val) VALUES (1, 'cloud')", &[]).await.unwrap();
+    db.execute_async("INSERT INTO t (id, val) VALUES (1, 'cloud')", &[])
+        .await
+        .unwrap();
     db.close().await.unwrap();
 
     let mut db2 = build_turbolite_dedicated(
-        tmp.path(), "cloud", turbodb::Durability::Cloud,
-        lease, manifest, "node-1", &vfs,
-    ).await;
-    let val: String = db2.query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0)).unwrap();
+        tmp.path(),
+        "cloud",
+        turbodb::Durability::Cloud,
+        lease,
+        manifest,
+        "node-1",
+        &vfs,
+    )
+    .await;
+    let val: String = db2
+        .query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0))
+        .unwrap();
     assert_eq!(val, "cloud");
     db2.close().await.unwrap();
 }
@@ -198,18 +257,30 @@ async fn close_reopen_walrust_replicated_survives() {
     let lease = Arc::new(InMemoryLeaseStore::new());
 
     let mut db = build_walrust_dedicated(
-        tmp.path(), "walrust", hadb::Durability::Replicated(Duration::from_secs(1)),
-        lease.clone(), "node-1",
-    ).await;
+        tmp.path(),
+        "walrust",
+        hadb::Durability::Replicated(Duration::from_secs(1)),
+        lease.clone(),
+        "node-1",
+    )
+    .await;
 
-    db.execute_async("INSERT INTO t (id, val) VALUES (1, 'walrust')", &[]).await.unwrap();
+    db.execute_async("INSERT INTO t (id, val) VALUES (1, 'walrust')", &[])
+        .await
+        .unwrap();
     db.close().await.unwrap();
 
     let mut db2 = build_walrust_dedicated(
-        tmp.path(), "walrust", hadb::Durability::Replicated(Duration::from_secs(1)),
-        lease, "node-1",
-    ).await;
-    let val: String = db2.query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0)).unwrap();
+        tmp.path(),
+        "walrust",
+        hadb::Durability::Replicated(Duration::from_secs(1)),
+        lease,
+        "node-1",
+    )
+    .await;
+    let val: String = db2
+        .query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0))
+        .unwrap();
     assert_eq!(val, "walrust");
     db2.close().await.unwrap();
 }
@@ -227,9 +298,15 @@ async fn continuous_cold_start_is_fast() {
 
     let start = Instant::now();
     let mut db = build_turbolite_dedicated(
-        tmp.path(), "fast", turbodb::Durability::default(),
-        lease, manifest, "node-1", &vfs,
-    ).await;
+        tmp.path(),
+        "fast",
+        turbodb::Durability::default(),
+        lease,
+        manifest,
+        "node-1",
+        &vfs,
+    )
+    .await;
 
     // Apply 24 DDL statements mimicking redlite migrate().
     {
@@ -265,9 +342,15 @@ async fn continuous_journal_mode_is_wal() {
     let vfs = format!("flotilla_jm_cont_{}", std::process::id());
 
     let mut db = build_turbolite_dedicated(
-        tmp.path(), "jm_cont", turbodb::Durability::default(),
-        lease, manifest, "node-1", &vfs,
-    ).await;
+        tmp.path(),
+        "jm_cont",
+        turbodb::Durability::default(),
+        lease,
+        manifest,
+        "node-1",
+        &vfs,
+    )
+    .await;
 
     let conn = db.connection().expect("get conn");
     let c = conn.lock();
@@ -275,7 +358,8 @@ async fn continuous_journal_mode_is_wal() {
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .expect("pragma");
     assert_eq!(
-        mode.to_lowercase(), "wal",
+        mode.to_lowercase(),
+        "wal",
         "Continuous durability must use WAL journal mode (got {})",
         mode
     );
@@ -291,10 +375,15 @@ async fn checkpoint_journal_mode_is_wal() {
     let vfs = format!("flotilla_jm_ckpt_{}", std::process::id());
 
     let mut db = build_turbolite_dedicated(
-        tmp.path(), "jm_ckpt",
+        tmp.path(),
+        "jm_ckpt",
         turbodb::Durability::Checkpoint(turbodb::CheckpointConfig::default()),
-        lease, manifest, "node-1", &vfs,
-    ).await;
+        lease,
+        manifest,
+        "node-1",
+        &vfs,
+    )
+    .await;
 
     let conn = db.connection().expect("get conn");
     let c = conn.lock();
@@ -302,7 +391,8 @@ async fn checkpoint_journal_mode_is_wal() {
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .expect("pragma");
     assert_eq!(
-        mode.to_lowercase(), "wal",
+        mode.to_lowercase(),
+        "wal",
         "Checkpoint durability must use WAL journal mode (got {})",
         mode
     );
@@ -318,9 +408,15 @@ async fn cloud_journal_mode_is_delete() {
     let vfs = format!("flotilla_jm_cloud_{}", std::process::id());
 
     let mut db = build_turbolite_dedicated(
-        tmp.path(), "jm_cloud", turbodb::Durability::Cloud,
-        lease, manifest, "node-1", &vfs,
-    ).await;
+        tmp.path(),
+        "jm_cloud",
+        turbodb::Durability::Cloud,
+        lease,
+        manifest,
+        "node-1",
+        &vfs,
+    )
+    .await;
 
     let conn = db.connection().expect("get conn");
     let c = conn.lock();
@@ -328,7 +424,8 @@ async fn cloud_journal_mode_is_delete() {
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .expect("pragma");
     assert_eq!(
-        mode.to_lowercase(), "delete",
+        mode.to_lowercase(),
+        "delete",
         "Cloud durability must use DELETE journal mode (got {})",
         mode
     );
@@ -348,20 +445,29 @@ async fn continuous_write_latency_is_fast() {
     let vfs = format!("flotilla_lat_{}", std::process::id());
 
     let mut db = build_turbolite_dedicated(
-        tmp.path(), "lat", turbodb::Durability::default(),
-        lease, manifest, "node-1", &vfs,
-    ).await;
+        tmp.path(),
+        "lat",
+        turbodb::Durability::default(),
+        lease,
+        manifest,
+        "node-1",
+        &vfs,
+    )
+    .await;
 
     // Warm-up write
     db.execute_async("INSERT INTO t (id, val) VALUES (0, 'warm')", &[])
-        .await.unwrap();
+        .await
+        .unwrap();
 
     let start = Instant::now();
     for i in 1..=10 {
         db.execute_async(
             "INSERT INTO t (id, val) VALUES (?1, ?2)",
             &[SqlValue::Integer(i), SqlValue::Text(format!("v{}", i))],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
     }
     let elapsed = start.elapsed();
     db.close().await.unwrap();
@@ -371,7 +477,8 @@ async fn continuous_write_latency_is_fast() {
         elapsed < threshold,
         "10 INSERTs in Continuous mode took {:?}, expected < {:?} \
          (if >5s, xSync-per-commit is still firing = journal_mode bug)",
-        elapsed, threshold
+        elapsed,
+        threshold
     );
 }
 
@@ -385,21 +492,81 @@ async fn close_reopen_syncreplicated_survives() {
     let lease = Arc::new(InMemoryLeaseStore::new());
 
     let mut db = build_walrust_dedicated(
-        tmp.path(), "syncrep", hadb::Durability::SyncReplicated,
-        lease.clone(), "node-1",
-    ).await;
+        tmp.path(),
+        "syncrep",
+        hadb::Durability::SyncReplicated,
+        lease.clone(),
+        "node-1",
+    )
+    .await;
 
     db.execute_async("INSERT INTO t (id, val) VALUES (1, 'syncrep')", &[])
-        .await.unwrap();
+        .await
+        .unwrap();
     db.close().await.unwrap();
 
     let mut db2 = build_walrust_dedicated(
-        tmp.path(), "syncrep", hadb::Durability::SyncReplicated,
-        lease, "node-1",
-    ).await;
+        tmp.path(),
+        "syncrep",
+        hadb::Durability::SyncReplicated,
+        lease,
+        "node-1",
+    )
+    .await;
     let val: String = db2
         .query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0))
         .unwrap();
     assert_eq!(val, "syncrep");
     db2.close().await.unwrap();
+}
+
+// ============================================================================
+// F3 regression: Cloud mode opens without walrust_storage (NoOpReplicator path)
+//
+// Pre-F3, building Cloud mode without walrust_storage errored at open() with
+// "Writer mode requires walrust storage". Post-F3, Cloud uses NoOpReplicator
+// internally, so walrust_storage is genuinely optional. We assert open()
+// success only — the schema-through-turbolite-VFS persistence path has a
+// separate pre-existing bug that affects every Cloud/Continuous/Checkpoint
+// flotilla_regression test (ensure_schema opens via plain rusqlite, not the
+// registered VFS, so the schema isn't visible to the VFS-backed connection).
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cloud_opens_without_walrust_storage() {
+    use haqlite_turbolite::{Builder, Mode};
+    use turbolite::tiered::{CacheConfig, TurboliteConfig, TurboliteVfs};
+
+    let tmp = TempDir::new().unwrap();
+    let lease = Arc::new(InMemoryLeaseStore::new());
+    let manifest = Arc::new(MemManifestStore::new());
+    let vfs_name = format!("flotilla_no_walrust_{}", std::process::id());
+
+    let tl_config = TurboliteConfig {
+        cache_dir: tmp.path().to_path_buf(),
+        cache: CacheConfig {
+            gc_enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(tl_config).expect("create VFS");
+    let shared_vfs = turbolite::tiered::SharedTurboliteVfs::new(vfs);
+    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
+
+    let db_path = tmp.path().join("no_walrust.db");
+
+    let mut db = Builder::new()
+        .prefix("test/")
+        .mode(Mode::Writer)
+        .durability(turbodb::Durability::Cloud)
+        .lease_store(lease)
+        .manifest_store(manifest)
+        .turbolite_vfs(shared_vfs, &vfs_name)
+        .instance_id("node-1")
+        .open(db_path.to_str().expect("utf8 path"), "")
+        .await
+        .expect("Cloud + no walrust should open cleanly");
+
+    db.close().await.unwrap();
 }
