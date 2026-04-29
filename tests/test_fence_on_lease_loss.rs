@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use common::InMemoryStorage;
 use haqlite::{
     Coordinator, CoordinatorConfig, HaQLite, InMemoryLeaseStore, LeaseConfig, LeaseStore, Role,
-    SqliteFollowerBehavior, SqliteReplicator, SqlValue,
+    SqlValue, SqliteFollowerBehavior, SqliteReplicator,
 };
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT)";
@@ -45,14 +45,7 @@ fn build_coordinator(
     let replicator = Arc::new(SqliteReplicator::new(storage.clone(), "test/", repl_config));
     let follower_behavior = Arc::new(SqliteFollowerBehavior::new(storage));
 
-    Coordinator::new(
-        replicator,
-        None,
-        None,
-        follower_behavior,
-        "test/",
-        config,
-    )
+    Coordinator::new(replicator, None, None, follower_behavior, "test/", config)
 }
 
 #[tokio::test]
@@ -94,7 +87,10 @@ async fn leader_fenced_on_lease_loss() {
 
     // Insert some data while we're leader
     leader
-        .execute("INSERT INTO t (val) VALUES (?1)", &[SqlValue::Text("before".into())])
+        .execute(
+            "INSERT INTO t (val) VALUES (?1)",
+            &[SqlValue::Text("before".into())],
+        )
         .expect("insert as leader");
 
     // Verify connection() works for writes
@@ -102,7 +98,10 @@ async fn leader_fenced_on_lease_loss() {
         let conn = leader.connection().expect("conn");
         let guard = conn.lock();
         guard
-            .execute("INSERT INTO t (val) VALUES (?1)", rusqlite::params!["also-before"])
+            .execute(
+                "INSERT INTO t (val) VALUES (?1)",
+                rusqlite::params!["also-before"],
+            )
             .expect("direct insert should work as leader");
     }
 
@@ -125,13 +124,20 @@ async fn leader_fenced_on_lease_loss() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Leader should now be demoted
-    assert_eq!(leader.role(), Some(Role::Follower), "leader should be demoted after lease loss");
+    assert_eq!(
+        leader.role(),
+        Some(Role::Follower),
+        "leader should be demoted after lease loss"
+    );
 
     // Writes through connection() should be blocked
     {
         let conn = leader.connection().expect("conn should still be available");
         let guard = conn.lock();
-        let result = guard.execute("INSERT INTO t (val) VALUES (?1)", rusqlite::params!["after-fence"]);
+        let result = guard.execute(
+            "INSERT INTO t (val) VALUES (?1)",
+            rusqlite::params!["after-fence"],
+        );
         assert!(result.is_err(), "writes should be blocked after lease loss");
     }
 

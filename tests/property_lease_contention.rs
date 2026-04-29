@@ -2,16 +2,16 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use proptest::prelude::*;
 use tempfile::TempDir;
 
 use common::InMemoryStorage;
-use haqlite::{HaQLite, InMemoryLeaseStore, SqlValue};
 use hadb::LeaseStore;
+use haqlite::{HaQLite, InMemoryLeaseStore, SqlValue};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, data TEXT);";
 

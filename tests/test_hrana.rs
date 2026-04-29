@@ -107,8 +107,8 @@ async fn post_json(
     let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let body_json: Value =
-        serde_json::from_slice(&body_bytes).unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&body_bytes).to_string()}));
+    let body_json: Value = serde_json::from_slice(&body_bytes)
+        .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&body_bytes).to_string()}));
 
     (status, body_json)
 }
@@ -197,7 +197,10 @@ async fn test_pipeline_v3_select() {
     let (status, resp) = post_json(&router, "/v3/pipeline", &body, None).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(resp["results"][0]["response"]["result"]["rows"][0][0]["value"], "42");
+    assert_eq!(
+        resp["results"][0]["response"]["result"]["rows"][0][0]["value"],
+        "42"
+    );
 }
 
 #[tokio::test]
@@ -410,17 +413,13 @@ async fn test_pipeline_close() {
 #[tokio::test]
 async fn test_pipeline_get_autocommit() {
     let (router, _, _tmp) = setup();
-    let body = pipeline_request(
-        None,
-        vec![json!({ "type": "get_autocommit" })],
-    );
+    let body = pipeline_request(None, vec![json!({ "type": "get_autocommit" })]);
     let (status, resp) = post_json(&router, "/v3/pipeline", &body, None).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(resp["results"][0]["type"], "ok");
     assert_eq!(
-        resp["results"][0]["response"]["is_autocommit"],
-        true,
+        resp["results"][0]["response"]["is_autocommit"], true,
         "Fresh connection should be in autocommit mode"
     );
 }
@@ -566,7 +565,11 @@ async fn test_cursor_basic() {
 
     // NDJSON: first line is header with baton, then step_begin, rows, step_end
     let lines: Vec<&str> = body_str.trim().split('\n').collect();
-    assert!(lines.len() >= 4, "Expected at least 4 NDJSON lines, got {}", lines.len());
+    assert!(
+        lines.len() >= 4,
+        "Expected at least 4 NDJSON lines, got {}",
+        lines.len()
+    );
 
     // Header has baton
     let header: Value = serde_json::from_str(lines[0]).unwrap();
@@ -700,7 +703,10 @@ async fn test_pipeline_null_value() {
     );
     let (status, resp) = post_json(&router, "/v3/pipeline", &body, None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(resp["results"][1]["response"]["result"]["rows"][0][0]["type"], "null");
+    assert_eq!(
+        resp["results"][1]["response"]["result"]["rows"][0][0]["type"],
+        "null"
+    );
 }
 
 #[tokio::test]

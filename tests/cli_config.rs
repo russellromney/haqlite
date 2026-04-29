@@ -131,8 +131,7 @@ async fn test_query_values_method() {
     let db_path = dir.path().join("test.db");
 
     let schema = "CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, name TEXT);";
-    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema)
-        .expect("local should open");
+    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema).expect("local should open");
 
     db.execute_async(
         "INSERT INTO test (id, name) VALUES (?1, ?2)",
@@ -282,8 +281,7 @@ async fn test_query_values_multi_row() {
     let db_path = dir.path().join("multi.db");
 
     let schema = "CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, name TEXT);";
-    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema)
-        .expect("local should open");
+    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema).expect("local should open");
 
     for i in 1..=5 {
         db.execute_async(
@@ -318,8 +316,7 @@ async fn test_query_values_zero_rows() {
     let db_path = dir.path().join("empty.db");
 
     let schema = "CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, name TEXT);";
-    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema)
-        .expect("local should open");
+    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema).expect("local should open");
 
     // Zero rows: SELECT from empty table with WHERE clause
     let rows = db
@@ -339,8 +336,7 @@ async fn test_query_values_null_values() {
     let db_path = dir.path().join("null.db");
 
     let schema = "CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, name TEXT);";
-    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema)
-        .expect("local should open");
+    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema).expect("local should open");
 
     // Insert row with NULL name
     db.execute_async(
@@ -365,8 +361,7 @@ async fn test_query_values_all_types() {
     let db_path = dir.path().join("types.db");
 
     let schema = "CREATE TABLE IF NOT EXISTS types (i INTEGER, r REAL, t TEXT, b BLOB);";
-    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema)
-        .expect("local should open");
+    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema).expect("local should open");
 
     db.execute_async(
         "INSERT INTO types (i, r, t, b) VALUES (?1, ?2, ?3, ?4)",
@@ -399,8 +394,7 @@ async fn test_query_values_invalid_sql() {
     let db_path = dir.path().join("badsql.db");
 
     let schema = "CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY);";
-    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema)
-        .expect("local should open");
+    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema).expect("local should open");
 
     let result = db.query_values("NOT VALID SQL AT ALL", &[]);
     assert!(result.is_err(), "invalid SQL should return error");
@@ -416,19 +410,12 @@ async fn test_query_values_invalid_sql() {
 // ============================================================================
 
 /// Helper: create a test app with schema and optional secret
-fn test_app(
-    db_path: &std::path::Path,
-    secret: Option<String>,
-) -> axum::Router {
+fn test_app(db_path: &std::path::Path, secret: Option<String>) -> axum::Router {
     let schema = "CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, name TEXT);";
-    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema)
-        .expect("local should open");
+    let db = haqlite::HaQLite::local(db_path.to_str().unwrap(), schema).expect("local should open");
     let db = std::sync::Arc::new(db);
-    let hrana_router = haqlite::hrana::build_hrana_router(
-        db.clone(),
-        db_path.to_path_buf(),
-        secret.clone(),
-    );
+    let hrana_router =
+        haqlite::hrana::build_hrana_router(db.clone(), db_path.to_path_buf(), secret.clone());
     let state = std::sync::Arc::new(haqlite::serve::AppState::new(db, secret));
     haqlite::serve::build_router(state, hrana_router)
 }

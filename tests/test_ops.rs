@@ -215,7 +215,9 @@ async fn test_list_no_snapshot() {
 #[tokio::test]
 async fn test_verify_empty_db_errors() {
     let storage = InMemoryStorage::new();
-    let err = ops::verify_database(&storage, "", "mydb").await.unwrap_err();
+    let err = ops::verify_database(&storage, "", "mydb")
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("No changeset files found"));
 }
 
@@ -227,7 +229,9 @@ async fn test_verify_no_snapshot_errors() {
         .insert("mydb/0000/0000000000000001.hadbp", vec![1])
         .await;
 
-    let err = ops::verify_database(&storage, "", "mydb").await.unwrap_err();
+    let err = ops::verify_database(&storage, "", "mydb")
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("No snapshot found"));
 }
 
@@ -410,7 +414,9 @@ async fn test_snapshot_creates_hadbp_file() {
     create_test_db(&db_path);
 
     let storage = InMemoryStorage::new();
-    let result = ops::snapshot_database(&storage, "", &db_path).await.unwrap();
+    let result = ops::snapshot_database(&storage, "", &db_path)
+        .await
+        .unwrap();
     // seq starts at 0 + 1 = 1
     assert_eq!(result.seq, 1);
 
@@ -431,7 +437,9 @@ async fn test_snapshot_increments_seq() {
     let storage = InMemoryStorage::new();
 
     // First snapshot
-    let result1 = ops::snapshot_database(&storage, "", &db_path).await.unwrap();
+    let result1 = ops::snapshot_database(&storage, "", &db_path)
+        .await
+        .unwrap();
     assert_eq!(result1.seq, 1);
 
     // Second snapshot after modifying the DB
@@ -440,7 +448,9 @@ async fn test_snapshot_increments_seq() {
         conn.execute("INSERT INTO t (val) VALUES ('world')", [])
             .unwrap();
     }
-    let result2 = ops::snapshot_database(&storage, "", &db_path).await.unwrap();
+    let result2 = ops::snapshot_database(&storage, "", &db_path)
+        .await
+        .unwrap();
     assert_eq!(result2.seq, 2);
 
     let keys = storage.keys().await;
@@ -511,7 +521,11 @@ async fn test_seq_keys_prevent_duplicates() {
         .await;
 
     let files = ops::discover_ltx_files(&storage, "", "mydb").await.unwrap();
-    assert_eq!(files.len(), 1, "duplicate seq should not create two entries");
+    assert_eq!(
+        files.len(),
+        1,
+        "duplicate seq should not create two entries"
+    );
 }
 
 #[tokio::test]
@@ -530,10 +544,7 @@ async fn test_verify_no_issues_on_contiguous_incrementals() {
     for seq in 2..=4 {
         let data = encode_snapshot(&db_path, seq);
         storage
-            .insert(
-                &format!("test/0000/{:016x}.hadbp", seq),
-                data,
-            )
+            .insert(&format!("test/0000/{:016x}.hadbp", seq), data)
             .await;
     }
 
@@ -611,12 +622,11 @@ impl hadb_storage::StorageBackend for FailingDownloadStorage {
     async fn exists(&self, _key: &str) -> Result<bool> {
         Ok(true)
     }
-    async fn put_if_absent(
-        &self,
-        _key: &str,
-        _data: &[u8],
-    ) -> Result<hadb_storage::CasResult> {
-        Ok(hadb_storage::CasResult { success: true, etag: Some("test".into()) })
+    async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: Some("test".into()),
+        })
     }
     async fn put_if_match(
         &self,
@@ -624,7 +634,10 @@ impl hadb_storage::StorageBackend for FailingDownloadStorage {
         _data: &[u8],
         _etag: &str,
     ) -> Result<hadb_storage::CasResult> {
-        Ok(hadb_storage::CasResult { success: true, etag: Some("test".into()) })
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: Some("test".into()),
+        })
     }
 }
 
@@ -679,7 +692,7 @@ async fn test_compact_stale_incrementals_below_kept_snapshot() {
     storage
         .insert("mydb/0000/0000000000000009.hadbp", vec![1])
         .await; // seq 9
-    // Incrementals at/after the snapshot
+                // Incrementals at/after the snapshot
     storage
         .insert("mydb/0000/0000000000000016.hadbp", vec![1])
         .await; // seq 22, not stale
@@ -781,7 +794,9 @@ async fn test_snapshot_then_verify() {
     create_test_db(&db_path);
 
     let storage = InMemoryStorage::new();
-    ops::snapshot_database(&storage, "", &db_path).await.unwrap();
+    ops::snapshot_database(&storage, "", &db_path)
+        .await
+        .unwrap();
 
     // Verify the snapshot we just created
     let result = ops::verify_database(&storage, "", "roundtrip")
@@ -802,7 +817,9 @@ async fn test_snapshot_list_verify_compact_roundtrip() {
 
     // Take 3 snapshots (each needs a new write to advance the change counter)
     for i in 0..3 {
-        ops::snapshot_database(&storage, "", &db_path).await.unwrap();
+        ops::snapshot_database(&storage, "", &db_path)
+            .await
+            .unwrap();
         // Write between snapshots so the file change counter advances
         if i < 2 {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -883,9 +900,7 @@ async fn test_discover_files_prefix_isolation() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].seq, 2);
 
-    let files = ops::discover_ltx_files(&storage, "", "mydb")
-        .await
-        .unwrap();
+    let files = ops::discover_ltx_files(&storage, "", "mydb").await.unwrap();
     assert_eq!(files.len(), 0);
 }
 
@@ -992,9 +1007,7 @@ async fn test_normalize_prefix_via_discover() {
     assert_eq!(files.len(), 1);
 
     // Empty prefix - different namespace, finds nothing
-    let files = ops::discover_ltx_files(&storage, "", "mydb")
-        .await
-        .unwrap();
+    let files = ops::discover_ltx_files(&storage, "", "mydb").await.unwrap();
     assert_eq!(files.len(), 0);
 }
 

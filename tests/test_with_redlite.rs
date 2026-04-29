@@ -12,12 +12,17 @@
 //! - Stop/recreate cycles maintain data (simulating engine stop/wake)
 //! - Concurrent operations on the shared connection
 
-use std::sync::Arc;
 use redlite::types::ZMember;
+use std::sync::Arc;
 
 fn temp_db() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("test.db").to_str().expect("path").to_string();
+    let path = dir
+        .path()
+        .join("test.db")
+        .to_str()
+        .expect("path")
+        .to_string();
     (dir, path)
 }
 
@@ -52,9 +57,16 @@ async fn redlite_tables_visible_via_raw_sql() {
     // Verify redlite's tables exist on the same connection
     let guard = conn.lock();
     let count: i64 = guard
-        .query_row("SELECT COUNT(*) FROM keys WHERE key = ?1", rusqlite::params!["sql-check"], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM keys WHERE key = ?1",
+            rusqlite::params!["sql-check"],
+            |r| r.get(0),
+        )
         .expect("raw sql query on redlite's keys table");
-    assert_eq!(count, 1, "redlite key should be visible via raw SQL on shared connection");
+    assert_eq!(
+        count, 1,
+        "redlite key should be visible via raw SQL on shared connection"
+    );
 
     let val: Vec<u8> = guard
         .query_row(
@@ -70,14 +82,23 @@ async fn redlite_tables_visible_via_raw_sql() {
 async fn haqlite_schema_and_redlite_coexist() {
     let (_dir, path) = temp_db();
     // Create HaQLite with a custom schema (like a real SQL database would have)
-    let db = haqlite::HaQLite::local(&path, "CREATE TABLE IF NOT EXISTS app_data (id INTEGER PRIMARY KEY, val TEXT)").expect("local");
+    let db = haqlite::HaQLite::local(
+        &path,
+        "CREATE TABLE IF NOT EXISTS app_data (id INTEGER PRIMARY KEY, val TEXT)",
+    )
+    .expect("local");
 
     let conn = db.connection().expect("connection");
 
     // Write to haqlite's custom schema
     {
         let guard = conn.lock();
-        guard.execute("INSERT INTO app_data (val) VALUES (?1)", rusqlite::params!["haqlite-data"]).expect("insert app_data");
+        guard
+            .execute(
+                "INSERT INTO app_data (val) VALUES (?1)",
+                rusqlite::params!["haqlite-data"],
+            )
+            .expect("insert app_data");
     }
 
     // Now layer redlite on top
@@ -86,7 +107,9 @@ async fn haqlite_schema_and_redlite_coexist() {
 
     // Both should coexist
     let guard = conn.lock();
-    let app_val: String = guard.query_row("SELECT val FROM app_data WHERE id = 1", [], |r| r.get(0)).expect("app_data");
+    let app_val: String = guard
+        .query_row("SELECT val FROM app_data WHERE id = 1", [], |r| r.get(0))
+        .expect("app_data");
     assert_eq!(app_val, "haqlite-data");
     drop(guard);
 
@@ -108,29 +131,57 @@ async fn all_redis_data_types_work_over_shared_connection() {
 
     // String
     rdb.set("str-key", b"str-value", None).expect("set");
-    assert_eq!(rdb.get("str-key").expect("get"), Some(b"str-value".to_vec()));
+    assert_eq!(
+        rdb.get("str-key").expect("get"),
+        Some(b"str-value".to_vec())
+    );
 
     // Hash
-    rdb.hset("hash-key", &[("field1", b"val1".as_slice()), ("field2", b"val2".as_slice())]).expect("hset");
-    assert_eq!(rdb.hget("hash-key", "field1").expect("hget"), Some(b"val1".to_vec()));
+    rdb.hset(
+        "hash-key",
+        &[
+            ("field1", b"val1".as_slice()),
+            ("field2", b"val2".as_slice()),
+        ],
+    )
+    .expect("hset");
+    assert_eq!(
+        rdb.hget("hash-key", "field1").expect("hget"),
+        Some(b"val1".to_vec())
+    );
     assert_eq!(rdb.hlen("hash-key").expect("hlen"), 2);
 
     // List
-    rdb.rpush("list-key", &[b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]).expect("rpush");
+    rdb.rpush(
+        "list-key",
+        &[b"a".as_slice(), b"b".as_slice(), b"c".as_slice()],
+    )
+    .expect("rpush");
     assert_eq!(rdb.llen("list-key").expect("llen"), 3);
-    assert_eq!(rdb.lindex("list-key", 0).expect("lindex"), Some(b"a".to_vec()));
+    assert_eq!(
+        rdb.lindex("list-key", 0).expect("lindex"),
+        Some(b"a".to_vec())
+    );
 
     // Set
-    rdb.sadd("set-key", &[b"x".as_slice(), b"y".as_slice(), b"z".as_slice()]).expect("sadd");
+    rdb.sadd(
+        "set-key",
+        &[b"x".as_slice(), b"y".as_slice(), b"z".as_slice()],
+    )
+    .expect("sadd");
     assert_eq!(rdb.scard("set-key").expect("scard"), 3);
     assert!(rdb.sismember("set-key", b"y").expect("sismember"));
 
     // Sorted Set
-    rdb.zadd("zset-key", &[
-        ZMember::new(1.0, b"alpha"),
-        ZMember::new(2.0, b"beta"),
-        ZMember::new(3.0, b"gamma"),
-    ]).expect("zadd");
+    rdb.zadd(
+        "zset-key",
+        &[
+            ZMember::new(1.0, b"alpha"),
+            ZMember::new(2.0, b"beta"),
+            ZMember::new(3.0, b"gamma"),
+        ],
+    )
+    .expect("zadd");
     assert_eq!(rdb.zcard("zset-key").expect("zcard"), 3);
 }
 
@@ -173,8 +224,10 @@ async fn data_survives_haqlite_recreate() {
         let rdb = redlite::Db::from_shared_connection(conn, 1).expect("redlite");
 
         rdb.set("persist-key", b"persist-value", None).expect("set");
-        rdb.hset("persist-hash", &[("f1", b"v1".as_slice())]).expect("hset");
-        rdb.rpush("persist-list", &[b"item1".as_slice(), b"item2".as_slice()]).expect("rpush");
+        rdb.hset("persist-hash", &[("f1", b"v1".as_slice())])
+            .expect("hset");
+        rdb.rpush("persist-list", &[b"item1".as_slice(), b"item2".as_slice()])
+            .expect("rpush");
 
         // Drop db (simulates stop)
         drop(rdb);
@@ -197,7 +250,11 @@ async fn data_survives_haqlite_recreate() {
             Some(b"v1".to_vec()),
             "Hash should survive recreate"
         );
-        assert_eq!(rdb.llen("persist-list").expect("llen"), 2, "List should survive recreate");
+        assert_eq!(
+            rdb.llen("persist-list").expect("llen"),
+            2,
+            "List should survive recreate"
+        );
     }
 }
 
@@ -221,7 +278,11 @@ async fn concurrent_operations_on_shared_connection() {
             let val = format!("value-{}", i);
             rdb.set(&key, val.as_bytes(), None).expect("set");
             let got = rdb.get(&key).expect("get");
-            assert_eq!(got, Some(val.into_bytes()), "concurrent read should match write");
+            assert_eq!(
+                got,
+                Some(val.into_bytes()),
+                "concurrent read should match write"
+            );
         }));
     }
 
@@ -232,7 +293,11 @@ async fn concurrent_operations_on_shared_connection() {
     // All 10 keys should exist
     for i in 0..10 {
         let key = format!("concurrent-{}", i);
-        assert!(rdb.get(&key).expect("get").is_some(), "key {} should exist", key);
+        assert!(
+            rdb.get(&key).expect("get").is_some(),
+            "key {} should exist",
+            key
+        );
     }
 }
 
@@ -284,14 +349,16 @@ async fn multiple_redlite_instances_same_connection() {
     let rdb1 = redlite::Db::from_shared_connection(conn.clone(), 1).expect("redlite 1");
     let rdb2 = redlite::Db::from_shared_connection(conn, 1).expect("redlite 2");
 
-    rdb1.set("shared-key", b"from-db1", None).expect("set via db1");
+    rdb1.set("shared-key", b"from-db1", None)
+        .expect("set via db1");
 
     // db2 should see db1's write
     let val = rdb2.get("shared-key").expect("get via db2");
     assert_eq!(val, Some(b"from-db1".to_vec()));
 
     // db2 writes, db1 reads
-    rdb2.set("shared-key-2", b"from-db2", None).expect("set via db2");
+    rdb2.set("shared-key-2", b"from-db2", None)
+        .expect("set via db2");
     let val = rdb1.get("shared-key-2").expect("get via db1");
     assert_eq!(val, Some(b"from-db2".to_vec()));
 }

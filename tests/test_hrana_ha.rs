@@ -67,7 +67,11 @@ fn build_coordinator(
 }
 
 /// Build the full axum router (health/status/metrics + hrana) for a node.
-fn build_app(db: Arc<HaQLite>, db_path: std::path::PathBuf, secret: Option<String>) -> axum::Router {
+fn build_app(
+    db: Arc<HaQLite>,
+    db_path: std::path::PathBuf,
+    secret: Option<String>,
+) -> axum::Router {
     let hrana_router = build_hrana_router(db.clone(), db_path, secret.clone());
     let state = Arc::new(AppState::new(db, secret));
     build_router(state, hrana_router)
@@ -93,9 +97,8 @@ async fn pipeline(
     let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let body_json: Value = serde_json::from_slice(&body_bytes).unwrap_or_else(|_| {
-        json!({"raw": String::from_utf8_lossy(&body_bytes).to_string()})
-    });
+    let body_json: Value = serde_json::from_slice(&body_bytes)
+        .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&body_bytes).to_string()}));
     (status, body_json)
 }
 
@@ -135,9 +138,15 @@ async fn test_leader_hrana_read() {
     let coord = build_coordinator(storage, lease, "leader-1", "http://localhost:19100");
 
     let db = Arc::new(
-        HaQLite::from_coordinator(coord, db_path.to_str().unwrap(), SCHEMA, 19100, Duration::from_secs(5))
-            .await
-            .unwrap(),
+        HaQLite::from_coordinator(
+            coord,
+            db_path.to_str().unwrap(),
+            SCHEMA,
+            19100,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap(),
     );
     assert_eq!(db.role(), Some(Role::Leader));
 
@@ -154,7 +163,11 @@ async fn test_leader_hrana_read() {
     );
 
     drop(app);
-    Arc::into_inner(db).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(db)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -167,9 +180,15 @@ async fn test_leader_hrana_write() {
     let coord = build_coordinator(storage, lease, "leader-2", "http://localhost:19101");
 
     let db = Arc::new(
-        HaQLite::from_coordinator(coord, db_path.to_str().unwrap(), SCHEMA, 19101, Duration::from_secs(5))
-            .await
-            .unwrap(),
+        HaQLite::from_coordinator(
+            coord,
+            db_path.to_str().unwrap(),
+            SCHEMA,
+            19101,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap(),
     );
     assert_eq!(db.role(), Some(Role::Leader));
 
@@ -195,7 +214,11 @@ async fn test_leader_hrana_write() {
     );
 
     drop(app);
-    Arc::into_inner(db).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(db)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -208,9 +231,15 @@ async fn test_leader_hrana_transaction() {
     let coord = build_coordinator(storage, lease, "leader-3", "http://localhost:19102");
 
     let db = Arc::new(
-        HaQLite::from_coordinator(coord, db_path.to_str().unwrap(), SCHEMA, 19102, Duration::from_secs(5))
-            .await
-            .unwrap(),
+        HaQLite::from_coordinator(
+            coord,
+            db_path.to_str().unwrap(),
+            SCHEMA,
+            19102,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap(),
     );
     let app = build_app(db.clone(), db_path, None);
 
@@ -243,7 +272,11 @@ async fn test_leader_hrana_transaction() {
     );
 
     drop(app);
-    Arc::into_inner(db).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(db)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -340,8 +373,16 @@ async fn test_follower_hrana_read() {
     );
 
     drop(follower_app);
-    Arc::into_inner(leader).expect("sole owner").close().await.unwrap();
-    Arc::into_inner(follower).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(leader)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
+    Arc::into_inner(follower)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -426,18 +467,12 @@ async fn test_follower_hrana_rejects_writes() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     // DELETE through follower → 403
-    let body = pipeline_body(
-        None,
-        vec![execute_req("DELETE FROM t WHERE id = 1")],
-    );
+    let body = pipeline_body(None, vec![execute_req("DELETE FROM t WHERE id = 1")]);
     let (status, _) = pipeline(&follower_app, "/v3/pipeline", &body, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     // CREATE TABLE through follower → 403
-    let body = pipeline_body(
-        None,
-        vec![execute_req("CREATE TABLE t2 (id INTEGER)")],
-    );
+    let body = pipeline_body(None, vec![execute_req("CREATE TABLE t2 (id INTEGER)")]);
     let (status, _) = pipeline(&follower_app, "/v3/pipeline", &body, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
@@ -453,8 +488,16 @@ async fn test_follower_hrana_rejects_writes() {
     assert_eq!(resp["results"][0]["type"], "ok");
 
     drop(follower_app);
-    Arc::into_inner(leader).expect("sole owner").close().await.unwrap();
-    Arc::into_inner(follower).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(leader)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
+    Arc::into_inner(follower)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -522,16 +565,21 @@ async fn test_follower_hrana_rejects_batch_with_writes() {
     assert!(resp["error"].as_str().unwrap().contains("follower"));
 
     // Pure read pipeline on follower → OK
-    let body = pipeline_body(
-        None,
-        vec![query_req("SELECT 1"), query_req("SELECT 2")],
-    );
+    let body = pipeline_body(None, vec![query_req("SELECT 1"), query_req("SELECT 2")]);
     let (status, _) = pipeline(&follower_app, "/v3/pipeline", &body, None).await;
     assert_eq!(status, StatusCode::OK);
 
     drop(follower_app);
-    Arc::into_inner(leader).expect("sole owner").close().await.unwrap();
-    Arc::into_inner(follower).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(leader)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
+    Arc::into_inner(follower)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -624,8 +672,16 @@ async fn test_follower_hrana_cursor_rejects_writes() {
     let response = follower_app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    Arc::into_inner(leader).expect("sole owner").close().await.unwrap();
-    Arc::into_inner(follower).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(leader)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
+    Arc::into_inner(follower)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -692,8 +748,16 @@ async fn test_follower_hrana_rejects_sequence_writes() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     drop(follower_app);
-    Arc::into_inner(leader).expect("sole owner").close().await.unwrap();
-    Arc::into_inner(follower).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(leader)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
+    Arc::into_inner(follower)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -777,13 +841,27 @@ async fn test_leader_follower_hrana_with_auth() {
         None,
         vec![execute_req("INSERT INTO t (id, name) VALUES (1, 'Alice')")],
     );
-    let (status, _) = pipeline(&follower_app, "/v3/pipeline", &write_body, Some("secret123")).await;
+    let (status, _) = pipeline(
+        &follower_app,
+        "/v3/pipeline",
+        &write_body,
+        Some("secret123"),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     drop(leader_app);
     drop(follower_app);
-    Arc::into_inner(leader).expect("sole owner").close().await.unwrap();
-    Arc::into_inner(follower).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(leader)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
+    Arc::into_inner(follower)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -872,10 +950,7 @@ async fn test_leader_write_follower_read_through_hrana() {
     }
 
     // Read through follower's hrana endpoint
-    let body = pipeline_body(
-        None,
-        vec![query_req("SELECT id, name FROM t ORDER BY id")],
-    );
+    let body = pipeline_body(None, vec![query_req("SELECT id, name FROM t ORDER BY id")]);
     let (status, resp) = pipeline(&follower_app, "/v3/pipeline", &body, None).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -894,8 +969,16 @@ async fn test_leader_write_follower_read_through_hrana() {
 
     drop(leader_app);
     drop(follower_app);
-    Arc::into_inner(leader).expect("sole owner").close().await.unwrap();
-    Arc::into_inner(follower).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(leader)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
+    Arc::into_inner(follower)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -955,20 +1038,14 @@ async fn test_follower_hrana_close_and_autocommit() {
     let follower_app = build_app(follower.clone(), follower_path, None);
 
     // get_autocommit on follower
-    let body = pipeline_body(
-        None,
-        vec![json!({ "type": "get_autocommit" })],
-    );
+    let body = pipeline_body(None, vec![json!({ "type": "get_autocommit" })]);
     let (status, resp) = pipeline(&follower_app, "/v3/pipeline", &body, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(resp["results"][0]["type"], "ok");
     assert_eq!(resp["results"][0]["response"]["is_autocommit"], true);
 
     // close on follower
-    let body = pipeline_body(
-        None,
-        vec![json!({ "type": "close" })],
-    );
+    let body = pipeline_body(None, vec![json!({ "type": "close" })]);
     let (status, resp) = pipeline(&follower_app, "/v3/pipeline", &body, None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(resp["baton"].is_null());
@@ -976,8 +1053,16 @@ async fn test_follower_hrana_close_and_autocommit() {
     assert_eq!(resp["results"][0]["response"]["type"], "close");
 
     drop(follower_app);
-    Arc::into_inner(leader).expect("sole owner").close().await.unwrap();
-    Arc::into_inner(follower).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(leader)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
+    Arc::into_inner(follower)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -1055,8 +1140,16 @@ async fn test_follower_hrana_describe() {
     assert_eq!(cols[1]["name"], "name");
 
     drop(follower_app);
-    Arc::into_inner(leader).expect("sole owner").close().await.unwrap();
-    Arc::into_inner(follower).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(leader)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
+    Arc::into_inner(follower)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -1130,8 +1223,7 @@ async fn test_follower_connection_is_sqlite_readonly() {
     assert!(result.is_err(), "Write must fail on read-only connection");
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.to_lowercase().contains("readonly")
-            || err_msg.to_lowercase().contains("read-only"),
+        err_msg.to_lowercase().contains("readonly") || err_msg.to_lowercase().contains("read-only"),
         "Error should mention readonly, got: {err_msg}"
     );
 
@@ -1150,8 +1242,16 @@ async fn test_follower_connection_is_sqlite_readonly() {
         .unwrap();
     assert_eq!(count, 1);
 
-    Arc::into_inner(leader).expect("sole owner").close().await.unwrap();
-    Arc::into_inner(follower).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(leader)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
+    Arc::into_inner(follower)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -1220,7 +1320,11 @@ async fn test_hrana_session_isolation_on_leader() {
     );
 
     drop(app);
-    Arc::into_inner(db).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(db)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -1282,10 +1386,7 @@ async fn test_hrana_and_haqlite_share_database_state() {
     .unwrap();
 
     // Read through hrana — must see HaQLite's native write
-    let body = pipeline_body(
-        None,
-        vec![query_req("SELECT name FROM t WHERE id = 2")],
-    );
+    let body = pipeline_body(None, vec![query_req("SELECT name FROM t WHERE id = 2")]);
     let (status, resp) = pipeline(&app, "/v3/pipeline", &body, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -1294,7 +1395,11 @@ async fn test_hrana_and_haqlite_share_database_state() {
     );
 
     drop(app);
-    Arc::into_inner(db).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(db)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -1354,19 +1459,20 @@ async fn test_wrong_auth_rejected_on_both_roles() {
     );
 
     let leader_app = build_app(leader.clone(), leader_path, Some("correct_secret".into()));
-    let follower_app =
-        build_app(follower.clone(), follower_path, Some("correct_secret".into()));
+    let follower_app = build_app(
+        follower.clone(),
+        follower_path,
+        Some("correct_secret".into()),
+    );
 
     let body = pipeline_body(None, vec![query_req("SELECT 1")]);
 
     // Wrong token on leader → 401
-    let (status, _) =
-        pipeline(&leader_app, "/v3/pipeline", &body, Some("wrong_secret")).await;
+    let (status, _) = pipeline(&leader_app, "/v3/pipeline", &body, Some("wrong_secret")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // Wrong token on follower → 401
-    let (status, _) =
-        pipeline(&follower_app, "/v3/pipeline", &body, Some("wrong_secret")).await;
+    let (status, _) = pipeline(&follower_app, "/v3/pipeline", &body, Some("wrong_secret")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // Empty token on leader → 401
@@ -1379,8 +1485,16 @@ async fn test_wrong_auth_rejected_on_both_roles() {
 
     drop(leader_app);
     drop(follower_app);
-    Arc::into_inner(leader).expect("sole owner").close().await.unwrap();
-    Arc::into_inner(follower).expect("sole owner").close().await.unwrap();
+    Arc::into_inner(leader)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
+    Arc::into_inner(follower)
+        .expect("sole owner")
+        .close()
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -1394,7 +1508,8 @@ fn build_coordinator_fast(
     instance_id: &str,
     address: &str,
 ) -> Arc<Coordinator> {
-    let mut lease_config = LeaseConfig::new(lease_store, instance_id.to_string(), address.to_string());
+    let mut lease_config =
+        LeaseConfig::new(lease_store, instance_id.to_string(), address.to_string());
     lease_config.ttl_secs = 3;
     lease_config.renew_interval = Duration::from_millis(500);
     lease_config.follower_poll_interval = Duration::from_millis(200);
@@ -1530,10 +1645,7 @@ async fn test_role_promotion_changes_hrana_writability() {
     assert_eq!(resp["results"][0]["type"], "ok");
 
     // Verify the write landed
-    let body = pipeline_body(
-        None,
-        vec![query_req("SELECT name FROM t WHERE id = 1")],
-    );
+    let body = pipeline_body(None, vec![query_req("SELECT name FROM t WHERE id = 1")]);
     let (status, resp) = pipeline(&follower_app, "/v3/pipeline", &body, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
