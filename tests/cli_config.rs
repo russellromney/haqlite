@@ -184,12 +184,81 @@ async fn test_serve_rejects_empty_bucket() {
         secret: None,
         sync_interval_ms: 1000,
         follower_pull_ms: 1000,
-        mode: "dedicated".to_string(),
+        mode: "singlewriter".to_string(),
     };
     let err = haqlite::serve::run(&shared, &serve).await.unwrap_err();
     assert!(
         err.to_string().contains("bucket is required"),
         "expected bucket validation error, got: {err}"
+    );
+}
+
+/// Phase Košice: dead-name regression guard.
+///
+/// Pre-Košice the haqlite mode parser accepted `"dedicated"` /
+/// `"shared"` as compatibility aliases for `singlewriter` /
+/// `sharedwriter`. Košice removed those aliases (decision [D6]). This
+/// test pins the live contract: `serve::run` rejects the dead name with
+/// the canonical "invalid HAQLITE_MODE 'dedicated'" message.
+///
+/// Note: HAQLITE_MODE env var is process-wide and beats `serve.mode`,
+/// so we explicitly clear it before the call. The non-empty `bucket`
+/// is required to get past the bucket-validation short-circuit and
+/// actually reach the mode parser.
+#[tokio::test]
+async fn test_serve_rejects_dead_mode_name_dedicated() {
+    std::env::remove_var("HAQLITE_MODE");
+
+    let mut shared = SharedConfig::default();
+    shared.s3.bucket = "non-empty".to_string();
+
+    let serve = ServeConfig {
+        db_path: std::path::PathBuf::from("/tmp/dead-name-test.db"),
+        schema: None,
+        port: 19998,
+        forwarding_port: 29998,
+        prefix: "haqlite/".to_string(),
+        secret: None,
+        sync_interval_ms: 1000,
+        follower_pull_ms: 1000,
+        mode: "dedicated".to_string(),
+    };
+    let err = haqlite::serve::run(&shared, &serve).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid HAQLITE_MODE 'dedicated'"),
+        "expected dead-name rejection, got: {msg}"
+    );
+    assert!(
+        msg.contains("singlewriter") || msg.contains("sharedwriter"),
+        "rejection should name the canonical values, got: {msg}"
+    );
+}
+
+/// Phase Košice: dead-name regression guard for "shared".
+#[tokio::test]
+async fn test_serve_rejects_dead_mode_name_shared() {
+    std::env::remove_var("HAQLITE_MODE");
+
+    let mut shared = SharedConfig::default();
+    shared.s3.bucket = "non-empty".to_string();
+
+    let serve = ServeConfig {
+        db_path: std::path::PathBuf::from("/tmp/dead-name-shared.db"),
+        schema: None,
+        port: 19997,
+        forwarding_port: 29997,
+        prefix: "haqlite/".to_string(),
+        secret: None,
+        sync_interval_ms: 1000,
+        follower_pull_ms: 1000,
+        mode: "shared".to_string(),
+    };
+    let err = haqlite::serve::run(&shared, &serve).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid HAQLITE_MODE 'shared'"),
+        "expected dead-name rejection, got: {msg}"
     );
 }
 
