@@ -81,8 +81,8 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
         .unwrap_or_else(|_| serve.mode.clone())
         .to_lowercase();
     let ha_mode = match mode_str.as_str() {
-        "singlewriter" | "dedicated" => HaMode::SingleWriter,
-        "sharedwriter" | "shared" => HaMode::SharedWriter,
+        "singlewriter" => HaMode::SingleWriter,
+        "sharedwriter" => HaMode::SharedWriter,
         other => anyhow::bail!(
             "invalid HAQLITE_MODE '{other}' (expected 'singlewriter' or 'sharedwriter')"
         ),

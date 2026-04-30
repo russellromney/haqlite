@@ -409,8 +409,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| format!("node-{}", args.port));
 
     let mode = match args.topology.as_str() {
-        "singlewriter" | "dedicated" => HaMode::SingleWriter,
-        "sharedwriter" | "shared" => HaMode::SharedWriter,
+        "singlewriter" => HaMode::SingleWriter,
+        "sharedwriter" => HaMode::SharedWriter,
         other => anyhow::bail!(
             "unknown topology: {} (expected: singlewriter, sharedwriter)",
             other
