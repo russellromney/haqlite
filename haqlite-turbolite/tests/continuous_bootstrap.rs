@@ -287,3 +287,67 @@ async fn continuous_open_accepts_same_writer_manifest_when_meta_lags() {
         .expect("continuous payload must include walrust cursor");
     assert_eq!(walrust, (0, "test/".to_string()));
 }
+
+/// Regression: a fresh tenant in turbolite-VFS mode must bootstrap even
+/// when the caller passes an empty schema.
+///
+/// The cinch engine's redis tenant create path (`pool/redis.rs::create`)
+/// calls `builder.open(db_path, "")` for a brand-new tenant. Without
+/// a schema to execute, ensure_schema's opener-call doesn't push any
+/// pages through the VFS, and the local OS path at `db_path` never
+/// gets a file. ensure_base_manifest then calls
+/// `vfs.import_sqlite_file(&db_path)` and ENOENTs out, the open fails,
+/// the orchestrator-side claim is leaked, and Phase Skerry watchdog
+/// fires (last_kind=EmptyQueue / total_flush_attempts grows / zero
+/// successes — the in-vivo fingerprint we observed).
+///
+/// The fix lives in haqlite-turbolite::Replicator::ensure_base_manifest:
+/// when there is no remote manifest AND no local file, seed a minimal
+/// valid SQLite at the local path before import so the import has a
+/// real header to read.
+#[tokio::test(flavor = "multi_thread")]
+async fn continuous_open_publishes_hybrid_manifest_for_fresh_database_with_empty_schema() {
+    let tmp = TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("empty_schema_bootstrap.db");
+
+    let walrust_storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
+    let tiered_storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+
+    let (vfs, vfs_name) = make_remote_vfs(tmp.path(), tiered_storage);
+    let _db = Builder::new()
+        .prefix("test/")
+        .mode(HaMode::SingleWriter)
+        .durability(turbodb::Durability::Continuous {
+            checkpoint: Default::default(),
+            replication_interval: Duration::from_millis(50),
+        })
+        .lease_store(lease_store)
+        .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
+        .walrust_storage(walrust_storage)
+        .turbolite_vfs(vfs.clone(), &vfs_name)
+        .instance_id("writer-empty-schema")
+        .forwarding_port(19310)
+        .open(db_path.to_str().expect("path"), "")
+        .await
+        .expect("fresh empty-schema bootstrap must succeed (cinch redis-create path)");
+
+    let manifest = manifest_store
+        .get("test/empty_schema_bootstrap/_manifest")
+        .await
+        .expect("fetch manifest")
+        .expect("empty-schema fresh bootstrap must publish manifest");
+    assert!(
+        manifest.version >= 1,
+        "manifest version must advance past zero for fresh tenants: {}",
+        manifest.version
+    );
+    assert_eq!(manifest.writer_id, "writer-empty-schema");
+
+    let walrust = vfs
+        .set_manifest_bytes(&manifest.payload)
+        .expect("decode hybrid payload")
+        .expect("continuous payload must include walrust cursor");
+    assert_eq!(walrust, (0, "test/".to_string()));
+}

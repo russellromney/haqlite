@@ -14,6 +14,141 @@ fn manifest_key(prefix: &str, db_name: &str) -> String {
     format!("{}{}/_manifest", prefix, db_name)
 }
 
+/// Create a minimal valid SQLite file at `path` so
+/// `vfs.import_sqlite_file` has a real on-disk header to read for a
+/// fresh-tenant bootstrap. Idempotent — does nothing if `path` already
+/// exists.
+///
+/// Why this is necessary: turbolite-backed connections write through
+/// the VFS, not the literal OS path. For a brand-new tenant whose
+/// connection_opener hasn't yet triggered an xSync that publishes a
+/// remote manifest (empty schema with no commit, slow HTTP storage,
+/// etc.), `ensure_base_manifest`'s import branch hits ENOENT on the
+/// nonexistent local file. Seeding a tiny SQLite here lets the
+/// import succeed; turbolite reads the empty db, builds an empty
+/// manifest at version 1, and the writer takes over from there.
+///
+/// `PRAGMA user_version = 1; PRAGMA user_version = 0;` is the cheapest
+/// way to bump SQLite's file change counter past zero, which
+/// `import::import_sqlite_file` asserts is non-zero.
+///
+/// Public so callers and tests can exercise the seed step directly.
+pub fn seed_local_sqlite_for_import(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let conn = rusqlite::Connection::open(path).map_err(io_err)?;
+    conn.execute_batch("PRAGMA user_version = 1; PRAGMA user_version = 0;")
+        .map_err(io_err)?;
+    drop(conn);
+    Ok(())
+}
+
+fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// `seed_local_sqlite_for_import` creates a real, valid SQLite file
+    /// at `path` even when the parent directory doesn't exist yet — the
+    /// engine's `./data/.tl_cache_<id>` parent is created by the
+    /// haqlite-turbolite Builder, but `db_path = ./data/<id>.db`
+    /// itself has no creator unless we make one here.
+    #[test]
+    fn seed_creates_file_and_parent_dir() {
+        let tmp = TempDir::new().expect("tmp");
+        let nested = tmp.path().join("never").join("existed");
+        let path = nested.join("seed.db");
+        assert!(!nested.exists());
+        assert!(!path.exists());
+
+        seed_local_sqlite_for_import(&path).expect("seed");
+
+        assert!(nested.exists(), "parent dir must be created");
+        assert!(path.exists(), "seed file must exist after call");
+    }
+
+    /// The seeded file must be a valid SQLite file with file change
+    /// counter > 0 — that's the precondition `import_sqlite_file`
+    /// asserts. SQLite encodes the change counter at offset 24..28
+    /// (big-endian). PRAGMA user_version=1 then =0 commits twice,
+    /// bumping the counter to 2.
+    #[test]
+    fn seed_bumps_file_change_counter_past_zero() {
+        use std::io::Read;
+        let tmp = TempDir::new().expect("tmp");
+        let path = tmp.path().join("seed.db");
+        seed_local_sqlite_for_import(&path).expect("seed");
+
+        let mut header = [0u8; 100];
+        let mut f = std::fs::File::open(&path).expect("open");
+        f.read_exact(&mut header).expect("read header");
+        let counter = u32::from_be_bytes([header[24], header[25], header[26], header[27]]);
+        assert!(
+            counter > 0,
+            "file change counter must be > 0 after seed (import_sqlite_file asserts > 0); got {}",
+            counter
+        );
+    }
+
+    /// Idempotent: re-seeding an existing file is a no-op (doesn't
+    /// truncate, doesn't error). Important because ensure_base_manifest
+    /// may be called more than once over the lifetime of a tenant.
+    #[test]
+    fn seed_is_idempotent() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = tmp.path().join("seed.db");
+        seed_local_sqlite_for_import(&path).expect("first seed");
+
+        // Write a sentinel byte right after the SQLite header so we
+        // can detect if the second seed truncated.
+        {
+            use std::io::Seek;
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open rw");
+            f.seek(std::io::SeekFrom::End(0)).expect("seek end");
+            f.write_all(b"sentinel").expect("write sentinel");
+        }
+        let len_before = std::fs::metadata(&path).expect("meta").len();
+
+        seed_local_sqlite_for_import(&path).expect("second seed (idempotent)");
+        let len_after = std::fs::metadata(&path).expect("meta").len();
+        assert_eq!(
+            len_before, len_after,
+            "seed must not truncate or rewrite an existing file"
+        );
+    }
+
+    /// The seeded file must round-trip through `import_sqlite_file`
+    /// — that's the call site that prompted the seed in the first
+    /// place. We don't run the full turbolite import here (it needs a
+    /// backend), but we do verify SQLite can re-open the file and
+    /// answer a simple query, which is the SQLite-level precondition
+    /// import depends on.
+    #[test]
+    fn seeded_file_is_a_valid_sqlite_database() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = tmp.path().join("seed.db");
+        seed_local_sqlite_for_import(&path).expect("seed");
+
+        let conn = rusqlite::Connection::open(&path).expect("reopen seeded db");
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("query user_version");
+        assert_eq!(user_version, 0);
+    }
+}
+
 fn should_publish_manifest(vfs: &SharedTurboliteVfs) -> bool {
     let manifest = vfs.manifest();
     manifest.version > 0 || manifest.page_count > 0 || !manifest.page_group_keys.is_empty()
@@ -258,9 +393,35 @@ impl TurboliteWalReplicator {
                 ));
             }
         } else {
+            // No remote manifest, no published hybrid manifest. The local
+            // db_path may legitimately not exist yet — turbolite-backed
+            // connections write through the VFS, not the OS path, so a
+            // brand-new tenant whose connection_opener didn't trigger an
+            // xSync (e.g., empty schema, no committed pragma side-effect
+            // visible to a remote HTTP storage backend before
+            // ensure_base_manifest runs) leaves us with neither a remote
+            // manifest nor a real file at `path`. import_sqlite_file
+            // requires the file. Seed a minimal valid SQLite at `path`
+            // before import so the bootstrap completes — turbolite then
+            // imports a 1-page (header-only) database, which the
+            // connection_opener fills in on first write.
+            //
+            // Symptom this fixes (cinch): redis tenant create returns 500
+            // "Failed to create Redis database via HaQLite builder:
+            // turbolite import failed: No such file or directory" and the
+            // orchestrator-side claim is leaked, tripping Phase Skerry
+            // watchdog with last_kind=EmptyQueue.
+            seed_local_sqlite_for_import(path).map_err(|e| {
+                anyhow!(
+                    "turbolite seed local sqlite for fresh bootstrap of '{}' at {}: {}",
+                    name,
+                    path.display(),
+                    e
+                )
+            })?;
             let vfs = self.vfs.clone();
-            let path = path.to_path_buf();
-            tokio::task::spawn_blocking(move || vfs.import_sqlite_file(&path))
+            let path_buf = path.to_path_buf();
+            tokio::task::spawn_blocking(move || vfs.import_sqlite_file(&path_buf))
                 .await
                 .map_err(|e| anyhow!("turbolite import task panicked: {}", e))?
                 .map_err(|e| anyhow!("turbolite import failed: {}", e))?;
