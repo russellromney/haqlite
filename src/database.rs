@@ -890,7 +890,8 @@ impl HaQLite {
         authorizer: Option<AuthorizerFactory>,
     ) -> Result<HaQLite> {
         let db_path = PathBuf::from(db_path);
-        ensure_schema(&db_path, schema)?;
+        // Local mode never uses an opener — discard the (always-None) returned conn.
+        let _ = ensure_schema(&db_path, schema, None)?;
 
         let conn = open_leader_connection(&db_path)?;
 
@@ -1677,7 +1678,7 @@ pub async fn open_with_coordinator(
     >,
     on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
 ) -> Result<HaQLite> {
-    ensure_schema(&db_path, schema)?;
+    let bootstrap_conn = ensure_schema(&db_path, schema, connection_opener.as_ref())?;
 
     // Subscribe to role events BEFORE join.
     let role_rx = coordinator.role_events();
@@ -1739,9 +1740,17 @@ pub async fn open_with_coordinator(
         on_flush,
     });
 
-    // If leader, open rw connection.
+    // If leader, open rw connection. Re-use the bootstrap conn from
+    // ensure_schema when present — opening a second connection via the
+    // turbolite-backed opener can hit "database is locked" because the
+    // VFS may still hold per-file locks from the bootstrap conn that
+    // haven't been released across the open/close gap.
     if initial_role == Role::Leader {
-        match inner.try_open_leader_conn() {
+        let leader_conn = match bootstrap_conn {
+            Some(conn) => Ok(conn),
+            None => inner.try_open_leader_conn(),
+        };
+        match leader_conn {
             Ok(conn) => {
                 inner.apply_initial_authorizer(&conn);
                 inner.set_conn(Some(Arc::new(Mutex::new(conn))));
@@ -1750,6 +1759,11 @@ pub async fn open_with_coordinator(
                 tracing::error!("HaQLite: failed to open initial leader connection: {}", e);
             }
         }
+    } else {
+        // Non-leader role: bootstrap conn (if any) belongs to the schema
+        // pass and gets dropped here. Followers open their own rw conn
+        // on promotion.
+        drop(bootstrap_conn);
     }
 
     // Start forwarding server only if we're the leader.
@@ -1846,15 +1860,52 @@ pub async fn run_role_listener(
 // ============================================================================
 
 /// Create the DB file with schema (WAL mode, autocheckpoint=0).
-fn ensure_schema(db_path: &Path, schema: &str) -> Result<()> {
+///
+/// When a `connection_opener` is supplied (haqlite-turbolite path), the
+/// schema must land *through* the registered turbolite VFS so the
+/// VFS-backed connection sees it. Earlier versions opened via plain
+/// `rusqlite::Connection::open(db_path)`, which writes to a regular
+/// file at `db_path` that the VFS-backed connection never reads from —
+/// causing `no such table: t` for tiering modes that don't import the
+/// disk file at first publish (Checkpoint and Cloud).
+///
+/// Returns the opened connection when a `connection_opener` was used so
+/// the caller can re-use it as the persistent leader connection. Some
+/// VFS impls (notably turbolite in Cloud mode) hold per-file locks that
+/// don't release across an open/close gap, so opening a second time via
+/// the opener would fail with `database is locked`. Returning the
+/// connection lets the caller skip that second open entirely.
+fn ensure_schema(
+    db_path: &Path,
+    schema: &str,
+    connection_opener: Option<
+        &Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>,
+    >,
+) -> Result<Option<rusqlite::Connection>> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let conn = rusqlite::Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")?;
-    conn.execute_batch(schema)?;
-    drop(conn);
-    Ok(())
+    match connection_opener {
+        Some(opener) => {
+            let conn = opener().map_err(|e| anyhow::anyhow!("ensure_schema opener: {e}"))?;
+            if !schema.trim().is_empty() {
+                conn.execute_batch(schema)?;
+            }
+            Ok(Some(conn))
+        }
+        None => {
+            let conn = rusqlite::Connection::open(db_path)?;
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+                 PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;",
+            )?;
+            if !schema.trim().is_empty() {
+                conn.execute_batch(schema)?;
+            }
+            drop(conn);
+            Ok(None)
+        }
+    }
 }
 
 /// Open a read-write connection with WAL mode and autocheckpoint disabled.

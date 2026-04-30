@@ -614,9 +614,17 @@ impl Builder {
                 ))
             })?;
             // Apply pragmas based on durability.
+            //
+            // Cloud mode: SQLite's default journal_mode is DELETE, which is
+            // exactly what Cloud wants. We deliberately don't issue
+            // `PRAGMA journal_mode=DELETE` — the turbolite Cloud VFS has
+            // observed `database is locked` returns when the engine tries
+            // to switch journal modes on a freshly opened conn, and the
+            // pragma is a no-op when the mode already matches.
+            // Non-cloud (Continuous/Checkpoint): WAL is required, set it.
             if is_cloud {
-                conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;")
-                        .map_err(|e| haqlite::HaQLiteError::DatabaseError(format!("journal pragma: {e}")))?;
+                conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;")
+                    .map_err(|e| haqlite::HaQLiteError::DatabaseError(format!("pragma: {e}")))?;
             } else {
                 conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")
                         .map_err(|e| haqlite::HaQLiteError::DatabaseError(format!("journal pragma: {e}")))?;
