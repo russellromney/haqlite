@@ -172,7 +172,7 @@ async fn continuous_open_publishes_hybrid_manifest_for_fresh_database() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
 
     let (vfs, vfs_name) = make_remote_vfs(tmp.path(), tiered_storage);
-    let _db = Builder::new()
+    let mut db = Builder::new()
         .prefix("test/")
         .mode(HaMode::SingleWriter)
         .durability(turbodb::Durability::Continuous {
@@ -202,6 +202,7 @@ async fn continuous_open_publishes_hybrid_manifest_for_fresh_database() {
         .expect("decode hybrid payload")
         .expect("continuous payload must include walrust cursor");
     assert_eq!(walrust, (0, "test/".to_string()));
+    db.close().await.expect("close haqlite");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -215,7 +216,7 @@ async fn continuous_open_retries_first_manifest_create_race() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
 
     let (vfs, vfs_name) = make_remote_vfs(tmp.path(), tiered_storage);
-    let _db = Builder::new()
+    let mut db = Builder::new()
         .prefix("test/")
         .mode(HaMode::SingleWriter)
         .durability(turbodb::Durability::Continuous {
@@ -244,6 +245,7 @@ async fn continuous_open_retries_first_manifest_create_race() {
         .expect("decode hybrid payload")
         .expect("continuous payload must include walrust cursor");
     assert_eq!(walrust, (0, "test/".to_string()));
+    db.close().await.expect("close haqlite");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -257,7 +259,7 @@ async fn continuous_open_accepts_same_writer_manifest_when_meta_lags() {
     let lease_store = Arc::new(InMemoryLeaseStore::new());
 
     let (vfs, vfs_name) = make_remote_vfs(tmp.path(), tiered_storage);
-    let _db = Builder::new()
+    let mut db = Builder::new()
         .prefix("test/")
         .mode(HaMode::SingleWriter)
         .durability(turbodb::Durability::Continuous {
@@ -286,6 +288,7 @@ async fn continuous_open_accepts_same_writer_manifest_when_meta_lags() {
         .expect("decode hybrid payload")
         .expect("continuous payload must include walrust cursor");
     assert_eq!(walrust, (0, "test/".to_string()));
+    db.close().await.expect("close haqlite");
 }
 
 /// Regression: a fresh tenant in turbolite-VFS mode must bootstrap even
@@ -316,7 +319,7 @@ async fn continuous_open_publishes_hybrid_manifest_for_fresh_database_with_empty
     let lease_store = Arc::new(InMemoryLeaseStore::new());
 
     let (vfs, vfs_name) = make_remote_vfs(tmp.path(), tiered_storage);
-    let _db = Builder::new()
+    let mut db = Builder::new()
         .prefix("test/")
         .mode(HaMode::SingleWriter)
         .durability(turbodb::Durability::Continuous {
@@ -350,4 +353,5 @@ async fn continuous_open_publishes_hybrid_manifest_for_fresh_database_with_empty
         .expect("decode hybrid payload")
         .expect("continuous payload must include walrust cursor");
     assert_eq!(walrust, (0, "test/".to_string()));
+    db.close().await.expect("close haqlite");
 }
