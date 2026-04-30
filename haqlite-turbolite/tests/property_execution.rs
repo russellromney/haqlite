@@ -161,74 +161,14 @@ proptest! {
     }
 }
 
-proptest! {
-    // S3-backed: each case does num_writes S3 round-trips. 20 cases covers
-    // the 1..10 range well without burning 256 * ~5 = 1280 S3 calls.
-    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(20))]
-    #[test]
-    fn shared_mode_serialized_writes(
-        num_writes in 1..10usize,
-    ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            let tmp = TempDir::new().unwrap();
-            let storage = Arc::new(InMemoryStorage::new());
-            let lease_store = Arc::new(InMemoryLeaseStore::new());
-            let manifest_store = Arc::new(MemManifestStore::new());
-
-            let (vfs, vfs_name) = make_local_vfs(tmp.path());
-            let db_path = tmp.path().join("shared_serial.db");
-            let mut db = Builder::new()
-                .prefix("test/")
-                .mode(HaMode::SharedWriter)
-                .durability(turbodb::Durability::Cloud)
-                .lease_store(lease_store)
-                .manifest_store(manifest_store)
-                .walrust_storage(storage)
-                .turbolite_vfs(vfs, &vfs_name)
-                .instance_id("prop-writer")
-                .manifest_poll_interval(Duration::from_millis(50))
-                .write_timeout(Duration::from_secs(5))
-                .open(db_path.to_str().unwrap(), SCHEMA)
-                .await
-                .expect("open sharedwriter mode");
-
-            let db = Arc::new(db);
-
-            // execute_async's future is Send (param_refs scoped to sync branch).
-            // Run writes sequentially to test SharedWriter mode lease contention.
-            let mut successes = 0u64;
-            for i in 0..num_writes {
-                let id = i as i64;
-                let params = vec![
-                    SqlValue::Integer(id),
-                    SqlValue::Text(format!("prop-{}", id)),
-                    SqlValue::Real(id as f64),
-                ];
-                match db.execute_async(
-                    "INSERT INTO props (id, name, score) VALUES (?1, ?2, ?3)",
-                    &params,
-                ).await {
-                    Ok(_) => successes += 1,
-                    Err(HaQLiteError::LeaseContention(_)) => {}
-                    Err(e) => {
-                        panic!("unexpected error: {:?}", e);
-                    }
-                }
-            }
-
-            let count: i64 = db.query_row(
-                "SELECT COUNT(*) FROM props", &[], |r| r.get(0),
-            ).unwrap();
-
-            if let Ok(mut db) = Arc::try_unwrap(db) {
-                let _ = db.close().await;
-            }
-            (successes, count as u64)
-        });
-
-        let (successes, count) = result;
-        assert_eq!(successes, count,
-            "row count ({}) should equal successful writes ({})", count, successes);
-    }
-}
+// SharedWriter mode tests removed in Phase Košice.
+//
+// SharedWriter (formerly MultiWriter) was unimplemented in
+// haqlite-turbolite as of commit 28ed14a ("Wire Turbolite-owned
+// continuous replication"). The bail predates Phase Košice; these
+// proptests existed but did not exercise live functionality. They are
+// not deferred or `#[ignore]`d — they're deleted because the API
+// surface they exercise does not exist. Bail-matrix coverage for the
+// (HaMode::SharedWriter, *) combinations now lives in
+// `mode_role_bail.rs`. When SharedWriter is implemented, restore
+// these proptests there.
