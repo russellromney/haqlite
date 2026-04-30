@@ -1,4 +1,6 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -50,6 +52,94 @@ impl CinchHttpConfig {
             } => hadb_storage_cinch::CinchHttpStorage::new_internal(endpoint, database_id, prefix),
         }
     }
+
+    fn identity_key(&self) -> String {
+        match self {
+            Self::Public { endpoint, token } => format!("public:{endpoint}:{token}"),
+            Self::Internal {
+                endpoint,
+                database_id,
+            } => format!("internal:{endpoint}:{database_id}"),
+        }
+    }
+}
+
+type SharedFence = (Arc<haqlite::AtomicFence>, Arc<haqlite::AtomicFenceWriter>);
+
+#[derive(Clone)]
+struct AutoVfsRegistration {
+    shared_vfs: SharedTurboliteVfs,
+    vfs_name: String,
+    shared_fence: Option<SharedFence>,
+}
+
+static AUTO_VFS_REGISTRY: OnceLock<Mutex<HashMap<String, AutoVfsRegistration>>> = OnceLock::new();
+
+fn auto_vfs_registry() -> &'static Mutex<HashMap<String, AutoVfsRegistration>> {
+    AUTO_VFS_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn stable_vfs_name(key: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    format!("haqlite_ded_sync_{:016x}", hasher.finish())
+}
+
+fn new_shared_fence() -> SharedFence {
+    let (fence, writer) = haqlite::AtomicFence::new();
+    (Arc::new(fence), Arc::new(writer))
+}
+
+fn auto_vfs_key(
+    cache_dir: &std::path::Path,
+    db_filename: &str,
+    prefix: &str,
+    instance_id: &str,
+    storage_identity: &str,
+    durability: &turbodb::Durability,
+) -> String {
+    format!(
+        "cache={}|db={}|prefix={}|instance={}|storage={}|durability={:?}",
+        cache_dir.display(),
+        db_filename,
+        prefix,
+        instance_id,
+        storage_identity,
+        durability
+    )
+}
+
+fn get_or_register_auto_vfs<F>(key: String, create: F) -> Result<AutoVfsRegistration>
+where
+    F: FnOnce() -> Result<(SharedTurboliteVfs, Option<SharedFence>)>,
+{
+    let mut registry = auto_vfs_registry()
+        .lock()
+        .expect("auto VFS registry mutex poisoned");
+    if let Some(existing) = registry.get(&key) {
+        return Ok(existing.clone());
+    }
+
+    let vfs_name = stable_vfs_name(&key);
+    let (shared_vfs, shared_fence) = create()?;
+    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone())
+        .map_err(|e| anyhow::anyhow!("register VFS: {e}"))?;
+
+    let registration = AutoVfsRegistration {
+        shared_vfs,
+        vfs_name,
+        shared_fence,
+    };
+    registry.insert(key, registration.clone());
+    Ok(registration)
+}
+
+#[cfg(test)]
+fn auto_vfs_registry_len() -> usize {
+    auto_vfs_registry()
+        .lock()
+        .expect("auto VFS registry mutex poisoned")
+        .len()
 }
 
 /// Builder for tiered HA SQLite with turbolite VFS.
@@ -300,7 +390,8 @@ impl Builder {
             (HaMode::SingleWriter, None | Some(Role::Leader) | Some(Role::Follower)) => {
                 self.open_writer(db_path, schema).await
             }
-            (HaMode::SingleWriter, Some(Role::Client)) | (HaMode::SharedWriter, Some(Role::Client)) => {
+            (HaMode::SingleWriter, Some(Role::Client))
+            | (HaMode::SharedWriter, Some(Role::Client)) => {
                 anyhow::bail!("Client mode not yet implemented in haqlite-turbolite")
             }
             (HaMode::SharedWriter, None | Some(Role::LatentWriter)) => {
@@ -358,14 +449,88 @@ impl Builder {
                 ForwardingMode::BuiltinHttp { port } => detect_address(&instance_id, port),
                 ForwardingMode::Disabled => String::new(),
             });
-        let shared_fence = if self.turbolite_http.is_some() {
-            let (fence, writer) = haqlite::AtomicFence::new();
-            Some((Arc::new(fence), Arc::new(writer)))
+        // Build or reuse the process-lifetime SQLite VFS. sqlite-vfs does not
+        // unregister today, so retrying after a post-registration open error
+        // must not create a fresh auto VFS each time.
+        let (shared_vfs, vfs_name, shared_fence) = if let Some((ref vfs, ref name)) =
+            self.turbolite_vfs
+        {
+            let shared_fence = self.turbolite_http.as_ref().map(|_| new_shared_fence());
+            (vfs.clone(), name.clone(), shared_fence)
         } else {
-            None
+            let cache_dir = db_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("/tmp"))
+                .join(format!(".tl_cache_{}", db_name));
+            std::fs::create_dir_all(&cache_dir)?;
+            let db_filename = db_path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| db_name.clone());
+            let tl_config = turbolite::tiered::TurboliteConfig {
+                cache_dir: cache_dir.clone(),
+                cache: turbolite::tiered::CacheConfig {
+                    gc_enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let rt_handle = tokio::runtime::Handle::current();
+            if let Some(ref cfg) = self.turbolite_http {
+                let key = auto_vfs_key(
+                    &cache_dir,
+                    &db_filename,
+                    self.inner.get_prefix(),
+                    &instance_id,
+                    &cfg.identity_key(),
+                    &self.turbolite_durability,
+                );
+                let registration = get_or_register_auto_vfs(key, || {
+                    let shared_fence = new_shared_fence();
+                    let storage: Arc<dyn hadb_storage::StorageBackend> =
+                        Arc::new(cfg.storage("pages").with_fence(shared_fence.0.clone()));
+                    let vfs = turbolite::tiered::TurboliteVfs::with_backend(
+                        tl_config, storage, rt_handle,
+                    )
+                    .map_err(|e| anyhow::anyhow!("turbolite VFS (HTTP): {e}"))?;
+                    Ok((
+                        turbolite::tiered::SharedTurboliteVfs::new(vfs),
+                        Some(shared_fence),
+                    ))
+                })?;
+                (
+                    registration.shared_vfs,
+                    registration.vfs_name,
+                    registration.shared_fence,
+                )
+            } else if let Some(ref storage) = self.turbolite_storage {
+                let key = auto_vfs_key(
+                    &cache_dir,
+                    &db_filename,
+                    self.inner.get_prefix(),
+                    &instance_id,
+                    &format!("caller-supplied:{:p}", Arc::as_ptr(storage)),
+                    &self.turbolite_durability,
+                );
+                let registration = get_or_register_auto_vfs(key, || {
+                    let vfs = turbolite::tiered::TurboliteVfs::with_backend(
+                        tl_config,
+                        storage.clone(),
+                        rt_handle,
+                    )
+                    .map_err(|e| anyhow::anyhow!("turbolite VFS (caller-supplied): {e}"))?;
+                    Ok((turbolite::tiered::SharedTurboliteVfs::new(vfs), None))
+                })?;
+                (
+                    registration.shared_vfs,
+                    registration.vfs_name,
+                    registration.shared_fence,
+                )
+            } else {
+                anyhow::bail!("Turbolite requires .turbolite_http(), .turbolite_storage(), or .turbolite_vfs()")
+            }
         };
 
-        // Build turbolite VFS.
         let manifest_store: Arc<dyn turbodb::ManifestStore> =
             if let Some(store) = self.manifest_store.clone() {
                 store
@@ -378,45 +543,6 @@ impl Builder {
             } else {
                 anyhow::bail!("Turbolite-backed SingleWriter mode requires manifest_store()");
             };
-
-        let (shared_vfs, vfs_name) = if let Some((ref vfs, ref name)) = self.turbolite_vfs {
-            (vfs.clone(), name.clone())
-        } else {
-            let vfs_name = format!("haqlite_ded_sync_{}", uuid::Uuid::new_v4());
-            let cache_dir = db_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("/tmp"))
-                .join(format!(".tl_cache_{}", db_name));
-            std::fs::create_dir_all(&cache_dir)?;
-            let tl_config = turbolite::tiered::TurboliteConfig {
-                cache_dir,
-                cache: turbolite::tiered::CacheConfig {
-                    gc_enabled: false,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let rt_handle = tokio::runtime::Handle::current();
-            let vfs = if let Some(ref cfg) = self.turbolite_http {
-                let fence = shared_fence
-                    .as_ref()
-                    .map(|(fence, _)| fence.clone())
-                    .expect("turbolite_http implies shared fence");
-                let storage: Arc<dyn hadb_storage::StorageBackend> =
-                    Arc::new(cfg.storage("pages").with_fence(fence));
-                turbolite::tiered::TurboliteVfs::with_backend(tl_config, storage, rt_handle)
-                    .map_err(|e| anyhow::anyhow!("turbolite VFS (HTTP): {e}"))?
-            } else if let Some(ref storage) = self.turbolite_storage {
-                turbolite::tiered::TurboliteVfs::with_backend(tl_config, storage.clone(), rt_handle)
-                    .map_err(|e| anyhow::anyhow!("turbolite VFS (caller-supplied): {e}"))?
-            } else {
-                anyhow::bail!("Turbolite requires .turbolite_http(), .turbolite_storage(), or .turbolite_vfs()")
-            };
-            let shared_vfs = turbolite::tiered::SharedTurboliteVfs::new(vfs);
-            turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone())
-                .map_err(|e| anyhow::anyhow!("register VFS: {e}"))?;
-            (shared_vfs, vfs_name)
-        };
 
         let walrust_storage: Option<Arc<dyn hadb_storage::StorageBackend>> =
             match self.turbolite_durability {
@@ -674,5 +800,51 @@ fn detect_address(instance_id: &str, forwarding_port: u16) -> String {
         format!("http://{}:{}", addr, forwarding_port)
     } else {
         format!("http://{}:{}", instance_id, forwarding_port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hadb_storage::StorageBackend;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_vfs_registration_reuses_failed_retry_vfs() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("retry.db");
+        let storage: Arc<dyn StorageBackend> = Arc::new(hadb_storage_local::LocalStorage::new(
+            tmp.path().join("remote"),
+        ));
+        let manifest_store: Arc<dyn ManifestStore> =
+            Arc::new(turbodb_manifest_mem::MemManifestStore::new());
+        let before = auto_vfs_registry_len();
+
+        for _ in 0..3 {
+            let result = Builder::new()
+                .prefix("retry/")
+                .mode(HaMode::SingleWriter)
+                .durability(turbodb::Durability::Cloud)
+                .turbolite_storage(storage.clone())
+                .manifest_store(manifest_store.clone())
+                .instance_id("retry-node")
+                .disable_forwarding()
+                .open(db_path.to_str().expect("path"), "")
+                .await;
+
+            let err = match result {
+                Ok(_) => panic!("open should fail without lease_store"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("lease_store() required"),
+                "unexpected error: {err:#}"
+            );
+        }
+
+        assert_eq!(
+            auto_vfs_registry_len(),
+            before + 1,
+            "identical failed retries must reuse the first auto-registered VFS"
+        );
     }
 }
