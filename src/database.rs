@@ -533,6 +533,7 @@ impl HaQLiteBuilder {
             self.authorizer,
             None,
             None,
+            None,
         )
         .await
     }
@@ -630,6 +631,10 @@ pub struct HaQLiteInner {
     /// connections via a custom VFS on first use.
     pub connection_opener:
         Option<Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>>,
+    /// Optional follower read opener. When set, follower reads use this surface
+    /// instead of the normal connection opener.
+    pub follower_read_connection_opener:
+        Option<Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>>,
     /// Optional flush callback for tiered storage (turbolite). Set by sibling
     /// crates that inject a custom VFS; base haqlite never sets this.
     pub on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
@@ -675,6 +680,7 @@ impl HaQLiteInner {
             fwd_handle: tokio::sync::Mutex::new(None),
             authorizer: None,
             connection_opener: None,
+            follower_read_connection_opener: None,
             on_flush: None,
         }
     }
@@ -798,21 +804,7 @@ impl HaQLiteInner {
     fn fence_connection(&self) {
         if let Ok(Some(conn_arc)) = self.get_conn() {
             let conn = conn_arc.lock();
-            if let Some(ref factory) = self.authorizer {
-                conn.authorizer(Some(factory(true)));
-            } else {
-                // Default: read-only allowlist.
-                conn.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
-                    use rusqlite::hooks::{AuthAction, Authorization};
-                    match ctx.action {
-                        AuthAction::Select
-                        | AuthAction::Read { .. }
-                        | AuthAction::Function { .. }
-                        | AuthAction::Recursive => Authorization::Allow,
-                        _ => Authorization::Deny,
-                    }
-                }));
-            }
+            self.apply_read_only_authorizer(&conn);
             tracing::info!("HaQLite: connection fenced (writes blocked)");
         }
     }
@@ -838,6 +830,65 @@ impl HaQLiteInner {
         if let Some(ref factory) = self.authorizer {
             conn.authorizer(Some(factory(false)));
         }
+    }
+
+    /// Apply a read-only authorizer to a connection.
+    ///
+    /// Used both for fencing the persistent leader connection on demotion and
+    /// for ephemeral follower read connections opened through a custom VFS.
+    fn apply_read_only_authorizer(&self, conn: &rusqlite::Connection) {
+        if let Some(ref factory) = self.authorizer {
+            conn.authorizer(Some(factory(true)));
+        } else {
+            conn.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
+                use rusqlite::hooks::{AuthAction, Authorization};
+                match ctx.action {
+                    AuthAction::Select
+                    | AuthAction::Read { .. }
+                    | AuthAction::Function { .. }
+                    | AuthAction::Recursive => Authorization::Allow,
+                    _ => Authorization::Deny,
+                }
+            }));
+        }
+    }
+
+    /// Open a fresh follower read connection.
+    ///
+    /// Plain haqlite followers read from the on-disk SQLite file, but sibling
+    /// crates like haqlite-turbolite install a custom opener that must be used
+    /// for *all* connections, including follower reads, so the VFS-backed
+    /// database and the query path see the same bytes.
+    fn open_follower_read_conn(&self) -> Result<rusqlite::Connection, HaQLiteError> {
+        if let Some(ref opener) = self.follower_read_connection_opener {
+            let conn = opener()?;
+            conn.execute_batch("PRAGMA query_only=ON;").map_err(|e| {
+                HaQLiteError::DatabaseError(format!(
+                    "failed to enable query_only on follower read connection: {e}"
+                ))
+            })?;
+            self.apply_read_only_authorizer(&conn);
+            return Ok(conn);
+        }
+
+        if let Some(ref opener) = self.connection_opener {
+            let conn = opener()?;
+            conn.execute_batch("PRAGMA query_only=ON;").map_err(|e| {
+                HaQLiteError::DatabaseError(format!(
+                    "failed to enable query_only on follower read connection: {e}"
+                ))
+            })?;
+            self.apply_read_only_authorizer(&conn);
+            return Ok(conn);
+        }
+
+        rusqlite::Connection::open_with_flags(
+            &self.db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| {
+            HaQLiteError::DatabaseError(format!("Failed to open read-only connection: {e}"))
+        })
     }
 
     pub(crate) fn get_conn(
@@ -927,6 +978,7 @@ impl HaQLite {
             forwarding_mode: ForwardingMode::Disabled,
             fwd_handle: tokio::sync::Mutex::new(None),
             connection_opener: None,
+            follower_read_connection_opener: None,
             on_flush: None,
         });
 
@@ -999,6 +1051,7 @@ impl HaQLite {
             DEFAULT_READ_CONCURRENCY,
             None, // no custom authorizer for from_coordinator
             None, // no custom connection opener
+            None, // no custom follower read opener
             None, // no tiered storage flush
         )
         .await
@@ -1124,16 +1177,10 @@ impl HaQLite {
                             HaQLiteError::DatabaseError("Too many concurrent reads".into())
                         }
                     })?;
-                // Open fresh plain SQLite connections (walrust applies
-                // LTX files externally, pooled connections hold stale snapshots).
-                let conn = rusqlite::Connection::open_with_flags(
-                    &self.inner.db_path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                )
-                .map_err(|e| {
-                    HaQLiteError::DatabaseError(format!("Failed to open read-only connection: {e}"))
-                })?;
+                // Open a fresh follower read connection each time so reads see
+                // external replication progress. Sibling crates may route this
+                // through a VFS-backed opener instead of the raw db_path.
+                let conn = self.inner.open_follower_read_conn()?;
                 conn.query_row(sql, params, f)
                     .map_err(|e| HaQLiteError::DatabaseError(format!("query_row failed: {e}")))
             }
@@ -1222,14 +1269,7 @@ impl HaQLite {
                             HaQLiteError::DatabaseError("Too many concurrent reads".into())
                         }
                     })?;
-                let conn = rusqlite::Connection::open_with_flags(
-                    &self.inner.db_path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                )
-                .map_err(|e| {
-                    HaQLiteError::DatabaseError(format!("Failed to open read-only connection: {e}"))
-                })?;
+                let conn = self.inner.open_follower_read_conn()?;
                 query_with(&conn)
             }
             Some(Role::Client) => Err(HaQLiteError::ConfigurationError(
@@ -1676,6 +1716,9 @@ pub async fn open_with_coordinator(
     connection_opener: Option<
         Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>,
     >,
+    follower_read_connection_opener: Option<
+        Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>,
+    >,
     on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
 ) -> Result<HaQLite> {
     let bootstrap_conn = ensure_schema(&db_path, schema, connection_opener.as_ref())?;
@@ -1737,6 +1780,7 @@ pub async fn open_with_coordinator(
         forwarding_mode,
         fwd_handle: tokio::sync::Mutex::new(None),
         connection_opener,
+        follower_read_connection_opener,
         on_flush,
     });
 

@@ -156,6 +156,26 @@ fn make_remote_vfs(
     (shared_vfs, vfs_name)
 }
 
+async fn assert_manifest_page_groups_exist(
+    vfs: &SharedTurboliteVfs,
+    manifest: &Manifest,
+    storage: &InMemoryStorage,
+) {
+    let _walrust = vfs
+        .set_manifest_bytes(&manifest.payload)
+        .expect("decode hybrid payload");
+    let decoded = vfs.manifest();
+    let keys = storage.keys().await;
+
+    for key in decoded.page_group_keys.iter().filter(|k| !k.is_empty()) {
+        assert!(
+            keys.iter().any(|existing| existing == key),
+            "manifest references missing page-group object {key}; storage keys = {:?}",
+            keys
+        );
+    }
+}
+
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS bootstrap_test (
     id INTEGER PRIMARY KEY,
     value TEXT NOT NULL
@@ -167,7 +187,8 @@ async fn continuous_open_publishes_hybrid_manifest_for_fresh_database() {
     let db_path = tmp.path().join("bootstrap.db");
 
     let walrust_storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
-    let tiered_storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
+    let tiered_storage_impl = Arc::new(InMemoryStorage::new());
+    let tiered_storage: Arc<dyn StorageBackend> = tiered_storage_impl.clone();
     let manifest_store = Arc::new(MemManifestStore::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
 
@@ -202,6 +223,7 @@ async fn continuous_open_publishes_hybrid_manifest_for_fresh_database() {
         .expect("decode hybrid payload")
         .expect("continuous payload must include walrust cursor");
     assert_eq!(walrust, (0, "test/".to_string()));
+    assert_manifest_page_groups_exist(&vfs, &manifest, &tiered_storage_impl).await;
     db.close().await.expect("close haqlite");
 }
 
@@ -314,7 +336,8 @@ async fn continuous_open_publishes_hybrid_manifest_for_fresh_database_with_empty
     let db_path = tmp.path().join("empty_schema_bootstrap.db");
 
     let walrust_storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
-    let tiered_storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
+    let tiered_storage_impl = Arc::new(InMemoryStorage::new());
+    let tiered_storage: Arc<dyn StorageBackend> = tiered_storage_impl.clone();
     let manifest_store = Arc::new(MemManifestStore::new());
     let lease_store = Arc::new(InMemoryLeaseStore::new());
 
@@ -353,5 +376,93 @@ async fn continuous_open_publishes_hybrid_manifest_for_fresh_database_with_empty
         .expect("decode hybrid payload")
         .expect("continuous payload must include walrust cursor");
     assert_eq!(walrust, (0, "test/".to_string()));
+    assert_manifest_page_groups_exist(&vfs, &manifest, &tiered_storage_impl).await;
+    db.close().await.expect("close haqlite");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continuous_first_write_publishes_manifest_that_only_references_existing_page_groups() {
+    let tmp = TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("first_write.db");
+
+    let walrust_storage_impl = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn StorageBackend> = walrust_storage_impl.clone();
+    let tiered_storage_impl = Arc::new(InMemoryStorage::new());
+    let tiered_storage: Arc<dyn StorageBackend> = tiered_storage_impl.clone();
+    let manifest_store = Arc::new(MemManifestStore::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+
+    let (vfs, vfs_name) = make_remote_vfs(tmp.path(), tiered_storage);
+    let mut db = Builder::new()
+        .prefix("test/")
+        .mode(HaMode::SingleWriter)
+        .durability(turbodb::Durability::Continuous {
+            checkpoint: Default::default(),
+            replication_interval: Duration::from_millis(50),
+        })
+        .lease_store(lease_store)
+        .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
+        .walrust_storage(walrust_storage)
+        .turbolite_vfs(vfs.clone(), &vfs_name)
+        .instance_id("writer-first-write")
+        .forwarding_port(19311)
+        .open(db_path.to_str().expect("path"), SCHEMA)
+        .await
+        .expect("open continuous mode");
+    assert!(
+        vfs.cache_file_path().exists(),
+        "turbolite cache file should exist immediately after open: {}",
+        vfs.cache_file_path().display()
+    );
+
+    db.execute_async(
+        "INSERT INTO bootstrap_test (id, value) VALUES (?1, ?2)",
+        &[
+            haqlite::SqlValue::Integer(1),
+            haqlite::SqlValue::Text("first-write".to_string()),
+        ],
+    )
+    .await
+    .expect("first write");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let manifest = loop {
+        let manifest = manifest_store
+            .get("test/first_write/_manifest")
+            .await
+            .expect("fetch manifest during first-write poll");
+        if let Some(manifest) = manifest {
+            let walrust = vfs
+                .set_manifest_bytes(&manifest.payload)
+                .expect("decode hybrid payload during first-write poll")
+                .expect("continuous payload must carry walrust cursor during first-write poll");
+            if manifest.version > 1 || walrust.0 > 0 {
+                break manifest;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "first write should publish a fresh hybrid manifest envelope"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_manifest_page_groups_exist(&vfs, &manifest, &tiered_storage_impl).await;
+
+    let walrust = vfs
+        .set_manifest_bytes(&manifest.payload)
+        .expect("decode hybrid payload after first write")
+        .expect("continuous payload must carry walrust cursor after first write");
+    assert_eq!(
+        walrust,
+        (0, "test/".to_string()),
+        "first write must not move the base cursor until Turbolite checkpoints the base"
+    );
+
+    let walrust_keys = walrust_storage_impl.keys().await;
+    assert!(
+        !walrust_keys.is_empty(),
+        "first write should also publish walrust state; keys = {:?}",
+        walrust_keys
+    );
     db.close().await.expect("close haqlite");
 }

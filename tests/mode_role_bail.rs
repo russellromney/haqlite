@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use haqlite::{HaQLite, HaMode, InMemoryLeaseStore, Role};
+use haqlite::{HaMode, HaQLite, InMemoryLeaseStore, Role};
 use tempfile::TempDir;
 
 fn db_path(tmp: &TempDir, name: &str) -> String {

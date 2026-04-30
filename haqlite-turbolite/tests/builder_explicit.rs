@@ -60,7 +60,7 @@ fn dummy_turbolite_vfs(tmp: &TempDir) -> (SharedTurboliteVfs, String) {
 }
 
 #[tokio::test]
-async fn dedicated_without_lease_or_walrust_errors_clearly() {
+async fn singlewriter_without_lease_errors_before_manifest_preflight() {
     unset_env();
     let tmp = TempDir::new().expect("temp dir");
     let db_path = tmp.path().join("t.db");
@@ -74,8 +74,8 @@ async fn dedicated_without_lease_or_walrust_errors_clearly() {
 
     let err = err_msg(result);
     assert!(
-        err.contains("manifest_store()"),
-        "expected manifest_store() error, got: {err}"
+        err.contains("lease_store() required"),
+        "expected lease_store() preflight error, got: {err}"
     );
 }
 

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,7 +61,46 @@ impl TurboliteFollowerBehavior {
         self.walrust_storage.is_some() || self.walrust_prefix.is_some()
     }
 
-    async fn apply_manifest_payload(&self, db_name: &str, payload: &[u8]) -> Result<u64> {
+    fn remove_sqlite_sidecars(path: &Path) -> Result<()> {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
+            match std::fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(anyhow!(
+                        "remove stale sqlite sidecar {}: {}",
+                        sidecar.display(),
+                        e
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn normalize_replayed_sqlite_base(path: &Path) -> Result<()> {
+        let conn = rusqlite::Connection::open(path)
+            .map_err(|e| anyhow!("open WAL-replayed sqlite base {}: {}", path.display(), e))?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .map_err(|e| {
+                anyhow!(
+                    "normalize WAL-replayed sqlite base {} to rollback journal: {}",
+                    path.display(),
+                    e
+                )
+            })?;
+        drop(conn);
+        Self::remove_sqlite_sidecars(path)
+    }
+
+    async fn apply_manifest_payload(
+        &self,
+        db_name: &str,
+        db_path: &Path,
+        payload: &[u8],
+        import_after_wal_replay: bool,
+    ) -> Result<u64> {
         let walrust = self
             .vfs
             .set_manifest_bytes(payload)
@@ -76,9 +115,13 @@ impl TurboliteFollowerBehavior {
 
         let cache_path = self.vfs.cache_file_path();
         let page_count = self.vfs.manifest().page_count;
+        Self::remove_sqlite_sidecars(db_path)?;
+        Self::remove_sqlite_sidecars(&cache_path)?;
         let vfs = self.vfs.clone();
+        let cache_path_for_materialize = cache_path.clone();
         let version = tokio::task::spawn_blocking(move || {
-            vfs.shared_state().materialize_to_file(&cache_path)
+            vfs.shared_state()
+                .materialize_to_file(&cache_path_for_materialize)
         })
         .await
         .map_err(|e| anyhow!("turbolite materialize task panicked: {}", e))?
@@ -102,6 +145,27 @@ impl TurboliteFollowerBehavior {
                 walrust_seq,
             )
             .await?;
+            let cache_path_for_normalize = cache_path.clone();
+            tokio::task::spawn_blocking(move || {
+                Self::normalize_replayed_sqlite_base(&cache_path_for_normalize)
+            })
+            .await
+            .map_err(|e| anyhow!("sqlite base normalize task panicked: {}", e))??;
+            if import_after_wal_replay {
+                let vfs = self.vfs.clone();
+                let cache_path_for_import = cache_path.clone();
+                tokio::task::spawn_blocking(move || vfs.import_sqlite_file(&cache_path_for_import))
+                    .await
+                    .map_err(|e| anyhow!("turbolite import task panicked: {}", e))?
+                    .map_err(|e| anyhow!("turbolite import after WAL replay failed: {}", e))?;
+                self.vfs
+                    .replace_cache_from_sqlite_file(&cache_path)
+                    .map_err(|e| anyhow!("turbolite adopt WAL-replayed cache failed: {}", e))?;
+            } else if let Ok(metadata) = std::fs::metadata(&cache_path) {
+                let page_size = self.vfs.manifest().page_size.max(1) as u64;
+                self.vfs
+                    .sync_after_external_restore(metadata.len() / page_size);
+            }
             tracing::debug!(
                 "Follower '{}': applied hybrid manifest base {} and WAL {} -> {}",
                 db_name,
@@ -110,11 +174,18 @@ impl TurboliteFollowerBehavior {
                 final_seq
             );
         }
+        Self::remove_sqlite_sidecars(db_path)?;
+        Self::remove_sqlite_sidecars(&cache_path)?;
 
         Ok(self.vfs.manifest().version)
     }
 
-    async fn poll_manifest_store(&self, db_name: &str) -> Result<Option<u64>> {
+    async fn poll_manifest_store(
+        &self,
+        db_name: &str,
+        db_path: &Path,
+        import_after_wal_replay: bool,
+    ) -> Result<Option<u64>> {
         let Some(store) = &self.manifest_store else {
             return Ok(None);
         };
@@ -127,7 +198,7 @@ impl TurboliteFollowerBehavior {
             return Ok(None);
         };
         let version = self
-            .apply_manifest_payload(db_name, &manifest.payload)
+            .apply_manifest_payload(db_name, db_path, &manifest.payload, import_after_wal_replay)
             .await?;
         Ok(Some(version))
     }
@@ -140,7 +211,7 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
         _replicator: Arc<dyn Replicator>,
         _prefix: &str,
         db_name: &str,
-        _db_path: &PathBuf,
+        db_path: &PathBuf,
         poll_interval: Duration,
         position: Arc<AtomicU64>,
         caught_up: Arc<AtomicBool>,
@@ -170,7 +241,7 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
             let current_version = position.load(Ordering::SeqCst);
 
             if self.manifest_store.is_some() {
-                match self.poll_manifest_store(db_name).await {
+                match self.poll_manifest_store(db_name, db_path, false).await {
                     Ok(Some(new_version)) if new_version > current_version => {
                         tracing::debug!(
                             "Follower '{}': manifest v{} -> v{}",
@@ -253,11 +324,11 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
         &self,
         _prefix: &str,
         db_name: &str,
-        _db_path: &PathBuf,
+        db_path: &PathBuf,
         _position: u64,
     ) -> Result<()> {
         if self.manifest_store.is_some() {
-            let _ = self.poll_manifest_store(db_name).await?;
+            let _ = self.poll_manifest_store(db_name, db_path, true).await?;
             return Ok(());
         }
 

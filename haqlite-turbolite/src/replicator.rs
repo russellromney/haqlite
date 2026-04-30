@@ -51,6 +51,40 @@ fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
 }
 
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow!("remove {}: {}", path.display(), e)),
+    }
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}{}", path.display(), suffix))
+}
+
+fn remove_sqlite_sidecars(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        remove_if_exists(&sqlite_sidecar_path(path, suffix))?;
+    }
+    Ok(())
+}
+
+fn normalize_replayed_sqlite_base(path: &Path) -> Result<()> {
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|e| anyhow!("open WAL-replayed sqlite base {}: {}", path.display(), e))?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+        .map_err(|e| {
+            anyhow!(
+                "normalize WAL-replayed sqlite base {} to rollback journal: {}",
+                path.display(),
+                e
+            )
+        })?;
+    drop(conn);
+    remove_sqlite_sidecars(path)
+}
+
 #[cfg(test)]
 mod seed_tests {
     use super::*;
@@ -337,6 +371,19 @@ impl TurboliteWalReplicator {
         &self.walrust
     }
 
+    fn live_wal_path(&self, db_path: &Path) -> Result<std::path::PathBuf> {
+        let db_name = db_path
+            .file_name()
+            .ok_or_else(|| anyhow!("invalid turbolite db path '{}'", db_path.display()))?;
+        let cache_dir = self
+            .vfs
+            .cache_file_path()
+            .parent()
+            .ok_or_else(|| anyhow!("cache_file_path has no parent"))?
+            .to_path_buf();
+        Ok(cache_dir.join(format!("{}-wal", db_name.to_string_lossy())))
+    }
+
     async fn current_walrust_seq(&self, name: &str) -> Result<u64> {
         self.walrust
             .inner()
@@ -346,6 +393,7 @@ impl TurboliteWalReplicator {
     }
 
     async fn publish_current_manifest(&self, name: &str) -> Result<()> {
+        let current_manifest = self.vfs.manifest();
         if !should_publish_manifest(&self.vfs) {
             return Err(anyhow!(
                 "{} (turbolite manifest is still empty)",
@@ -353,7 +401,24 @@ impl TurboliteWalReplicator {
             ));
         }
 
-        let walrust_seq = self.current_walrust_seq(name).await?;
+        let current_walrust_seq = self.current_walrust_seq(name).await?;
+        let walrust_seq =
+            if let Some(existing) = self.manifest_store.get(&self.manifest_key).await? {
+                match turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&existing.payload) {
+                    Ok((published_manifest, Some((published_seq, _))))
+                        if published_manifest.version == current_manifest.version =>
+                    {
+                        // The hybrid cursor is the walrust seq already included
+                        // in this Turbolite base, not the latest uploaded WAL seq.
+                        // If the base manifest did not change, followers must keep
+                        // replaying WAL after the original base cursor.
+                        published_seq
+                    }
+                    Ok(_) | Err(_) => current_walrust_seq,
+                }
+            } else {
+                current_walrust_seq
+            };
         let payload = self
             .vfs
             .manifest_bytes_with_walrust_delta(walrust_seq, &self.walrust_prefix)
@@ -430,7 +495,7 @@ impl TurboliteWalReplicator {
         self.publish_current_manifest(name).await
     }
 
-    async fn restore_from_manifest(&self, name: &str) -> Result<()> {
+    async fn restore_from_manifest(&self, name: &str, path: &Path) -> Result<()> {
         let Some(manifest) = self.manifest_store.get(&self.manifest_key).await? else {
             return Err(anyhow!("{}", hybrid_manifest_required_message(name)));
         };
@@ -448,26 +513,49 @@ impl TurboliteWalReplicator {
         };
 
         let cache_path = self.vfs.cache_file_path();
-        let page_count = self.vfs.manifest().page_count;
+        let restore_path = cache_path.with_extension("restore.db");
         let vfs = self.vfs.clone();
+        let restore_path_for_materialize = restore_path.clone();
         let materialized_version = tokio::task::spawn_blocking(move || {
-            vfs.shared_state().materialize_to_file(&cache_path)
+            vfs.shared_state()
+                .materialize_to_file(&restore_path_for_materialize)
         })
         .await
         .map_err(|e| anyhow!("turbolite materialize task panicked: {}", e))?
         .map_err(|e| anyhow!("turbolite materialize failed: {}", e))?;
 
-        self.vfs.sync_after_external_restore(page_count);
+        // Followers bootstrap through a normal SQLite/VFS connection before they
+        // ever promote. That can leave behind a local `<db>-wal` / `<db>-shm`
+        // pair containing stale pre-restore state. After we materialize the
+        // authoritative base into `data.cache` and replay walrust frames onto it,
+        // the local sidecars must be cleared or a promoted leader connection can
+        // overlay the fresh base with old empty-table frames.
+        remove_sqlite_sidecars(path)?;
 
-        let cache_path = self.vfs.cache_file_path();
         let final_seq = walrust::sync::pull_incremental(
             self.walrust_storage.as_ref(),
             &self.walrust_prefix,
             name,
-            &cache_path,
+            &restore_path,
             walrust_seq,
         )
         .await?;
+        let restore_path_for_normalize = restore_path.clone();
+        tokio::task::spawn_blocking(move || {
+            normalize_replayed_sqlite_base(&restore_path_for_normalize)
+        })
+        .await
+        .map_err(|e| anyhow!("sqlite base normalize task panicked: {}", e))??;
+        let vfs = self.vfs.clone();
+        let restore_path_for_import = restore_path.clone();
+        tokio::task::spawn_blocking(move || vfs.import_sqlite_file(&restore_path_for_import))
+            .await
+            .map_err(|e| anyhow!("turbolite import task panicked: {}", e))?
+            .map_err(|e| anyhow!("turbolite import after WAL replay failed: {}", e))?;
+        self.vfs
+            .replace_cache_from_sqlite_file(&restore_path)
+            .map_err(|e| anyhow!("turbolite adopt restored cache failed: {}", e))?;
+        remove_if_exists(&restore_path)?;
         tracing::debug!(
             "TurboliteWalReplicator::pull('{}') restored base {}, WAL {} -> {}",
             name,
@@ -483,16 +571,24 @@ impl TurboliteWalReplicator {
 #[async_trait]
 impl Replicator for TurboliteWalReplicator {
     async fn add(&self, name: &str, path: &Path) -> Result<()> {
-        self.walrust.add(name, path).await?;
+        let cache_path = self.vfs.cache_file_path();
+        let wal_path = self.live_wal_path(path)?;
+        self.walrust
+            .add_with_wal_path(name, &cache_path, &wal_path)
+            .await?;
         self.ensure_base_manifest(name, path).await
     }
 
     async fn add_continuing(&self, name: &str, path: &Path) -> Result<()> {
-        self.walrust.add_continuing(name, path).await
+        let cache_path = self.vfs.cache_file_path();
+        let wal_path = self.live_wal_path(path)?;
+        self.walrust
+            .add_without_snapshot_with_wal_path(name, &cache_path, &wal_path)
+            .await
     }
 
-    async fn pull(&self, name: &str, _path: &Path) -> Result<()> {
-        self.restore_from_manifest(name).await
+    async fn pull(&self, name: &str, path: &Path) -> Result<()> {
+        self.restore_from_manifest(name, path).await
     }
 
     async fn remove(&self, name: &str) -> Result<()> {

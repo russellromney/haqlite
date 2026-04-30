@@ -368,7 +368,7 @@ async fn continuous_journal_mode_is_wal() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn checkpoint_journal_mode_is_wal() {
+async fn checkpoint_journal_mode_is_delete() {
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(InMemoryLeaseStore::new());
     let manifest = Arc::new(MemManifestStore::new());
@@ -392,8 +392,8 @@ async fn checkpoint_journal_mode_is_wal() {
         .expect("pragma");
     assert_eq!(
         mode.to_lowercase(),
-        "wal",
-        "Checkpoint durability must use WAL journal mode (got {})",
+        "delete",
+        "Checkpoint durability must use rollback journal mode so main-db pages are the checkpointed state (got {})",
         mode
     );
     drop(c);

@@ -728,6 +728,10 @@ impl Builder {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| db_name.clone());
         let is_cloud = self.turbolite_durability.is_cloud();
+        let is_continuous = matches!(
+            self.turbolite_durability,
+            turbodb::Durability::Continuous { .. }
+        );
         let connection_opener: Arc<
             dyn Fn() -> Result<rusqlite::Connection, haqlite::HaQLiteError> + Send + Sync,
         > = Arc::new(move || {
@@ -744,16 +748,11 @@ impl Builder {
                     db_name_for_opener, e
                 ))
             })?;
-            // Apply pragmas based on durability.
-            //
-            // Cloud mode: SQLite's default journal_mode is DELETE, which is
-            // exactly what Cloud wants. We deliberately don't issue
-            // `PRAGMA journal_mode=DELETE` — the turbolite Cloud VFS has
-            // observed `database is locked` returns when the engine tries
-            // to switch journal modes on a freshly opened conn, and the
-            // pragma is a no-op when the mode already matches.
-            // Non-cloud (Continuous/Checkpoint): WAL is required, set it.
-            if is_cloud {
+            // Apply pragmas based on durability. Continuous needs WAL because
+            // walrust ships the live WAL; checkpoint/cloud use SQLite's
+            // default rollback journal so the VFS main-db pages are the
+            // checkpointed state.
+            if !is_continuous || is_cloud {
                 conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;")
                     .map_err(|e| haqlite::HaQLiteError::DatabaseError(format!("pragma: {e}")))?;
             } else {
@@ -761,6 +760,24 @@ impl Builder {
                         .map_err(|e| haqlite::HaQLiteError::DatabaseError(format!("journal pragma: {e}")))?;
             }
             Ok(conn)
+        });
+
+        let follower_cache_path = shared_vfs.cache_file_path();
+        let follower_read_connection_opener: Arc<
+            dyn Fn() -> Result<rusqlite::Connection, haqlite::HaQLiteError> + Send + Sync,
+        > = Arc::new(move || {
+            rusqlite::Connection::open_with_flags(
+                &follower_cache_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|e| {
+                haqlite::HaQLiteError::DatabaseError(format!(
+                    "turbolite follower cache open '{}': {}",
+                    follower_cache_path.display(),
+                    e
+                ))
+            })
         });
 
         let db_name_for_flush = db_name.clone();
@@ -793,6 +810,7 @@ impl Builder {
             self.inner.get_read_concurrency(),
             self.inner.get_authorizer().cloned(),
             Some(connection_opener),
+            Some(follower_read_connection_opener),
             on_flush,
         )
         .await

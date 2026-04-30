@@ -61,6 +61,23 @@ impl SqliteReplicator {
     pub async fn add_without_snapshot(&self, name: &str, path: &Path) -> Result<()> {
         self.inner.add_without_snapshot(name, path).await
     }
+
+    /// Register a database with an explicit WAL path.
+    pub async fn add_with_wal_path(&self, name: &str, path: &Path, wal_path: &Path) -> Result<()> {
+        self.inner.add_with_wal_path(name, path, wal_path).await
+    }
+
+    /// Register a database without taking a snapshot, with an explicit WAL path.
+    pub async fn add_without_snapshot_with_wal_path(
+        &self,
+        name: &str,
+        path: &Path,
+        wal_path: &Path,
+    ) -> Result<()> {
+        self.inner
+            .add_without_snapshot_with_wal_path(name, path, wal_path)
+            .await
+    }
 }
 
 /// SQLite replicator for external-base-state mode.
@@ -99,6 +116,21 @@ impl ExternalSnapshotSqliteReplicator {
 
     pub fn inner(&self) -> &Arc<walrust::Replicator> {
         &self.inner
+    }
+
+    pub async fn add_with_wal_path(&self, name: &str, path: &Path, wal_path: &Path) -> Result<()> {
+        self.inner.add_with_wal_path(name, path, wal_path).await
+    }
+
+    pub async fn add_without_snapshot_with_wal_path(
+        &self,
+        name: &str,
+        path: &Path,
+        wal_path: &Path,
+    ) -> Result<()> {
+        self.inner
+            .add_without_snapshot_with_wal_path(name, path, wal_path)
+            .await
     }
 }
 
