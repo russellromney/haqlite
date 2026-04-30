@@ -13,7 +13,7 @@ use tempfile::TempDir;
 
 use hadb::InMemoryLeaseStore;
 use haqlite::{HaQLite, SqlValue};
-use haqlite_turbolite::{Builder, Mode};
+use haqlite_turbolite::{Builder, HaMode};
 use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{
     CacheConfig, CompressionConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs,
@@ -80,7 +80,7 @@ async fn build_turbolite_dedicated(
     let db_path = cache_dir.join(format!("{}.db", db_name));
     Builder::new()
         .prefix("test/")
-        .mode(Mode::SingleWriter)
+        .mode(HaMode::SingleWriter)
         .durability(durability)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
@@ -534,7 +534,7 @@ async fn close_reopen_syncreplicated_survives() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cloud_opens_without_walrust_storage() {
-    use haqlite_turbolite::{Builder, Mode};
+    use haqlite_turbolite::{Builder, HaMode};
     use turbolite::tiered::{CacheConfig, TurboliteConfig, TurboliteVfs};
 
     let tmp = TempDir::new().unwrap();
@@ -558,7 +558,7 @@ async fn cloud_opens_without_walrust_storage() {
 
     let mut db = Builder::new()
         .prefix("test/")
-        .mode(Mode::SingleWriter)
+        .mode(HaMode::SingleWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease)
         .manifest_store(manifest)

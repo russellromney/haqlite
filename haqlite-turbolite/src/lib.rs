@@ -8,7 +8,7 @@ pub mod follower_behavior;
 pub mod replicator;
 pub mod rollback_detection;
 
-pub use builder::{Builder, Mode};
+pub use builder::Builder;
 pub use follower_behavior::TurboliteFollowerBehavior;
 pub use replicator::{TurboliteReplicator, TurboliteWalReplicator};
 pub use rollback_detection::RollbackDetector;

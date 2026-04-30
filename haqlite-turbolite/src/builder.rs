@@ -3,13 +3,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use hadb::{LeaseStore, NoOpReplicator, Replicator, Role};
+use hadb::{HaMode, LeaseStore, NoOpReplicator, Replicator, Role};
 use haqlite::{ForwardingMode, HaQLite, HaQLiteBuilder};
 use turbodb::ManifestStore;
 use turbolite::tiered::SharedTurboliteVfs;
-
-/// Canonical coordination topology for tiered HA SQLite.
-pub use hadb::HaMode as Mode;
 
 #[derive(Debug, Clone)]
 enum CinchHttpConfig {
@@ -58,11 +55,11 @@ impl CinchHttpConfig {
 /// Builder for tiered HA SQLite with turbolite VFS.
 ///
 /// Wraps haqlite's walrust HA layer and injects turbolite for page-level
-/// S3 tiering. Single-writer with lease-protected coordination today; see
-/// [`Mode`] for the topology axis.
+/// S3 tiering. Single-writer with lease-protected coordination today;
+/// [`hadb::HaMode`] is the canonical topology axis.
 pub struct Builder {
     inner: HaQLiteBuilder,
-    mode: Mode,
+    mode: HaMode,
     role: Option<Role>,
     turbolite_durability: turbodb::Durability,
     turbolite_http: Option<CinchHttpConfig>,
@@ -91,7 +88,7 @@ impl Builder {
     pub fn new() -> Self {
         Self {
             inner: HaQLiteBuilder::new(),
-            mode: Mode::SingleWriter,
+            mode: HaMode::SingleWriter,
             role: None,
             turbolite_durability: turbodb::Durability::default(),
             turbolite_http: None,
@@ -176,7 +173,7 @@ impl Builder {
         self.lease_store(store)
     }
 
-    pub fn mode(mut self, mode: Mode) -> Self {
+    pub fn mode(mut self, mode: HaMode) -> Self {
         self.mode = mode;
         self
     }
@@ -293,24 +290,24 @@ impl Builder {
 
     pub async fn open(self, db_path: &str, schema: &str) -> Result<HaQLite> {
         let role_for_validation = self.role.unwrap_or(match self.mode {
-            Mode::SingleWriter => Role::Leader,
-            Mode::SharedWriter => Role::LatentWriter,
+            HaMode::SingleWriter => Role::Leader,
+            HaMode::SharedWriter => Role::LatentWriter,
         });
         hadb::validate_mode_role(self.mode, role_for_validation)
             .map_err(|e| anyhow::anyhow!("invalid mode/role combination: {e}"))?;
 
         match (self.mode, self.role) {
-            (Mode::SingleWriter, None | Some(Role::Leader) | Some(Role::Follower)) => {
+            (HaMode::SingleWriter, None | Some(Role::Leader) | Some(Role::Follower)) => {
                 self.open_writer(db_path, schema).await
             }
-            (Mode::SingleWriter, Some(Role::Client)) | (Mode::SharedWriter, Some(Role::Client)) => {
+            (HaMode::SingleWriter, Some(Role::Client)) | (HaMode::SharedWriter, Some(Role::Client)) => {
                 anyhow::bail!("Client mode not yet implemented in haqlite-turbolite")
             }
-            (Mode::SharedWriter, None | Some(Role::LatentWriter)) => {
+            (HaMode::SharedWriter, None | Some(Role::LatentWriter)) => {
                 anyhow::bail!("SharedWriter mode not yet implemented in haqlite-turbolite")
             }
-            (Mode::SingleWriter, Some(Role::LatentWriter))
-            | (Mode::SharedWriter, Some(Role::Leader | Role::Follower)) => {
+            (HaMode::SingleWriter, Some(Role::LatentWriter))
+            | (HaMode::SharedWriter, Some(Role::Leader | Role::Follower)) => {
                 unreachable!("mode/role validation should reject this combination")
             }
         }

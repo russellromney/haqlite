@@ -13,7 +13,7 @@ use tempfile::TempDir;
 
 use common::InMemoryStorage;
 use haqlite::{HaQLite, HaQLiteError, InMemoryLeaseStore, SqlValue};
-use haqlite_turbolite::{Builder, Mode};
+use haqlite_turbolite::{Builder, HaMode};
 use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{CacheConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
@@ -180,7 +180,7 @@ proptest! {
             let db_path = tmp.path().join("shared_serial.db");
             let mut db = Builder::new()
                 .prefix("test/")
-                .mode(Mode::SharedWriter)
+                .mode(HaMode::SharedWriter)
                 .durability(turbodb::Durability::Cloud)
                 .lease_store(lease_store)
                 .manifest_store(manifest_store)

@@ -24,7 +24,7 @@ mod common;
 
 use common::InMemoryStorage;
 use hadb::InMemoryLeaseStore;
-use haqlite_turbolite::{Builder, Mode};
+use haqlite_turbolite::{Builder, HaMode};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -90,7 +90,7 @@ async fn shared_without_lease_errors_clearly() {
     let result = Builder::new()
         .prefix("p/")
         .instance_id("test-1")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .turbolite_vfs(vfs, &vfs_name)
         .open(db_path_str, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -116,7 +116,7 @@ async fn shared_without_manifest_errors_clearly() {
     let result = Builder::new()
         .prefix("p/")
         .instance_id("test-1")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .turbolite_vfs(vfs, &vfs_name)
         .lease_store(lease)
@@ -143,7 +143,7 @@ async fn shared_without_turbolite_errors_clearly() {
     let result = Builder::new()
         .prefix("p/")
         .instance_id("test-1")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease)
         .manifest_store(manifest)

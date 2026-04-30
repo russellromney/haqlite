@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use haqlite::{HaQLite, InMemoryLeaseStore, SqlValue};
-use haqlite_turbolite::{Builder, Mode};
+use haqlite_turbolite::{Builder, HaMode};
 use tempfile::TempDir;
 use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
@@ -84,7 +84,7 @@ async fn build_node(
     let db_path = cache_dir.join("e2e.db");
     let mut builder = Builder::new()
         .prefix("test/")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
@@ -327,7 +327,7 @@ async fn e2e_write_fails_without_lease() {
 
     let db = Builder::new()
         .prefix("test/")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)

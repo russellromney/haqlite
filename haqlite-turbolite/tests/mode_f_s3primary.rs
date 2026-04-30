@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use hadb::InMemoryLeaseStore;
 use haqlite::{HaQLite, SqlValue};
-use haqlite_turbolite::{Builder, Mode};
+use haqlite_turbolite::{Builder, HaMode};
 use tempfile::TempDir;
 use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
@@ -89,7 +89,7 @@ async fn build_mode_f_node(
     // interfere with multiwriter catch-up.
     Builder::new()
         .prefix("test/")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)

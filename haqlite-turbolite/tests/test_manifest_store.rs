@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use common::InMemoryStorage;
 use hadb::{InMemoryLeaseStore, LeaseStore};
 use haqlite::{HaQLite, SqlValue};
-use haqlite_turbolite::{Builder, Mode};
+use haqlite_turbolite::{Builder, HaMode};
 use turbodb::ManifestStore;
 use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{CacheConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
@@ -91,7 +91,7 @@ async fn dedicated_mode_with_manifest_store() {
 
     let mut db = Builder::new()
         .prefix("test/")
-        .mode(Mode::SingleWriter)
+        .mode(HaMode::SingleWriter)
         .lease_store(lease_store)
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
         .walrust_storage(storage)
@@ -125,7 +125,7 @@ async fn dedicated_mode_without_manifest_store_still_works() {
 
     let mut db = Builder::new()
         .prefix("test/")
-        .mode(Mode::SingleWriter)
+        .mode(HaMode::SingleWriter)
         .lease_store(lease_store)
         .walrust_storage(storage)
         .instance_id("test-node")
@@ -164,7 +164,7 @@ async fn shared_mode_manifest_published_on_write() {
     let (vfs, vfs_name) = make_local_vfs(tmp.path());
     let mut db = Builder::new()
         .prefix("test/")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
@@ -212,7 +212,7 @@ async fn shared_mode_sequential_writes_increment_manifest_version() {
     let (vfs, vfs_name) = make_local_vfs(tmp.path());
     let mut db = Builder::new()
         .prefix("test/")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
@@ -264,7 +264,7 @@ async fn shared_mode_two_writers_see_each_others_data() {
     let (vfs1, vfs_name1) = make_s3_vfs(tmp1.path(), &s3_prefix);
     let db1 = Builder::new()
         .prefix("test/")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
@@ -291,7 +291,7 @@ async fn shared_mode_two_writers_see_each_others_data() {
     let (vfs2, vfs_name2) = make_s3_vfs(tmp2.path(), &s3_prefix);
     let mut db2 = Builder::new()
         .prefix("test/")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store.clone())
         .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)

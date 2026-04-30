@@ -16,7 +16,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use common::InMemoryStorage;
 use haqlite::{HaQLite, InMemoryLeaseStore, SqlValue};
-use haqlite_turbolite::{Builder, Mode};
+use haqlite_turbolite::{Builder, HaMode};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 use turbodb_manifest_mem::MemManifestStore;
@@ -146,7 +146,7 @@ async fn build_node(
     let db_path = tmp.path().join(format!("{}.db", name));
     Builder::new()
         .prefix("test/")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)

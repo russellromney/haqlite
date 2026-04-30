@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 use hadb::InMemoryLeaseStore;
 use haqlite::{HaQLite, SqlValue};
-use haqlite_turbolite::{Builder, Mode};
+use haqlite_turbolite::{Builder, HaMode};
 use turbodb::ManifestStore;
 use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{
@@ -52,7 +52,7 @@ async fn build_turbolite_shared(
     let db_path = cache_dir.join(format!("{}.db", db_name));
     Builder::new()
         .prefix("test/")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)

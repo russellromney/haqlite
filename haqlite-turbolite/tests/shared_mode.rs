@@ -17,7 +17,7 @@ use tempfile::TempDir;
 
 use hadb::{InMemoryLeaseStore, LeaseStore};
 use haqlite::{HaQLite, HaQLiteError, SqlValue};
-use haqlite_turbolite::{Builder, Mode};
+use haqlite_turbolite::{Builder, HaMode};
 use turbodb::ManifestStore;
 use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
@@ -79,7 +79,7 @@ async fn build_shared(
     let db_path = tmp.path().join(format!("{}.db", db_name));
     Builder::new()
         .prefix("test/")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
@@ -855,7 +855,7 @@ async fn test_write_timeout_lease_contention() {
     let db_path = tmp.path().join("contention.db");
     let mut db = Builder::new()
         .prefix("test/")
-        .mode(Mode::SharedWriter)
+        .mode(HaMode::SharedWriter)
         .durability(turbodb::Durability::Cloud)
         .lease_store(lease_store)
         .manifest_store(manifest_store)
