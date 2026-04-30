@@ -449,6 +449,17 @@ impl Builder {
                 ForwardingMode::BuiltinHttp { port } => detect_address(&instance_id, port),
                 ForwardingMode::Disabled => String::new(),
             });
+
+        // Validate required coordinator inputs before constructing/registering
+        // the process-lifetime SQLite VFS. Failed tests and startup retries
+        // should not open a Turbolite cache file just to discover that the
+        // builder is missing its lease store.
+        let lease_store: Arc<dyn hadb::LeaseStore> = self
+            .inner
+            .get_lease_store()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("lease_store() required"))?;
+
         // Build or reuse the process-lifetime SQLite VFS. sqlite-vfs does not
         // unregister today, so retrying after a post-registration open error
         // must not create a fresh auto VFS each time.
@@ -668,13 +679,7 @@ impl Builder {
             Arc::new(behavior)
         };
 
-        // Build lease store and coordinator config.
-        let lease_store: Arc<dyn hadb::LeaseStore> = self
-            .inner
-            .get_lease_store()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("lease_store() required"))?;
-
+        // Build coordinator config.
         let mut config = self
             .inner
             .get_coordinator_config()
@@ -809,7 +814,7 @@ mod tests {
     use hadb_storage::StorageBackend;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn auto_vfs_registration_reuses_failed_retry_vfs() {
+    async fn auto_vfs_registration_skips_preflight_failures() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let db_path = tmp.path().join("retry.db");
         let storage: Arc<dyn StorageBackend> = Arc::new(hadb_storage_local::LocalStorage::new(
@@ -843,8 +848,8 @@ mod tests {
 
         assert_eq!(
             auto_vfs_registry_len(),
-            before + 1,
-            "identical failed retries must reuse the first auto-registered VFS"
+            before,
+            "preflight failures must not register a process-lifetime VFS"
         );
     }
 }
