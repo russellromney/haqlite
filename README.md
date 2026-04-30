@@ -74,9 +74,9 @@ haqlite sets `synchronous=NORMAL` and `cache_size=64MB` by default (WAL mode bes
 
 | Mode | Write cost | Use case |
 |------|-----------|----------|
-| Dedicated + Continuous | same as SQLite | Active databases with volume (default) |
-| Dedicated + Checkpoint | same as SQLite | Dev / single-node / desktop apps |
-| Dedicated + Cloud | ~200ms/write | Every write durable to S3 |
+| SingleWriter + Continuous | same as SQLite | Active databases with volume (default) |
+| SingleWriter + Checkpoint | same as SQLite | Dev / single-node / desktop apps |
+| SingleWriter + Cloud | ~200ms/write | Every write durable to S3 |
 
 Continuous mode (default) writes locally, ships WAL to S3 in the background via [walrust](https://github.com/russellromney/walrust). Checkpoint mode is the same without WAL shipping — crash loses everything since last checkpoint. Cloud mode uploads every commit to S3 before returning (no WAL).
 
@@ -154,14 +154,40 @@ let db = HaQLite::builder()
     .await?;
 ```
 
+## Modes and roles
+
+haqlite's HA model has two axes, both re-exported from `hadb`:
+
+- `HaMode` — cluster topology.
+  - `SingleWriter` (default) — one node holds a persistent lease and
+    accepts all writes. Implemented today.
+  - `SharedWriter` — peers acquire-write-release a per-write lease.
+    Visible in the API; not implemented in base haqlite (`open()` bails
+    with `"SharedWriter not implemented in base haqlite"`).
+- `Role` — node behavior inside the topology. Set via `.role(...)`;
+  leave unset for the default lease-driven assignment in
+  `SingleWriter`.
+  - `Leader` / `Follower` — assigned by the lease in `SingleWriter`.
+  - `Client` — read-only consumer. Visible in the API; not
+    implemented (`open()` bails with `"Client mode not yet implemented
+    in base haqlite"`).
+  - `LatentWriter` — companion role for `SharedWriter`. Visible in
+    the API; not implemented.
+
+`hadb::validate_mode_role(mode, role)` is the source of truth for
+which combinations are allowed. Invalid pairs (e.g.
+`SingleWriter + LatentWriter`) are rejected at `open()` with an
+explicit error.
+
 ## Tiered storage (haqlite-turbolite)
 
 For page-level S3 tiering (sub-250ms cold queries, transparent page eviction), use the `haqlite-turbolite` crate:
 
 ```rust
-use haqlite_turbolite::{Builder, Mode};
+use haqlite_turbolite::{Builder, HaMode};
 
 let db = Builder::new()
+    .mode(HaMode::SingleWriter)
     .turbolite_http("https://t3.storage.dev", "my-token")
     .manifest_endpoint("https://t3.storage.dev", "my-token")
     .lease_endpoint("https://t3.storage.dev", "my-token")
@@ -169,10 +195,18 @@ let db = Builder::new()
     .await?;
 ```
 
-`haqlite-turbolite` wraps base `haqlite` and injects a turbolite VFS for page-level tiering. Modes and roles use the canonical `hadb` vocabulary:
-- `Mode::SingleWriter` (default) — one persistent lease holder. Runtime role is assigned as `Role::Leader` or `Role::Follower`.
-- `Mode::SharedWriter` — visible in the API for the future per-write lease topology, but not implemented yet.
-- `Role::Client` — visible in the API for future read-only replicas that never claim leases.
+`haqlite-turbolite` wraps base `haqlite` and injects a turbolite VFS for
+page-level tiering. Modes and roles use the canonical `hadb`
+vocabulary directly — there is no `haqlite_turbolite::Mode` rename:
+
+- `HaMode::SingleWriter` (default) — one persistent lease holder.
+  Runtime role is assigned as `Role::Leader` or `Role::Follower`.
+- `HaMode::SharedWriter` — visible in the API for the future per-write
+  lease topology, but not implemented yet (`open()` bails clearly).
+- `Role::Client` — visible in the API for future read-only replicas
+  that never claim leases (`open()` bails clearly).
+- `Role::LatentWriter` — companion role for `SharedWriter` (`open()`
+  bails clearly).
 
 ## Local mode (no HA)
 

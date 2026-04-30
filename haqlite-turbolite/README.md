@@ -14,11 +14,11 @@ The cost: per-tenant S3 page traffic and a manifest store. The benefit: zero-loc
 ## Quick start
 
 ```rust
-use haqlite_turbolite::{Builder, Mode};
+use haqlite_turbolite::{Builder, HaMode};
 use turbodb::Durability;
 
 let db = Builder::new()
-    .mode(Mode::SingleWriter)                        // single-writer with lease
+    .mode(HaMode::SingleWriter)                 // single-writer with lease
     .durability(Durability::default())          // Continuous (page checkpoints + 1s log shipping)
     .lease_store(my_lease_store)
     .manifest_store(my_manifest_store)
@@ -36,16 +36,30 @@ let db = Builder::new()
 |---|---|---|---|---|
 | `Checkpoint` | on checkpoint trigger (time/commits/WAL bytes) | never | checkpoint interval | dev, single-node, desktop apps |
 | `Continuous` (default) | on checkpoint | 1s cadence | ≤ 1s | production tiered HA |
-| `Cloud` | every commit, before ack | n/a (pages are the replication) | 0 | multi-writer (`Mode::SharedWriter`) |
+| `Cloud` | every commit, before ack | n/a (pages are the replication) | 0 | multi-writer (`HaMode::SharedWriter`) |
 
-## Modes
+## Modes and roles
 
-- `Mode::SingleWriter` — single persistent writer, lease-protected. Production default.
-- `Mode::SharedWriter` — planned per-write lease topology. Visible in the API, but not implemented yet.
+The `HaMode` and `Role` types come straight from `hadb`; haqlite-turbolite
+does not wrap them. The two axes:
 
-## Roles
+- `HaMode::SingleWriter` — single persistent writer, lease-protected.
+  Production default. Implemented today.
+- `HaMode::SharedWriter` — planned per-write lease topology. Visible in
+  the API, but not implemented yet — `open()` bails with
+  `"SharedWriter mode not yet implemented in haqlite-turbolite"`.
+- `Role::{Leader, Follower}` — runtime roles assigned by the lease in
+  `SingleWriter`. Set explicitly via `.role(...)` only if you need to
+  override the default; otherwise leave it unset.
+- `Role::Client` — reserved for future read-only replicas. Visible in
+  the API but not implemented; `open()` bails with
+  `"Client mode not yet implemented"`.
+- `Role::LatentWriter` — companion role for `SharedWriter`. Same
+  visible-but-unimplemented status.
 
-Roles are a separate axis from mode. In `SingleWriter`, the lease outcome assigns `Role::Leader` or `Role::Follower`. `Role::Client` is reserved for future read-only replicas that never claim a lease.
+Validation lives in `hadb::validate_mode_role`. Invalid combinations
+(`SingleWriter + LatentWriter`, `SharedWriter + Leader/Follower`) are
+rejected on `open()` with a sharp error string from the validator.
 
 ## Rollback detection
 
