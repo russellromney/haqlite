@@ -482,63 +482,82 @@ impl TurboliteWalReplicator {
             return Err(anyhow!("{}", hybrid_manifest_required_message(name)));
         };
 
-        let walrust = self
-            .vfs
-            .set_manifest_bytes(&manifest.payload)
-            .map_err(|e| anyhow!("turbolite set_manifest_bytes failed: {}", e))?;
+        // Same full-apply gate pattern as
+        // `TurboliteFollowerBehavior::apply_manifest_payload`: take
+        // the VFS replay-gate write lock once, hold across
+        // set_manifest_bytes + materialize + sync + replay so VFS
+        // reads can't observe a partial logical apply, and use
+        // `finalize_assuming_external_write` to avoid a recursive
+        // lock-take. See that method for the full design rationale.
+        let runtime = tokio::runtime::Handle::current();
+        let vfs = self.vfs.clone();
+        let cache_path = self.vfs.cache_file_path();
+        let gate = self.vfs.replay_gate();
+        let payload_owned = manifest.payload.clone();
+        let name_owned = name.to_string();
+        let walrust_storage = self.walrust_storage.clone();
+        let walrust_prefix = self.walrust_prefix.clone();
 
-        let Some((walrust_seq, _changeset_prefix)) = walrust else {
+        // Decode the candidate manifest before mutating VFS state.
+        // Same materialize-before-commit ordering as
+        // `TurboliteFollowerBehavior::apply_manifest_payload`: a
+        // missing-group race during materialize must leave the live
+        // VFS untouched so the caller can retry without observing a
+        // half-applied state. See that method for the full rationale.
+        let (decoded_manifest, decoded_walrust) =
+            turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&payload_owned)
+                .map_err(|e| anyhow!("turbolite decode_manifest_bytes failed: {}", e))?;
+
+        if decoded_walrust.is_none() {
             return Err(anyhow!(
                 "continuous manifest for '{}' must carry walrust replay cursor",
                 name
             ));
-        };
+        }
 
-        // Warm `data.cache` from the manifest's page groups before
-        // replay. Same rationale as
-        // `TurboliteFollowerBehavior::apply_manifest_payload`: the
-        // follower-read shortcut and SQLite's own VFS bypass paths
-        // expect the cache to hold the manifest's pages, and replay
-        // finalize layers walrust deltas on top. No temp restore
-        // file — we materialize directly into the live cache file.
-        let cache_path = self.vfs.cache_file_path();
-        let vfs_for_materialize = self.vfs.clone();
-        let cache_path_for_materialize = cache_path.clone();
-        let _materialized_version = tokio::task::spawn_blocking(move || {
-            vfs_for_materialize
-                .shared_state()
-                .materialize_to_file(&cache_path_for_materialize)
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let _gate = gate.write();
+
+            // Materialize from the decoded (not-yet-committed)
+            // manifest first so a missing-group transient leaves
+            // VFS state fully untouched.
+            vfs.shared_state()
+                .materialize_manifest_to_file(&decoded_manifest, &cache_path)
+                .map_err(|e| anyhow!("turbolite materialize failed: {}", e))?;
+
+            // Materialize succeeded; commit the new manifest.
+            let walrust = vfs
+                .set_manifest_bytes(&payload_owned)
+                .map_err(|e| anyhow!("turbolite set_manifest_bytes failed: {}", e))?;
+            let (walrust_seq, _changeset_prefix) = walrust.expect("decoded_walrust was Some");
+
+            let page_count = vfs.manifest().page_count;
+            vfs.sync_after_external_restore(page_count);
+
+            let handle = vfs
+                .begin_replay()
+                .map_err(|e| anyhow!("turbolite begin_replay failed: {}", e))?;
+            let mut sink = HaqliteTurboliteReplaySink::new_under_external_write(handle);
+            let final_seq = runtime
+                .block_on(walrust::sync::pull_incremental_into_sink(
+                    walrust_storage.as_ref(),
+                    &walrust_prefix,
+                    &name_owned,
+                    &mut sink,
+                    walrust_seq,
+                ))?;
+
+            tracing::debug!(
+                "TurboliteWalReplicator::pull('{}') replayed walrust {} -> {} via direct page sink",
+                name_owned,
+                walrust_seq,
+                final_seq
+            );
+
+            Ok(())
         })
         .await
-        .map_err(|e| anyhow!("turbolite materialize task panicked: {}", e))?
-        .map_err(|e| anyhow!("turbolite materialize failed: {}", e))?;
-        let page_count = self.vfs.manifest().page_count;
-        self.vfs.sync_after_external_restore(page_count);
-
-        // Direct hybrid page replay: stream decoded HADBP pages
-        // straight from walrust into Turbolite's tiered cache via
-        // `begin_replay` + `pull_incremental_into_sink`. No temp
-        // SQLite restore file. No PRAGMA dance. No double-import.
-        let handle = self
-            .vfs
-            .begin_replay()
-            .map_err(|e| anyhow!("turbolite begin_replay failed: {}", e))?;
-        let mut sink = HaqliteTurboliteReplaySink::new(handle);
-        let final_seq = walrust::sync::pull_incremental_into_sink(
-            self.walrust_storage.as_ref(),
-            &self.walrust_prefix,
-            name,
-            &mut sink,
-            walrust_seq,
-        )
-        .await?;
-
-        tracing::debug!(
-            "TurboliteWalReplicator::pull('{}') replayed walrust {} -> {} via direct page sink",
-            name,
-            walrust_seq,
-            final_seq
-        );
+        .map_err(|e| anyhow!("turbolite restore task panicked: {}", e))??;
 
         Ok(())
     }

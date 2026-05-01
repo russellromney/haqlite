@@ -7,6 +7,8 @@
 //! trait.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -106,5 +108,76 @@ impl StorageBackend for InMemoryStorage {
             success: true,
             etag: Some("mem".into()),
         })
+    }
+}
+
+/// Wrapper around `InMemoryStorage` that can simulate page-group
+/// objects becoming temporarily unavailable for `get()` (e.g., a
+/// leader publish-then-upload race or a churn re-key window).
+///
+/// `paused == true` causes every `get()` to return `Ok(None)` as if
+/// the object weren't there. Other methods delegate normally so the
+/// leader's writes (`put`) and the follower's manifest-store reads
+/// (which go through `ManifestStore`, not `StorageBackend`) keep
+/// flowing.
+pub struct PausableStorage {
+    inner: Arc<InMemoryStorage>,
+    pub paused: Arc<AtomicBool>,
+}
+
+impl PausableStorage {
+    pub fn new(inner: Arc<InMemoryStorage>) -> Self {
+        Self {
+            inner,
+            paused: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn unpause(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl StorageBackend for PausableStorage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        if self.paused.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.inner.put(key, data).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        if self.paused.load(Ordering::SeqCst) {
+            return Ok(Vec::new());
+        }
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        if self.paused.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        self.inner.put_if_absent(key, data).await
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
+        self.inner.put_if_match(key, data, etag).await
     }
 }

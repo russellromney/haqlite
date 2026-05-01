@@ -25,13 +25,21 @@ pub(crate) struct FinalizeOutcome {
     pub last_finalize: Option<FinalizeReport>,
 }
 
+/// All callers (`apply_manifest_payload`, `restore_from_manifest`)
+/// run inside a `spawn_blocking` that already holds
+/// `TurboliteVfs::replay_gate().write()` around the full
+/// set_manifest_bytes + materialize + sync + replay window. Replay
+/// finalize therefore goes through
+/// `ReplayHandle::finalize_assuming_external_write` so it doesn't
+/// recursively re-take the gate (parking_lot's `RwLock` is not
+/// re-entrant; a second take would deadlock).
 pub(crate) struct HaqliteTurboliteReplaySink {
     handle: Option<ReplayHandle>,
     outcome: FinalizeOutcome,
 }
 
 impl HaqliteTurboliteReplaySink {
-    pub(crate) fn new(handle: ReplayHandle) -> Self {
+    pub(crate) fn new_under_external_write(handle: ReplayHandle) -> Self {
         Self {
             handle: Some(handle),
             outcome: FinalizeOutcome::default(),
@@ -81,7 +89,7 @@ impl PageReplaySink for HaqliteTurboliteReplaySink {
             .take()
             .ok_or_else(|| anyhow!("HaqliteTurboliteReplaySink: finalize called twice"))?;
         let report = handle
-            .finalize()
+            .finalize_assuming_external_write()
             .map_err(|e| anyhow!("turbolite ReplayHandle::finalize failed: {}", e))?;
         self.outcome.last_finalize = Some(report);
         Ok(())

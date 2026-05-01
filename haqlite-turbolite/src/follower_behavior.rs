@@ -13,6 +13,11 @@ use turbodb::ManifestStore;
 
 use crate::replay_sink::HaqliteTurboliteReplaySink;
 
+enum ApplyOutcome {
+    Applied(u64),
+    TransientRetry(String),
+}
+
 pub struct TurboliteFollowerBehavior {
     vfs: turbolite::tiered::SharedTurboliteVfs,
     manifest_store: Option<Arc<dyn ManifestStore>>,
@@ -64,112 +69,233 @@ impl TurboliteFollowerBehavior {
     }
 
     /// Apply a published hybrid manifest. Updates Turbolite's
-    /// in-memory manifest, then if the payload carries a walrust
+    /// in-memory manifest, materializes the manifest's pages into
+    /// the live cache file, then if the payload carries a walrust
     /// cursor, replays delta pages from `current cursor → latest
-    /// uploaded` straight into Turbolite's tiered cache via
-    /// `walrust::sync::pull_incremental_into_sink` and
+    /// uploaded` via `walrust::sync::pull_incremental_into_sink` +
     /// `TurboliteVfs::begin_replay`. No temp SQLite restore file.
-    /// No materialize_to_file. No PRAGMA dance. No double-import.
     /// `apply_page` writes go into staging on the `ReplayHandle`;
-    /// `finalize` (driven by the walrust pull) installs them under
-    /// the replay gate so in-flight readers see either the
-    /// pre-replay snapshot or the post-replay snapshot, never a
-    /// cross-page mix.
+    /// `finalize` (driven by the walrust pull) installs them.
+    ///
+    /// `current_version` is the follower's last-applied manifest
+    /// version. We decode the published manifest's version FIRST
+    /// (a pure read, no state mutation) and skip the entire apply
+    /// when the manifest is a pure-checkpoint payload at the same
+    /// or older version. Without this guard, a routine no-new-data
+    /// poll would still rewrite `data.cache` via
+    /// `materialize_to_file` and re-run replay, briefly clobbering
+    /// pages a follower-read shortcut might be observing right now.
+    ///
+    /// The skip is gated on `walrust.is_none()` — a continuous
+    /// manifest can be republished at the same version while new
+    /// walrust frames continue to upload (the manifest's `walrust`
+    /// field carries the embed cursor, not the upload head). If we
+    /// skipped a same-version continuous manifest after pulling 0
+    /// frames on a tight first attempt, we'd never re-pull and the
+    /// follower would stall indefinitely on storage that races the
+    /// publish. Continuous followers stay on the original
+    /// always-apply path; the no-op-skip optimization is a
+    /// checkpoint-only concern today.
     async fn apply_manifest_payload(
         &self,
         db_name: &str,
         _db_path: &Path,
         payload: &[u8],
+        current_version: u64,
     ) -> Result<u64> {
-        let walrust = self
-            .vfs
-            .set_manifest_bytes(payload)
-            .map_err(|e| anyhow!("turbolite set_manifest_bytes failed: {}", e))?;
+        // Decode without mutating local state so we can early-exit
+        // on a pure-checkpoint no-op poll. The skip is gated on
+        // `walrust.is_none()` because a continuous manifest can be
+        // republished at the same version while new walrust frames
+        // upload (the manifest's walrust field is the embed cursor,
+        // not the upload head); skipping a same-version continuous
+        // payload after a tight no-frames-yet first attempt would
+        // latch the follower stale.
+        let (decoded_manifest, decoded_walrust) =
+            turbolite::tiered::TurboliteVfs::decode_manifest_bytes(payload)
+                .map_err(|e| anyhow!("turbolite decode_manifest_bytes failed: {}", e))?;
+        if decoded_walrust.is_none() && decoded_manifest.version <= current_version {
+            return Ok(current_version);
+        }
 
-        if self.requires_hybrid_payload() && walrust.is_none() {
+        if self.requires_hybrid_payload() && decoded_walrust.is_none() {
             return Err(anyhow!(
                 "continuous manifest for '{}' must carry walrust replay cursor",
                 db_name
             ));
         }
 
-        // Warm `data.cache` from the manifest's page groups BEFORE
-        // replay. haqlite-turbolite installs a
-        // `follower_read_connection_opener` that opens `data.cache`
-        // directly (bypassing the turbolite VFS) for fast follower
-        // reads. After `set_manifest_bytes` adopts a new manifest,
-        // the cache may have evicted pages from groups whose keys
-        // changed; the bytes for those pages live on remote storage
-        // but aren't in `data.cache` yet. Materializing the manifest
-        // here populates `data.cache` from the manifest's page-group
-        // keys so the direct-file read path sees the post-manifest
-        // base.
+        // The full apply runs inside one `spawn_blocking` so the
+        // VFS replay-gate write lock can be held across:
+        //   1. `set_manifest_bytes` — adopts the new manifest in
+        //      VFS in-memory state.
+        //   2. `materialize_to_file` — rewrites `data.cache` from
+        //      the manifest's page-group objects.
+        //   3. `sync_after_external_restore` — clears mem cache,
+        //      marks all pages present, persists bitmap.
+        //   4. `walrust::sync::pull_incremental_into_sink` followed
+        //      by `ReplayHandle::finalize_assuming_external_write` —
+        //      layers walrust delta pages on top of the materialized
+        //      base.
         //
-        // This is NOT the temp-restore staging the previous code
-        // used. There is no separate `*.restore.db` file; we write
-        // the materialized DB straight into the live cache file
-        // (turbolite's cache layout is byte-compatible with a SQLite
-        // file, so this is safe). After materialize,
-        // `sync_after_external_restore` marks every page present so
-        // subsequent VFS reads skip the cache-miss fetch path.
+        // Holding the gate over the whole sequence prevents two
+        // distinct reader-visible inconsistencies:
+        //   - Torn bytes mid-`materialize_to_file` (the file is
+        //     truncated then re-written page-by-page).
+        //   - Logical tear between materialize and replay (manifest
+        //     swap done, base materialized, walrust deltas not yet
+        //     applied — VFS reads would see a snapshot the leader
+        //     never published).
         //
-        // Order matters: materialize FIRST, then replay. Replay
-        // finalize writes walrust delta pages on top of the
-        // materialized base. If we materialized after replay, we
-        // would overwrite the replayed pages with the manifest's
-        // older base bytes (the manifest's walrust cursor names
-        // where the base ends; replay carries the leader's writes
-        // beyond that cursor).
+        // VFS-routed follower reads take the read half on
+        // `xLock(SHARED)`, so they either complete before the gate
+        // is taken or block at xLock until apply finishes.
+        //
+        // Replay finalize would normally take the same write lock
+        // itself; we use `finalize_assuming_external_write` (via
+        // `HaqliteTurboliteReplaySink::new_under_external_write`) to
+        // skip the inner take. parking_lot's `RwLock` is not
+        // re-entrant, so without that variant the second take would
+        // deadlock.
+        //
+        // walrust pull is async (storage I/O). To run it under the
+        // sync write guard we use the captured tokio runtime handle
+        // to `block_on` the pull future — same pattern as the
+        // sync-API shims documented in the cinch-cloud `CLAUDE.md`
+        // ("don't reach for block_on" exceptions). The gate is
+        // released the instant the closure returns.
+        //
+        // A missing page-group object during materialize is a
+        // transient race against the leader's publish ordering:
+        // the manifest can name a page-group key that the leader's
+        // background uploader hasn't pushed yet (or has already
+        // re-keyed under a higher version's churn). We surface
+        // that as `io::ErrorKind::NotFound` from
+        // `materialize_to_file` and translate it here into a
+        // no-op-skip return: don't bump the position, don't error
+        // the follower; the next poll re-fetches and retries.
+        let runtime = tokio::runtime::Handle::current();
+        let vfs = self.vfs.clone();
         let cache_path = self.vfs.cache_file_path();
-        let vfs_for_materialize = self.vfs.clone();
-        let cache_path_for_materialize = cache_path.clone();
-        let _materialized_version = tokio::task::spawn_blocking(move || {
-            vfs_for_materialize
+        let gate = self.vfs.replay_gate();
+        let payload_owned = payload.to_vec();
+        let db_name_owned = db_name.to_string();
+        let walrust_storage = self.walrust_storage.clone();
+        let walrust_prefix = self.walrust_prefix.clone();
+
+        // Decode the candidate manifest WITHOUT mutating VFS state
+        // so we can materialize from it and only commit
+        // (`set_manifest_bytes`) once the page-group fetches have
+        // all succeeded. Order is critical for missing-group
+        // retry safety:
+        //   1. Decode (pure read).
+        //   2. Materialize from the decoded manifest (preflights
+        //      fetches in memory; on NotFound returns BEFORE
+        //      truncating `data.cache`).
+        //   3. set_manifest_bytes (now the only mutation; commits
+        //      the new manifest, evicts changed page groups,
+        //      persists local manifest).
+        //   4. sync_after_external_restore (clear mem cache, mark
+        //      all pages present, persist bitmap).
+        //   5. Replay walrust frames if continuous.
+        //
+        // If step 2 returns NotFound, steps 3–5 don't run. VFS
+        // state stays exactly as it was: shared_manifest unchanged,
+        // page bitmap unchanged, db_header unchanged, evictions
+        // not performed, data.cache untouched. Reads after the
+        // gate releases see the previous (still-valid) snapshot;
+        // the next manifest poll retries.
+        let decoded_manifest_for_materialize = decoded_manifest.clone();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<ApplyOutcome> {
+            let _gate = gate.write();
+
+            // Materialize the decoded manifest WITHOUT yet committing
+            // it to the VFS. Pre-flight semantics: on missing-group
+            // / fetch failure, returns before File::create touches
+            // `data.cache`.
+            match vfs
                 .shared_state()
-                .materialize_to_file(&cache_path_for_materialize)
+                .materialize_manifest_to_file(&decoded_manifest_for_materialize, &cache_path)
+            {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Transient: leader publish raced the page-group
+                    // upload. VFS state unchanged because we haven't
+                    // called set_manifest_bytes yet. Caller skips
+                    // advancing position so the next poll retries.
+                    return Ok(ApplyOutcome::TransientRetry(format!(
+                        "missing page-group during materialize for '{}': {}",
+                        db_name_owned, e
+                    )));
+                }
+                Err(e) => {
+                    return Err(anyhow!("turbolite materialize failed: {}", e));
+                }
+            }
+
+            // Materialize succeeded. Now safe to commit the new
+            // manifest to live VFS state.
+            let walrust = vfs
+                .set_manifest_bytes(&payload_owned)
+                .map_err(|e| anyhow!("turbolite set_manifest_bytes failed: {}", e))?;
+
+            let page_count = vfs.manifest().page_count;
+            vfs.sync_after_external_restore(page_count);
+
+            if let Some((walrust_seq, _changeset_prefix)) = walrust {
+                let storage = walrust_storage.ok_or_else(|| {
+                    anyhow!(
+                        "continuous follower '{}' missing walrust storage",
+                        db_name_owned
+                    )
+                })?;
+                let prefix = walrust_prefix.ok_or_else(|| {
+                    anyhow!(
+                        "continuous follower '{}' missing walrust prefix",
+                        db_name_owned
+                    )
+                })?;
+
+                let handle = vfs
+                    .begin_replay()
+                    .map_err(|e| anyhow!("turbolite begin_replay failed: {}", e))?;
+                let mut sink = HaqliteTurboliteReplaySink::new_under_external_write(handle);
+                let final_seq = runtime
+                    .block_on(walrust::sync::pull_incremental_into_sink(
+                        storage.as_ref(),
+                        &prefix,
+                        &db_name_owned,
+                        &mut sink,
+                        walrust_seq,
+                    ))?;
+                tracing::debug!(
+                    "Follower '{}': replayed walrust {} -> {} via direct page sink",
+                    db_name_owned,
+                    walrust_seq,
+                    final_seq,
+                );
+            }
+
+            Ok(ApplyOutcome::Applied(vfs.manifest().version))
         })
         .await
-        .map_err(|e| anyhow!("turbolite materialize task panicked: {}", e))?
-        .map_err(|e| anyhow!("turbolite materialize failed: {}", e))?;
-        let page_count = self.vfs.manifest().page_count;
-        self.vfs.sync_after_external_restore(page_count);
+        .map_err(|e| anyhow!("turbolite apply task panicked: {}", e))??;
 
-        if let Some((walrust_seq, _changeset_prefix)) = walrust {
-            let storage = self.walrust_storage.as_ref().ok_or_else(|| {
-                anyhow!("continuous follower '{}' missing walrust storage", db_name)
-            })?;
-            let prefix = self.walrust_prefix.as_ref().ok_or_else(|| {
-                anyhow!("continuous follower '{}' missing walrust prefix", db_name)
-            })?;
-
-            let handle = self
-                .vfs
-                .begin_replay()
-                .map_err(|e| anyhow!("turbolite begin_replay failed: {}", e))?;
-            let mut sink = HaqliteTurboliteReplaySink::new(handle);
-            let final_seq = walrust::sync::pull_incremental_into_sink(
-                storage.as_ref(),
-                prefix,
-                db_name,
-                &mut sink,
-                walrust_seq,
-            )
-            .await?;
-            tracing::debug!(
-                "Follower '{}': replayed walrust {} -> {} via direct page sink",
-                db_name,
-                walrust_seq,
-                final_seq,
-            );
+        match result {
+            ApplyOutcome::Applied(v) => Ok(v),
+            ApplyOutcome::TransientRetry(msg) => {
+                tracing::warn!("Follower '{}': apply transient ({}); will retry on next poll", db_name, msg);
+                Ok(current_version)
+            }
         }
-
-        Ok(self.vfs.manifest().version)
     }
 
     async fn poll_manifest_store(
         &self,
         db_name: &str,
         db_path: &Path,
+        current_version: u64,
     ) -> Result<Option<u64>> {
         let Some(store) = &self.manifest_store else {
             return Ok(None);
@@ -183,7 +309,7 @@ impl TurboliteFollowerBehavior {
             return Ok(None);
         };
         let version = self
-            .apply_manifest_payload(db_name, db_path, &manifest.payload)
+            .apply_manifest_payload(db_name, db_path, &manifest.payload, current_version)
             .await?;
         Ok(Some(version))
     }
@@ -226,7 +352,10 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
             let current_version = position.load(Ordering::SeqCst);
 
             if self.manifest_store.is_some() {
-                match self.poll_manifest_store(db_name, db_path).await {
+                match self
+                    .poll_manifest_store(db_name, db_path, current_version)
+                    .await
+                {
                     Ok(Some(new_version)) if new_version > current_version => {
                         tracing::debug!(
                             "Follower '{}': manifest v{} -> v{}",
@@ -310,10 +439,10 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
         _prefix: &str,
         db_name: &str,
         db_path: &PathBuf,
-        _position: u64,
+        position: u64,
     ) -> Result<()> {
         if self.manifest_store.is_some() {
-            let _ = self.poll_manifest_store(db_name, db_path).await?;
+            let _ = self.poll_manifest_store(db_name, db_path, position).await?;
             return Ok(());
         }
 

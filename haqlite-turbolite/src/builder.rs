@@ -727,6 +727,7 @@ impl Builder {
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| db_name.clone());
+        let db_filename_for_opener = db_filename.clone();
         let is_cloud = self.turbolite_durability.is_cloud();
         let is_continuous = matches!(
             self.turbolite_durability,
@@ -735,7 +736,7 @@ impl Builder {
         let connection_opener: Arc<
             dyn Fn() -> Result<rusqlite::Connection, haqlite::HaQLiteError> + Send + Sync,
         > = Arc::new(move || {
-            let vfs_uri = format!("file:{}?vfs={}", db_filename, vfs_name_for_opener);
+            let vfs_uri = format!("file:{}?vfs={}", db_filename_for_opener, vfs_name_for_opener);
             let conn = rusqlite::Connection::open_with_flags(
                 &vfs_uri,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -772,20 +773,33 @@ impl Builder {
             Ok(conn)
         });
 
-        let follower_cache_path = shared_vfs.cache_file_path();
+        // Follower-read connections route through the turbolite VFS
+        // (not the raw `data.cache` path) so each `xLock(SHARED)` /
+        // `xRead` takes the VFS replay-gate read half. That gate
+        // serializes follower reads against follower-apply's
+        // out-of-band `materialize_to_file` rewrite (which the apply
+        // path takes the write half around), preventing torn reads
+        // when a manifest swap rewrites the cache file behind us.
+        let vfs_name_for_follower = vfs_name.clone();
+        let db_filename_for_follower = db_filename.clone();
+        let db_name_for_follower = db_name.clone();
         let follower_read_connection_opener: Arc<
             dyn Fn() -> Result<rusqlite::Connection, haqlite::HaQLiteError> + Send + Sync,
         > = Arc::new(move || {
+            let vfs_uri = format!(
+                "file:{}?vfs={}",
+                db_filename_for_follower, vfs_name_for_follower
+            );
             rusqlite::Connection::open_with_flags(
-                &follower_cache_path,
+                &vfs_uri,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
             )
             .map_err(|e| {
                 haqlite::HaQLiteError::DatabaseError(format!(
-                    "turbolite follower cache open '{}': {}",
-                    follower_cache_path.display(),
-                    e
+                    "turbolite follower VFS open for '{}': {}",
+                    db_name_for_follower, e
                 ))
             })
         });
