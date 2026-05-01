@@ -11,6 +11,8 @@ use hadb::{FollowerBehavior, HaMetrics, Replicator};
 use hadb_storage::StorageBackend;
 use turbodb::ManifestStore;
 
+use crate::replay_sink::HaqliteTurboliteReplaySink;
+
 pub struct TurboliteFollowerBehavior {
     vfs: turbolite::tiered::SharedTurboliteVfs,
     manifest_store: Option<Arc<dyn ManifestStore>>,
@@ -61,45 +63,23 @@ impl TurboliteFollowerBehavior {
         self.walrust_storage.is_some() || self.walrust_prefix.is_some()
     }
 
-    fn remove_sqlite_sidecars(path: &Path) -> Result<()> {
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
-            match std::fs::remove_file(&sidecar) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(anyhow!(
-                        "remove stale sqlite sidecar {}: {}",
-                        sidecar.display(),
-                        e
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn normalize_replayed_sqlite_base(path: &Path) -> Result<()> {
-        let conn = rusqlite::Connection::open(path)
-            .map_err(|e| anyhow!("open WAL-replayed sqlite base {}: {}", path.display(), e))?;
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
-            .map_err(|e| {
-                anyhow!(
-                    "normalize WAL-replayed sqlite base {} to rollback journal: {}",
-                    path.display(),
-                    e
-                )
-            })?;
-        drop(conn);
-        Self::remove_sqlite_sidecars(path)
-    }
-
+    /// Apply a published hybrid manifest. Updates Turbolite's
+    /// in-memory manifest, then if the payload carries a walrust
+    /// cursor, replays delta pages from `current cursor → latest
+    /// uploaded` straight into Turbolite's tiered cache via
+    /// `walrust::sync::pull_incremental_into_sink` and
+    /// `TurboliteVfs::begin_replay`. No temp SQLite restore file.
+    /// No materialize_to_file. No PRAGMA dance. No double-import.
+    /// `apply_page` writes go into staging on the `ReplayHandle`;
+    /// `finalize` (driven by the walrust pull) installs them under
+    /// the replay gate so in-flight readers see either the
+    /// pre-replay snapshot or the post-replay snapshot, never a
+    /// cross-page mix.
     async fn apply_manifest_payload(
         &self,
         db_name: &str,
-        db_path: &Path,
+        _db_path: &Path,
         payload: &[u8],
-        import_after_wal_replay: bool,
     ) -> Result<u64> {
         let walrust = self
             .vfs
@@ -113,22 +93,6 @@ impl TurboliteFollowerBehavior {
             ));
         }
 
-        let cache_path = self.vfs.cache_file_path();
-        let page_count = self.vfs.manifest().page_count;
-        Self::remove_sqlite_sidecars(db_path)?;
-        Self::remove_sqlite_sidecars(&cache_path)?;
-        let vfs = self.vfs.clone();
-        let cache_path_for_materialize = cache_path.clone();
-        let version = tokio::task::spawn_blocking(move || {
-            vfs.shared_state()
-                .materialize_to_file(&cache_path_for_materialize)
-        })
-        .await
-        .map_err(|e| anyhow!("turbolite materialize task panicked: {}", e))?
-        .map_err(|e| anyhow!("turbolite materialize failed: {}", e))?;
-
-        self.vfs.sync_after_external_restore(page_count);
-
         if let Some((walrust_seq, _changeset_prefix)) = walrust {
             let storage = self.walrust_storage.as_ref().ok_or_else(|| {
                 anyhow!("continuous follower '{}' missing walrust storage", db_name)
@@ -136,46 +100,27 @@ impl TurboliteFollowerBehavior {
             let prefix = self.walrust_prefix.as_ref().ok_or_else(|| {
                 anyhow!("continuous follower '{}' missing walrust prefix", db_name)
             })?;
-            let cache_path = self.vfs.cache_file_path();
-            let final_seq = walrust::sync::pull_incremental(
+
+            let handle = self
+                .vfs
+                .begin_replay()
+                .map_err(|e| anyhow!("turbolite begin_replay failed: {}", e))?;
+            let mut sink = HaqliteTurboliteReplaySink::new(handle);
+            let final_seq = walrust::sync::pull_incremental_into_sink(
                 storage.as_ref(),
                 prefix,
                 db_name,
-                &cache_path,
+                &mut sink,
                 walrust_seq,
             )
             .await?;
-            let cache_path_for_normalize = cache_path.clone();
-            tokio::task::spawn_blocking(move || {
-                Self::normalize_replayed_sqlite_base(&cache_path_for_normalize)
-            })
-            .await
-            .map_err(|e| anyhow!("sqlite base normalize task panicked: {}", e))??;
-            if import_after_wal_replay {
-                let vfs = self.vfs.clone();
-                let cache_path_for_import = cache_path.clone();
-                tokio::task::spawn_blocking(move || vfs.import_sqlite_file(&cache_path_for_import))
-                    .await
-                    .map_err(|e| anyhow!("turbolite import task panicked: {}", e))?
-                    .map_err(|e| anyhow!("turbolite import after WAL replay failed: {}", e))?;
-                self.vfs
-                    .replace_cache_from_sqlite_file(&cache_path)
-                    .map_err(|e| anyhow!("turbolite adopt WAL-replayed cache failed: {}", e))?;
-            } else if let Ok(metadata) = std::fs::metadata(&cache_path) {
-                let page_size = self.vfs.manifest().page_size.max(1) as u64;
-                self.vfs
-                    .sync_after_external_restore(metadata.len() / page_size);
-            }
             tracing::debug!(
-                "Follower '{}': applied hybrid manifest base {} and WAL {} -> {}",
+                "Follower '{}': replayed walrust {} -> {} via direct page sink",
                 db_name,
-                version,
                 walrust_seq,
-                final_seq
+                final_seq,
             );
         }
-        Self::remove_sqlite_sidecars(db_path)?;
-        Self::remove_sqlite_sidecars(&cache_path)?;
 
         Ok(self.vfs.manifest().version)
     }
@@ -184,7 +129,6 @@ impl TurboliteFollowerBehavior {
         &self,
         db_name: &str,
         db_path: &Path,
-        import_after_wal_replay: bool,
     ) -> Result<Option<u64>> {
         let Some(store) = &self.manifest_store else {
             return Ok(None);
@@ -198,7 +142,7 @@ impl TurboliteFollowerBehavior {
             return Ok(None);
         };
         let version = self
-            .apply_manifest_payload(db_name, db_path, &manifest.payload, import_after_wal_replay)
+            .apply_manifest_payload(db_name, db_path, &manifest.payload)
             .await?;
         Ok(Some(version))
     }
@@ -241,7 +185,7 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
             let current_version = position.load(Ordering::SeqCst);
 
             if self.manifest_store.is_some() {
-                match self.poll_manifest_store(db_name, db_path, false).await {
+                match self.poll_manifest_store(db_name, db_path).await {
                     Ok(Some(new_version)) if new_version > current_version => {
                         tracing::debug!(
                             "Follower '{}': manifest v{} -> v{}",
@@ -328,7 +272,7 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
         _position: u64,
     ) -> Result<()> {
         if self.manifest_store.is_some() {
-            let _ = self.poll_manifest_store(db_name, db_path, true).await?;
+            let _ = self.poll_manifest_store(db_name, db_path).await?;
             return Ok(());
         }
 
