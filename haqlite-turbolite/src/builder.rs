@@ -749,11 +749,21 @@ impl Builder {
                 ))
             })?;
             // Apply pragmas based on durability. Continuous needs WAL because
-            // walrust ships the live WAL; checkpoint/cloud use SQLite's
-            // default rollback journal so the VFS main-db pages are the
-            // checkpointed state.
+            // walrust ships the live WAL; checkpoint/cloud need DELETE so
+            // every commit's pages land in the VFS main-db cache (where
+            // turbolite's checkpoint flush picks them up). We pin DELETE
+            // explicitly because the schema-bootstrap pattern is
+            // open-apply-close-reopen, and SQLite's default journal mode
+            // for the reopened connection on a turbolite-VFS-backed DB
+            // is WAL — that defeats checkpoint durability because INSERT
+            // writes would go to the WAL passthrough file (outside the
+            // main-db cache) and the manifest would never bump to reflect
+            // the new pages until autocheckpoint kicks in (default 1000
+            // frames). DELETE-mode commits write the rollback journal +
+            // main DB through xWrite, which is exactly what turbolite's
+            // checkpoint mode needs.
             if !is_continuous || is_cloud {
-                conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;")
+                conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-64000;")
                     .map_err(|e| haqlite::HaQLiteError::DatabaseError(format!("pragma: {e}")))?;
             } else {
                 conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;")

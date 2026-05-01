@@ -93,6 +93,47 @@ impl TurboliteFollowerBehavior {
             ));
         }
 
+        // Warm `data.cache` from the manifest's page groups BEFORE
+        // replay. haqlite-turbolite installs a
+        // `follower_read_connection_opener` that opens `data.cache`
+        // directly (bypassing the turbolite VFS) for fast follower
+        // reads. After `set_manifest_bytes` adopts a new manifest,
+        // the cache may have evicted pages from groups whose keys
+        // changed; the bytes for those pages live on remote storage
+        // but aren't in `data.cache` yet. Materializing the manifest
+        // here populates `data.cache` from the manifest's page-group
+        // keys so the direct-file read path sees the post-manifest
+        // base.
+        //
+        // This is NOT the temp-restore staging the previous code
+        // used. There is no separate `*.restore.db` file; we write
+        // the materialized DB straight into the live cache file
+        // (turbolite's cache layout is byte-compatible with a SQLite
+        // file, so this is safe). After materialize,
+        // `sync_after_external_restore` marks every page present so
+        // subsequent VFS reads skip the cache-miss fetch path.
+        //
+        // Order matters: materialize FIRST, then replay. Replay
+        // finalize writes walrust delta pages on top of the
+        // materialized base. If we materialized after replay, we
+        // would overwrite the replayed pages with the manifest's
+        // older base bytes (the manifest's walrust cursor names
+        // where the base ends; replay carries the leader's writes
+        // beyond that cursor).
+        let cache_path = self.vfs.cache_file_path();
+        let vfs_for_materialize = self.vfs.clone();
+        let cache_path_for_materialize = cache_path.clone();
+        let _materialized_version = tokio::task::spawn_blocking(move || {
+            vfs_for_materialize
+                .shared_state()
+                .materialize_to_file(&cache_path_for_materialize)
+        })
+        .await
+        .map_err(|e| anyhow!("turbolite materialize task panicked: {}", e))?
+        .map_err(|e| anyhow!("turbolite materialize failed: {}", e))?;
+        let page_count = self.vfs.manifest().page_count;
+        self.vfs.sync_after_external_restore(page_count);
+
         if let Some((walrust_seq, _changeset_prefix)) = walrust {
             let storage = self.walrust_storage.as_ref().ok_or_else(|| {
                 anyhow!("continuous follower '{}' missing walrust storage", db_name)

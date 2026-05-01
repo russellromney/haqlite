@@ -494,6 +494,27 @@ impl TurboliteWalReplicator {
             ));
         };
 
+        // Warm `data.cache` from the manifest's page groups before
+        // replay. Same rationale as
+        // `TurboliteFollowerBehavior::apply_manifest_payload`: the
+        // follower-read shortcut and SQLite's own VFS bypass paths
+        // expect the cache to hold the manifest's pages, and replay
+        // finalize layers walrust deltas on top. No temp restore
+        // file — we materialize directly into the live cache file.
+        let cache_path = self.vfs.cache_file_path();
+        let vfs_for_materialize = self.vfs.clone();
+        let cache_path_for_materialize = cache_path.clone();
+        let _materialized_version = tokio::task::spawn_blocking(move || {
+            vfs_for_materialize
+                .shared_state()
+                .materialize_to_file(&cache_path_for_materialize)
+        })
+        .await
+        .map_err(|e| anyhow!("turbolite materialize task panicked: {}", e))?
+        .map_err(|e| anyhow!("turbolite materialize failed: {}", e))?;
+        let page_count = self.vfs.manifest().page_count;
+        self.vfs.sync_after_external_restore(page_count);
+
         // Direct hybrid page replay: stream decoded HADBP pages
         // straight from walrust into Turbolite's tiered cache via
         // `begin_replay` + `pull_incremental_into_sink`. No temp

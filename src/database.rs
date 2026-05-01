@@ -1723,6 +1723,15 @@ pub async fn open_with_coordinator(
 ) -> Result<HaQLite> {
     let bootstrap_conn = ensure_schema(&db_path, schema, connection_opener.as_ref())?;
 
+    // Drop the bootstrap connection BEFORE coordinator.join. join()
+    // calls Replicator::pull on followers, which (for direct hybrid
+    // page replay) drives finalize → replay_gate.write(). A live
+    // bootstrap_conn parked at xLock=Shared holds a read_arc on the
+    // same gate and would deadlock the join. The leader path reopens
+    // through `try_open_leader_conn` once the role is known; the
+    // schema is durable in the VFS at this point.
+    drop(bootstrap_conn);
+
     // Subscribe to role events BEFORE join.
     let role_rx = coordinator.role_events();
 
@@ -1784,17 +1793,11 @@ pub async fn open_with_coordinator(
         on_flush,
     });
 
-    // If leader, open rw connection. Re-use the bootstrap conn from
-    // ensure_schema when present — opening a second connection via the
-    // turbolite-backed opener can hit "database is locked" because the
-    // VFS may still hold per-file locks from the bootstrap conn that
-    // haven't been released across the open/close gap.
+    // bootstrap_conn was dropped above. For leader, reopen via the
+    // connection_opener now that the role is known. Followers open
+    // their own rw conn on promotion.
     if initial_role == Role::Leader {
-        let leader_conn = match bootstrap_conn {
-            Some(conn) => Ok(conn),
-            None => inner.try_open_leader_conn(),
-        };
-        match leader_conn {
+        match inner.try_open_leader_conn() {
             Ok(conn) => {
                 inner.apply_initial_authorizer(&conn);
                 inner.set_conn(Some(Arc::new(Mutex::new(conn))));
@@ -1803,11 +1806,6 @@ pub async fn open_with_coordinator(
                 tracing::error!("HaQLite: failed to open initial leader connection: {}", e);
             }
         }
-    } else {
-        // Non-leader role: bootstrap conn (if any) belongs to the schema
-        // pass and gets dropped here. Followers open their own rw conn
-        // on promotion.
-        drop(bootstrap_conn);
     }
 
     // Start forwarding server only if we're the leader.
