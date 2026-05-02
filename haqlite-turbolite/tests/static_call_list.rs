@@ -1,45 +1,10 @@
 //! Source-grep assertion that the hybrid follower-replay path does
 //! not call any of the legacy temp-SQLite-restore primitives.
 //!
-//! Phase 004 (direct hybrid page replay) replaced
-//! `pull_incremental` + `import_sqlite_file` (after-WAL-replay) +
-//! `replace_cache_from_sqlite_file` + `normalize_replayed_sqlite_base`
-//! + a temp-DB `materialize_to_file` with `pull_incremental_into_sink`
-//! + a `ReplayHandle` and a write directly to the live cache (via
-//! `materialize_manifest_to_file`, which is *not* the same surface).
-//! This test pins that boundary at the source level so a future
-//! refactor can't quietly resurrect the old path even if the
-//! artifact-scan assertions miss a renamed temp-file.
-//!
-//! Scope: the check runs over the BODIES of the two replay-path
-//! functions only —
-//!   - `TurboliteFollowerBehavior::apply_manifest_payload` (follower
-//!     poll-time catch-up)
-//!   - `TurboliteWalReplicator::restore_from_manifest` (replicator
-//!     pull / promotion catch-up)
-//! Other functions in the same files are intentionally NOT checked:
-//!     - `TurboliteWalReplicator::ensure_base_manifest` and its
-//!       `seed_local_sqlite_for_import` + `vfs.import_sqlite_file`
-//!       chain are the fresh-tenant bootstrap path and are explicitly
-//!       preserved (plan.md "Keep `seed_local_sqlite_for_import`
-//!       because the fresh-bootstrap path still uses it").
-//!     - Doc comments and module-level commentary that *mention* the
-//!       legacy names while explaining their absence are also out of
-//!       scope.
-//!
-//! Forbidden substrings (each spelled with the trailing `(` for call-
-//! site disambiguation against same-prefix replacements):
-//!   - `pull_incremental(`     forbids the old non-sink walrust API
-//!     while leaving `pull_incremental_into_sink(` allowed.
-//!   - `materialize_to_file(`  forbids the legacy bench API while
-//!     leaving `materialize_manifest_to_file(` allowed (the new
-//!     manifest-aware variant). Note that `materialize_to_file(` is
-//!     not a substring of `materialize_manifest_to_file(`.
-//!   - `import_sqlite_file(`   forbids the after-WAL-replay shape;
-//!     fresh-bootstrap callers live outside the scoped window.
-//!   - `replace_cache_from_sqlite_file`, `normalize_replayed_sqlite_base`
-//!     are gone entirely; any reappearance is a regression regardless
-//!     of caller.
+//! Scope: only the bodies of `apply_manifest_payload` (follower
+//! poll-time catch-up) and `restore_from_manifest` (replicator
+//! pull / promotion catch-up). The fresh-tenant bootstrap path,
+//! which legitimately uses `import_sqlite_file`, is out of scope.
 
 use std::fs;
 use std::path::PathBuf;
@@ -58,11 +23,8 @@ fn read_source(rel: &str) -> String {
         .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e))
 }
 
-/// Strip line comments (`//` and `///`) and block comments
-/// (`/* ... */`) so doc commentary that mentions the legacy names
-/// while explaining the new shape isn't flagged. The strip is
-/// deliberately simple — we own the input files; no need for a real
-/// Rust lexer.
+/// Strip `//` and `/* */` comments so doc commentary mentioning
+/// the legacy names doesn't trip the substring check.
 fn strip_comments(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let bytes = src.as_bytes();
@@ -96,11 +58,8 @@ fn strip_comments(src: &str) -> String {
     out
 }
 
-/// Pull out the body of an `async fn <name>(...)` declaration up to
-/// its matching closing brace (depth-balanced). Returns None if the
-/// declaration isn't found, which the caller treats as a hard test
-/// failure — the file shape this test relies on must match the
-/// codebase exactly.
+/// Returns the body of `async fn <name>` (between matched braces)
+/// or None if the declaration isn't found.
 fn extract_async_fn_body(src: &str, fn_name: &str) -> Option<String> {
     let needle = format!("async fn {}", fn_name);
     let start = src.find(&needle)?;

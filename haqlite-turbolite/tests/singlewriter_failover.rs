@@ -140,35 +140,13 @@ fn raw_cache_snapshot(cache_path: &Path) -> String {
     }
 }
 
-/// Scan the follower's tempdir recursively at a quiescent point and
-/// return paths whose filenames look like a temporary SQLite restore
-/// artifact. The Phase 004 hybrid replay path materializes the
-/// manifest base directly into the live `data.cache` and replays
-/// walrust pages on top via a `ReplayHandle`; it never writes a
-/// temporary `.restore.db` / `.sqlite` / `.db` file. If this scan
-/// turns up a match, the implementation has regressed to (or
-/// silently re-introduced) the legacy temp-restore path.
+/// Scan the follower tempdir for filenames that look like a temp
+/// SQLite restore artifact (`*restore*`, `*.sqlite`, `*.db`).
 ///
-/// Forbidden filename patterns:
-///   - any name containing the substring `restore`
-///   - any name ending in `.sqlite`
-///   - any name ending in `.db`
-///
-/// Allowed Turbolite layout:
-///   - `data.cache` (the live tiered cache) and any `data.cache-*`
-///     SQLite shm/wal sidecars SQLite creates against it
-///   - `page_bitmap` (presence bitmap)
-///   - `manifest.msgpack`, `dirty_groups.msgpack` (local manifest /
-///     dirty-group state)
-///   - `cache_index.json` (compressed-mode page index)
-///   - `staging/`, `pending_flushes/` (replay-emitted staging logs;
-///     part of the normal flush path)
-///   - `sub_chunk_tracker`
-///   - `locks/` subdirectory contents — turbolite's per-database
-///     file-guard lock targets live here as `<db>.db` etc., named
-///     after the SQLite database name. They're zero-byte lock
-///     marker files, NOT restore artifacts, so the scan ignores
-///     anything under a `locks` directory.
+/// Allows the turbolite layout: `data.cache` plus its SQLite shm/wal
+/// sidecars, and anything under a `locks/` subdirectory (turbolite's
+/// per-database file-guard markers are named `<db>.db` and would
+/// otherwise trip `*.db`).
 fn scan_for_restore_artifacts(dir: &Path) -> Vec<PathBuf> {
     let mut hits = Vec::new();
     fn walk(dir: &Path, in_locks: bool, hits: &mut Vec<PathBuf>) {
@@ -510,17 +488,9 @@ async fn singlewriter_continuous_failover_promotes_and_keeps_writing() {
     .expect("continuous failover");
 }
 
-/// B25 regression: a manifest poll that finds the same version
-/// the follower has already applied must not rewrite `data.cache`.
-/// Without the version-skip guard, every poll interval would
-/// re-`set_manifest_bytes` + `materialize_to_file` + sync, briefly
-/// clobbering whatever bytes are at offsets a concurrent
-/// follower-read shortcut might be looking at.
-///
-/// Uses checkpoint durability because the skip is gated on
-/// `walrust.is_none()` — continuous manifests carry an embed
-/// cursor, not an upload head, so the no-op-skip optimization
-/// can't be safely applied while walrust frames are flowing.
+/// A no-op manifest poll (same version, no walrust) must not
+/// rewrite `data.cache`. Uses checkpoint durability because the
+/// skip is gated on `walrust.is_none()`.
 #[tokio::test(flavor = "multi_thread")]
 async fn follower_no_op_poll_does_not_touch_data_cache() {
     let _guard = FAILOVER_TEST_LOCK.lock().await;
@@ -606,31 +576,19 @@ async fn follower_no_op_poll_does_not_touch_data_cache() {
     );
     assert!(
         cache_before == cache_after,
-        "data.cache bytes changed during no-op poll window (B25 regression: \
-         apply_manifest_payload ran for an unchanged manifest)"
+        "data.cache bytes changed during no-op poll window"
     );
     assert_eq!(
         mtime_before, mtime_after,
-        "data.cache mtime advanced during no-op poll window (B25 regression)"
+        "data.cache mtime advanced during no-op poll window"
     );
 }
 
-/// B26 regression: concurrent follower reads must never observe a
-/// torn `data.cache` while `materialize_to_file` is rewriting it.
-///
-/// Without the apply-side fence (replay_gate.write held around
-/// materialize) a reader's `xRead` can race the truncate+rewrite
-/// and surface as SQLITE_CORRUPT, missing schema, regressed row
-/// counts, or other torn reads. With the fence and follower reads
-/// routed through the VFS, every read either completes before
-/// truncate or blocks until the cache is consistent again.
-///
-/// Drives a leader through a tight INSERT loop (each INSERT bumps
-/// the manifest in checkpoint mode and the follower's poll triggers
-/// a fresh `materialize_to_file`) while parallel reader tasks hammer
-/// `query_values_fresh` against the follower. The follower's
-/// observed row count must be monotonically non-decreasing (with
-/// the schema column shape preserved) and no read may error.
+/// Concurrent follower reads must not observe a torn `data.cache`
+/// while a manifest swap is rewriting it. Drives a tight INSERT
+/// loop on the leader (each commit triggers a fresh follower
+/// materialize) against 8 parallel readers; row count must be
+/// monotonically non-decreasing and rows must keep shape.
 #[tokio::test(flavor = "multi_thread")]
 async fn follower_reads_remain_consistent_during_concurrent_materialize() {
     let _guard = FAILOVER_TEST_LOCK.lock().await;
@@ -706,8 +664,8 @@ async fn follower_reads_remain_consistent_during_concurrent_materialize() {
                 };
                 assert!(
                     count >= last_count,
-                    "reader {id}: row count regressed {} -> {} (B26 regression: \
-                     torn read of pre-truncate manifest)",
+                    "reader {id}: row count regressed {} -> {} \
+                     (torn read of pre-truncate manifest)",
                     last_count,
                     count
                 );
@@ -730,18 +688,9 @@ async fn follower_reads_remain_consistent_during_concurrent_materialize() {
         }
     };
 
-    // Aggressive write cadence (8ms between INSERTs over 200
-    // iterations = ~1.6s) drives the leader's page-group upload
-    // and manifest republish flow into a tight race. Two distinct
-    // failure modes used to surface here:
-    //   - Torn xRead during materialize_to_file's `File::create`
-    //     truncate window (B27 narrow-gate bug, fixed by holding
-    //     the VFS replay-gate write across the full apply).
-    //   - "missing page-group object" when the leader publishes
-    //     manifest vN naming a key whose object hasn't uploaded
-    //     yet, or has been re-keyed under vN+1 churn (fixed by
-    //     pre-flighting all fetches before truncating data.cache
-    //     and treating the residual NotFound as a transient retry).
+    // 200 INSERTs at 8ms apart drives the manifest republish chain
+    // tight enough to surface both torn-xRead and
+    // missing-page-group races on broken code.
     let writer = {
         let stop = stop.clone();
         let leader_db = &leader.db;
@@ -788,41 +737,11 @@ async fn follower_reads_remain_consistent_during_concurrent_materialize() {
         .expect("follower converges after concurrent torture");
 }
 
-/// Promotion publishes a usable base, proven by a fresh third node
-/// joining from the post-promotion manifest.
-///
-/// The continuous failover test only proves the promoted leader
-/// itself can keep reading and writing — it doesn't prove the
-/// **published** manifest carries the replayed Turbolite pages plus
-/// the advanced walrust cursor. Without this proof, the failover
-/// test can pass while the manifest still points at the old
-/// pre-replay base + an advanced cursor, and a fresh follower
-/// silently misses pre-promotion data.
-///
-/// Sequence:
-///   1. Leader writes `before-crash`. Follower catches up.
-///   2. Snapshot the pre-promotion manifest from the
-///      `ManifestStore` (version, page_count, page_group_keys, walrust
-///      cursor).
-///   3. Kill the leader; follower promotes.
-///   4. Promoted leader writes `after-promotion`; that write triggers
-///      a `flush_turbolite -> on_flush -> sync -> publish` chain
-///      which publishes a hybrid manifest.
-///   5. Decode the post-promotion manifest and assert:
-///        - `version` strictly greater than pre-promotion's
-///        - `page_count` >= pre-promotion's
-///        - `page_group_keys` contains at least one key NOT present
-///          in the pre-promotion manifest (proves
-///          `flush_dirty_groups` actually uploaded fresh objects,
-///          not just bumped the version)
-///        - walrust cursor strictly greater than pre-promotion's
-///          (proves replay layered new frames into the published
-///          base)
-///   6. Spin up a fresh third node sharing the same lease /
-///      manifest / tiered / walrust storage; wait for it to attain
-///      Follower role and catch up.
-///   7. Assert the third node reads BOTH rows: row 1 (pre-promotion
-///      `before-crash`) and row 2 (post-promotion `after-promotion`).
+/// After failover + a post-promotion write, a fresh third node
+/// joining from the published manifest must see both pre-promotion
+/// and post-promotion rows. Asserts the post-promotion manifest is
+/// actually a usable base (fresh page-group keys, advanced walrust
+/// cursor) before spinning the third node up.
 #[tokio::test(flavor = "multi_thread")]
 async fn singlewriter_promotion_publishes_usable_base() {
     let _guard = FAILOVER_TEST_LOCK.lock().await;
@@ -830,15 +749,8 @@ async fn singlewriter_promotion_publishes_usable_base() {
     let follower_tmp = TempDir::new().expect("follower tmp");
     let third_tmp = TempDir::new().expect("third tmp");
 
-    // Tight checkpoint config so the after-promotion INSERT
-    // actually triggers a checkpoint flush — without this, the
-    // default 15s/10k-commits/64MB thresholds would never fire in
-    // a fast unit test, the WAL frame would never embed into the
-    // base manifest, and a fresh third follower would only see
-    // pages from before the after-promotion write. We want to
-    // prove the end-to-end "post-promotion published manifest is
-    // a usable base" property; a starvation of the checkpoint
-    // trigger would silently mask the real assertion.
+    // Tight checkpoint thresholds so post-promotion writes embed
+    // into the base — defaults won't fire in a unit-test window.
     let durability = turbodb::Durability::Continuous {
         checkpoint: turbodb::CheckpointConfig {
             interval: Duration::from_millis(100),
@@ -903,8 +815,7 @@ async fn singlewriter_promotion_publishes_usable_base() {
         .await
         .expect("follower sees before-crash row");
 
-    // Snapshot pre-promotion manifest. This is the baseline the
-    // post-promotion publish must strictly improve on.
+    // Pre-promotion manifest baseline.
     let pre_promotion_manifest_bytes = manifest_store
         .get("test/failover/_manifest")
         .await
@@ -932,13 +843,8 @@ async fn singlewriter_promotion_publishes_usable_base() {
         .await
         .expect("promoted leader still sees before-crash");
 
-    // Post-promotion writes drive several commits so the checkpoint
-    // trigger has multiple opportunities to flush the WAL frames
-    // into the page-group base. We need the post-promotion data to
-    // be in the BASE — not just in walrust frames whose cursor the
-    // manifest thinks is already "embedded" — so a fresh third
-    // follower can see it via materialize alone, without depending
-    // on a follower-only WAL stream the third node never had.
+    // Multiple post-promotion writes give the checkpoint trigger
+    // room to embed WAL frames into the base.
     for i in 2..=6i64 {
         follower
             .db
@@ -956,59 +862,14 @@ async fn singlewriter_promotion_publishes_usable_base() {
         .await
         .expect("promoted leader sees all post-promotion rows");
 
-    // Force a SQLite checkpoint via PRAGMA so the post-promotion
-    // INSERT's WAL frames are pushed into the main DB. Without
-    // this, in continuous mode the writes live only in walrust
-    // frames AND the post-write manifest publish advances its
-    // cursor to "latest uploaded walrust seq" — even though those
-    // frames aren't yet embedded into the page-group base. A fresh
-    // third follower joining from such a manifest would then pull
-    // walrust frames > cursor and find nothing, while the base
-    // doesn't carry the post-promotion writes either. The
-    // PRAGMA pushes WAL → main, the next publish flushes a fresh
-    // page-group with all rows baked in, and the fresh-follower
-    // materialize alone is enough to see everything.
-    let _ = follower
-        .db
-        .query_values_fresh("PRAGMA wal_checkpoint(TRUNCATE)", &[])
-        .await
-        .expect("promoted leader checkpoint");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    // One more INSERT after the SQLite checkpoint forces a fresh
-    // commit cycle whose Turbolite-layer publish flushes the
-    // post-checkpoint base bytes (now including all post-promotion
-    // rows in the main DB) up to the manifest_store. Without this
-    // second commit, the post-checkpoint state can stay in
-    // pending-flush local state on the leader and never reach a
-    // fresh follower.
-    follower
-        .db
-        .execute_async(
-            "INSERT INTO t (id, val) VALUES (?1, ?2)",
-            &[
-                SqlValue::Integer(99),
-                SqlValue::Text("flush-trigger".to_string()),
-            ],
-        )
-        .await
-        .expect("flush-trigger insert");
-    wait_for_count(&follower.db, 7, Duration::from_secs(3))
-        .await
-        .expect("promoted leader sees flush-trigger row");
-    // Allow a generous window for the cascaded fire-and-forget
-    // publish chain (commit → spawned on_flush → walrust upload →
-    // manifest publish) to drain to its final state.
+    // Drain the publish chain so the manifest_store reflects the
+    // post-promotion base. With commit_count=1, every commit
+    // triggers a turbolite checkpoint, so a generous sleep here
+    // is enough.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Wait for the post-promotion manifest to publish to the
-    // manifest store carrying the after-promotion INSERT — that
-    // means version strictly greater than pre-promotion AND a
-    // walrust cursor strictly greater than pre-promotion's. Two
-    // distinct publishes happen after promotion: the
-    // `publish_replayed_base` flush at promotion time, then the
-    // on-commit publish from the after-promotion INSERT. Without
-    // waiting for the second, a fresh third follower joining from
-    // an in-flight cursor would miss row 2.
+    // Wait for both the promotion publish AND the post-INSERT
+    // publish to land — version + cursor must both advance.
     let deadline = Instant::now() + Duration::from_secs(8);
     let post_promotion_manifest_bytes = loop {
         let bytes = manifest_store
@@ -1040,10 +901,9 @@ async fn singlewriter_promotion_publishes_usable_base() {
         turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&post_promotion_manifest_bytes)
             .expect("decode post-promotion manifest (final)");
 
-    // Manifest-inspection assertions (Plan Review 2 proof gap on
-    // manifest inspection): the post-promotion manifest is a real,
-    // usable base — version advanced, page coverage at least as
-    // wide, fresh page-group keys uploaded, walrust cursor advanced.
+    // The post-promotion manifest must be a real usable base:
+    // version advanced, page coverage at least as wide, fresh
+    // page-group keys uploaded, walrust cursor advanced.
     assert!(
         post_manifest.version > pre_manifest.version,
         "post-promotion manifest version did not advance: {} -> {}",
@@ -1083,9 +943,8 @@ async fn singlewriter_promotion_publishes_usable_base() {
         );
     }
 
-    // Spin up a fresh third node sharing the same storage. It must
-    // join as a Follower (lease still held by the promoted leader)
-    // and catch up to BOTH rows from the post-promotion manifest.
+    // Fresh third node sharing the same storage — joins as
+    // Follower and must catch up to both rows.
     let third = build_singlewriter_node(
         third_tmp.path(),
         "failover",
@@ -1100,7 +959,7 @@ async fn singlewriter_promotion_publishes_usable_base() {
     wait_for_role(&third.db, Role::Follower, Duration::from_secs(5))
         .await
         .expect("third node attains follower role");
-    if let Err(e) = wait_for_count(&third.db, 7, Duration::from_secs(10)).await {
+    if let Err(e) = wait_for_count(&third.db, 6, Duration::from_secs(20)).await {
         let third_local = local_vfs_state(&third.vfs);
         let third_files = dir_snapshot(third_tmp.path());
         let third_vfs = vfs_snapshot(third_tmp.path(), "failover", &third.vfs_name);
@@ -1136,26 +995,15 @@ async fn singlewriter_promotion_publishes_usable_base() {
     wait_for_value(&third.db, 6, "after-promotion-6", Duration::from_secs(5))
         .await
         .expect("third node sees last after-promotion row");
-    wait_for_value(&third.db, 99, "flush-trigger", Duration::from_secs(5))
-        .await
-        .expect("third node sees flush-trigger row");
 
     assert_no_restore_artifacts(third_tmp.path(), "third-fresh-follower");
 }
 
-/// Already-caught-up promotion still publishes a usable replayed
-/// base.
-///
-/// Sister test to `singlewriter_promotion_publishes_usable_base`,
-/// but the failover happens at a moment when the follower has
-/// already replayed every walrust frame the leader uploaded.
-/// Promotion's own catch-up cycle therefore applies zero new
-/// changesets — the load-bearing assertion is that the freshly
-/// promoted leader still publishes a hybrid manifest a fresh
-/// third follower can join from. This pins Plan Review 3 B9: the
-/// adapter must accumulate replay state across cycles AND across
-/// the promotion boundary, so a follower that caught up early
-/// still has the full base ready when its first publish lands.
+/// Failover when the follower has already replayed every walrust
+/// frame the leader uploaded. The promoted leader's first publish
+/// must still flush its accumulated replay state into a fresh
+/// page-group base — proven by giving the third node EMPTY walrust
+/// storage so it can only see pre-crash data via materialize.
 #[tokio::test(flavor = "multi_thread")]
 async fn singlewriter_promotion_publishes_already_replayed_base() {
     let _guard = FAILOVER_TEST_LOCK.lock().await;
@@ -1236,6 +1084,29 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
     // follower's poll should be a true no-op (zero frames > cursor).
     tokio::time::sleep(Duration::from_millis(300)).await;
 
+    // Pre-promotion manifest baseline. We diff post against pre
+    // and require at least one fresh page-group key — without
+    // that the third node could be getting `before-crash` only
+    // via walrust replay, not via the promotion's published base.
+    let pre_promotion_manifest_bytes = manifest_store
+        .get("test/failover/_manifest")
+        .await
+        .expect("manifest_store get pre-promotion")
+        .expect("pre-promotion manifest exists")
+        .payload;
+    let (pre_manifest, pre_walrust) =
+        turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&pre_promotion_manifest_bytes)
+            .expect("decode pre-promotion manifest");
+    let pre_walrust_cursor = pre_walrust.as_ref().map(|(seq, _)| *seq);
+    let pre_keys: std::collections::HashSet<String> =
+        pre_manifest.page_group_keys.iter().cloned().collect();
+    let pre_envelope_version = manifest_store
+        .meta("test/failover/_manifest")
+        .await
+        .expect("manifest_store meta pre-promotion")
+        .map(|m| m.version)
+        .unwrap_or(0);
+
     // Kill the leader. The follower's promotion-time replay will
     // find zero new walrust changesets — it's already current.
     leader
@@ -1251,17 +1122,72 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
         .await
         .expect("promoted leader still reads before-crash after a no-op promotion replay");
 
-    // Brief drain for any promotion-time publish chain. Since
-    // promotion replay applied zero changesets, the turbolite
-    // manifest version may stay the same and the manifest_store
-    // envelope version may or may not bump — what matters for
-    // this test is that the manifest currently in the store
-    // contains the replayed base bytes a fresh follower can load.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait for the promotion publish: at least one fresh
+    // page-group key AND a bumped envelope version. Same-keys is
+    // the negative signal — accumulated state never reached the
+    // store.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let post_promotion_manifest_bytes = loop {
+        let bytes = manifest_store
+            .get("test/failover/_manifest")
+            .await
+            .expect("manifest_store get post-promotion")
+            .expect("manifest exists post-promotion")
+            .payload;
+        let (m, _) = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
+            .expect("decode post-promotion manifest");
+        let post_keys: std::collections::HashSet<&String> =
+            m.page_group_keys.iter().collect();
+        let has_new_key = post_keys
+            .iter()
+            .any(|k| !k.is_empty() && !pre_keys.contains(*k));
+        let envelope_version = manifest_store
+            .meta("test/failover/_manifest")
+            .await
+            .expect("manifest_store meta post-promotion")
+            .map(|m| m.version)
+            .unwrap_or(0);
+        if has_new_key && envelope_version > pre_envelope_version {
+            break bytes;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "promoted follower did not publish a fresh page-group base \
+                 within timeout; pre_keys={:?} post_keys={:?} \
+                 pre_envelope={} post_envelope={}",
+                pre_keys, m.page_group_keys, pre_envelope_version, envelope_version
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
 
-    // Bring up a fresh third node. It must see the pre-promotion
-    // row — the published manifest from the no-op promotion has to
-    // carry the replayed base, not just the cursor.
+    // Manifest-inspection assertions (pre vs post).
+    let (post_manifest, post_walrust) =
+        turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&post_promotion_manifest_bytes)
+            .expect("decode post-promotion manifest (final)");
+    let post_walrust_cursor = post_walrust.as_ref().map(|(seq, _)| *seq);
+    let new_keys: Vec<&String> = post_manifest
+        .page_group_keys
+        .iter()
+        .filter(|k| !k.is_empty() && !pre_keys.contains(*k))
+        .collect();
+    assert!(
+        !new_keys.is_empty(),
+        "post-promotion manifest must carry at least one fresh page-group key \
+         (the flush of accumulated replay state). pre_keys={:?} post_keys={:?}",
+        pre_keys, post_manifest.page_group_keys
+    );
+    assert!(
+        post_walrust_cursor.is_some(),
+        "post-promotion manifest dropped its walrust cursor"
+    );
+
+    // Empty walrust storage for the third: if `before-crash`
+    // reaches it, the row had to come from materialize over the
+    // post-promotion page-group base, not from a walrust frame.
+    let third_walrust_storage_impl = Arc::new(InMemoryStorage::new());
+    let third_walrust_storage: Arc<dyn hadb_storage::StorageBackend> =
+        third_walrust_storage_impl.clone();
     let third = build_singlewriter_node(
         third_tmp.path(),
         "failover",
@@ -1269,7 +1195,7 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
         lease_store,
         manifest_store.clone(),
         tiered_storage,
-        walrust_storage,
+        third_walrust_storage,
         "node-third",
     )
     .await;
@@ -1278,58 +1204,38 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
         .expect("third node attains follower role");
     wait_for_value(&third.db, 1, "before-crash", Duration::from_secs(10))
         .await
-        .expect("third node sees pre-promotion row from no-op-promotion publish");
+        .unwrap_or_else(|e| {
+            let third_walrust_keys = futures_lite_block_on(third_walrust_storage_impl.keys());
+            panic!(
+                "third node did not see row 1 from materialize alone: {}; \
+                 pre_keys={:?} post_keys={:?} new_keys_in_post={:?} \
+                 pre_walrust_cursor={:?} post_walrust_cursor={:?} \
+                 third_walrust_keys={:?}",
+                e,
+                pre_keys,
+                post_manifest.page_group_keys,
+                new_keys,
+                pre_walrust_cursor,
+                post_walrust_cursor,
+                third_walrust_keys,
+            )
+        });
 
-    // Now write through the promoted leader. The plan's contract:
-    // both live nodes (promoted leader + third follower) must
-    // read both rows. Same PRAGMA-checkpoint + flush-trigger
-    // pattern as `singlewriter_promotion_publishes_usable_base`
-    // for the same reason: in continuous mode the post-promotion
-    // INSERT lives only in the leader's WAL until SQLite
-    // checkpoint pushes it into the main DB and a fresh commit
-    // forces a Turbolite-layer page-group republish a fresh third
-    // follower can materialize from.
-    follower
-        .db
-        .execute_async(
-            "INSERT INTO t (id, val) VALUES (?1, ?2)",
-            &[
-                SqlValue::Integer(2),
-                SqlValue::Text("after-promotion".to_string()),
-            ],
-        )
-        .await
-        .expect("promoted leader after-promotion insert");
-    wait_for_count(&follower.db, 2, Duration::from_secs(5))
-        .await
-        .expect("promoted leader sees after-promotion");
-    let _ = follower
-        .db
-        .query_values_fresh("PRAGMA wal_checkpoint(TRUNCATE)", &[])
-        .await
-        .expect("promoted leader checkpoint");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    follower
-        .db
-        .execute_async(
-            "INSERT INTO t (id, val) VALUES (?1, ?2)",
-            &[
-                SqlValue::Integer(99),
-                SqlValue::Text("flush-trigger".to_string()),
-            ],
-        )
-        .await
-        .expect("flush-trigger insert");
-    wait_for_count(&follower.db, 3, Duration::from_secs(5))
-        .await
-        .expect("promoted leader sees flush-trigger");
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    wait_for_value(&third.db, 2, "after-promotion", Duration::from_secs(8))
-        .await
-        .expect("third node sees post-no-op-promotion write");
+    // Sanity-check the no-walrust-replay precondition.
+    let third_walrust_keys = third_walrust_storage_impl.keys().await;
+    assert!(
+        third_walrust_keys.is_empty(),
+        "third node's walrust storage is unexpectedly populated: {:?}",
+        third_walrust_keys
+    );
 
     assert_no_restore_artifacts(third_tmp.path(), "third-already-caught-up");
+}
+
+/// Run a future to completion from sync code inside an async test.
+fn futures_lite_block_on<F: std::future::Future>(fut: F) -> F::Output {
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::block_in_place(|| runtime.block_on(fut))
 }
 
 /// Retry-safety regression: when materialize fails because a

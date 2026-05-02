@@ -440,24 +440,11 @@ impl TurboliteWalReplicator {
                 ));
             }
         } else {
-            // No remote manifest, no published hybrid manifest. The local
-            // db_path may legitimately not exist yet — turbolite-backed
-            // connections write through the VFS, not the OS path, so a
-            // brand-new tenant whose connection_opener didn't trigger an
-            // xSync (e.g., empty schema, no committed pragma side-effect
-            // visible to a remote HTTP storage backend before
-            // ensure_base_manifest runs) leaves us with neither a remote
-            // manifest nor a real file at `path`. import_sqlite_file
-            // requires the file. Seed a minimal valid SQLite at `path`
-            // before import so the bootstrap completes — turbolite then
-            // imports a 1-page (header-only) database, which the
-            // connection_opener fills in on first write.
-            //
-            // Symptom this fixes (cinch): redis tenant create returns 500
-            // "Failed to create Redis database via HaQLite builder:
-            // turbolite import failed: No such file or directory" and the
-            // orchestrator-side claim is leaked, tripping Phase Skerry
-            // watchdog with last_kind=EmptyQueue.
+            // Brand-new tenant: no remote manifest exists yet AND
+            // db_path may not exist on disk because turbolite-backed
+            // connections write through the VFS, not the OS path.
+            // `import_sqlite_file` requires a real file, so seed a
+            // minimal SQLite header at db_path first.
             seed_local_sqlite_for_import(path).map_err(|e| {
                 anyhow!(
                     "turbolite seed local sqlite for fresh bootstrap of '{}' at {}: {}",
@@ -482,13 +469,8 @@ impl TurboliteWalReplicator {
             return Err(anyhow!("{}", hybrid_manifest_required_message(name)));
         };
 
-        // Same full-apply gate pattern as
-        // `TurboliteFollowerBehavior::apply_manifest_payload`: take
-        // the VFS replay-gate write lock once, hold across
-        // set_manifest_bytes + materialize + sync + replay so VFS
-        // reads can't observe a partial logical apply, and use
-        // `finalize_assuming_external_write` to avoid a recursive
-        // lock-take. See that method for the full design rationale.
+        // Full-apply gate + materialize-before-commit, same shape
+        // as `TurboliteFollowerBehavior::apply_manifest_payload`.
         let runtime = tokio::runtime::Handle::current();
         let vfs = self.vfs.clone();
         let cache_path = self.vfs.cache_file_path();
@@ -498,12 +480,6 @@ impl TurboliteWalReplicator {
         let walrust_storage = self.walrust_storage.clone();
         let walrust_prefix = self.walrust_prefix.clone();
 
-        // Decode the candidate manifest before mutating VFS state.
-        // Same materialize-before-commit ordering as
-        // `TurboliteFollowerBehavior::apply_manifest_payload`: a
-        // missing-group race during materialize must leave the live
-        // VFS untouched so the caller can retry without observing a
-        // half-applied state. See that method for the full rationale.
         let (decoded_manifest, decoded_walrust) =
             turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&payload_owned)
                 .map_err(|e| anyhow!("turbolite decode_manifest_bytes failed: {}", e))?;
@@ -518,9 +494,6 @@ impl TurboliteWalReplicator {
         tokio::task::spawn_blocking(move || -> Result<()> {
             let _gate = gate.write();
 
-            // Materialize from the decoded (not-yet-committed)
-            // manifest first so a missing-group transient leaves
-            // VFS state fully untouched.
             vfs.shared_state()
                 .materialize_manifest_to_file(&decoded_manifest, &cache_path)
                 .map_err(|e| anyhow!("turbolite materialize failed: {}", e))?;
@@ -579,7 +552,14 @@ impl Replicator for TurboliteWalReplicator {
         let wal_path = self.live_wal_path(path)?;
         self.walrust
             .add_without_snapshot_with_wal_path(name, &cache_path, &wal_path)
-            .await
+            .await?;
+
+        // Promotion publish: hadb calls `add_continuing` right
+        // after a follower wins the lease. Flush the accumulated
+        // replay state now so a fresh follower joining before the
+        // next commit still sees the replayed pages in the
+        // published base.
+        self.publish_current_manifest(name).await
     }
 
     async fn pull(&self, name: &str, path: &Path) -> Result<()> {

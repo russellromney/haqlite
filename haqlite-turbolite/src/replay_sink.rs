@@ -1,38 +1,17 @@
-//! `walrust_core::PageReplaySink` adapter that drives a Turbolite
-//! `ReplayHandle` directly.
-//!
-//! Routes decoded HADBP physical pages from
-//! `walrust::sync::pull_incremental_into_sink` into Turbolite's
-//! tiered cache without staging through a temporary SQLite file.
-//! `pull_incremental_into_sink` calls `begin` once, then per
-//! discovered changeset calls `apply_page` for each page and
-//! `commit_changeset(seq)`, then exactly one of `finalize` or
-//! `abort` per invocation. The adapter owns the `ReplayHandle` in
-//! an `Option` so the consume-by-value `finalize` and `abort`
-//! methods on the handle can be reached from inside the trait's
-//! `&mut self` methods.
+//! `walrust::PageReplaySink` adapter for a turbolite `ReplayHandle`.
 
 use anyhow::{anyhow, Result};
 use turbolite::tiered::{FinalizeReport, ReplayHandle};
 use walrust::PageReplaySink;
 
-/// Captured outcome of the most recent `finalize`. Used by the
-/// promotion path to confirm an install actually happened (test
-/// hooks, telemetry); production publish reads accumulated VFS
-/// state directly via `TurboliteVfs::publish_replayed_base`.
 #[derive(Default)]
 pub(crate) struct FinalizeOutcome {
     pub last_finalize: Option<FinalizeReport>,
 }
 
-/// All callers (`apply_manifest_payload`, `restore_from_manifest`)
-/// run inside a `spawn_blocking` that already holds
-/// `TurboliteVfs::replay_gate().write()` around the full
-/// set_manifest_bytes + materialize + sync + replay window. Replay
-/// finalize therefore goes through
-/// `ReplayHandle::finalize_assuming_external_write` so it doesn't
-/// recursively re-take the gate (parking_lot's `RwLock` is not
-/// re-entrant; a second take would deadlock).
+/// All callers run under a held VFS replay-gate write, so finalize
+/// goes through `finalize_assuming_external_write` to avoid a
+/// reentrant take on parking_lot's RwLock.
 pub(crate) struct HaqliteTurboliteReplaySink {
     handle: Option<ReplayHandle>,
     outcome: FinalizeOutcome,
@@ -54,10 +33,6 @@ impl HaqliteTurboliteReplaySink {
 
 impl PageReplaySink for HaqliteTurboliteReplaySink {
     fn begin(&mut self) -> Result<()> {
-        // Handle is constructed via `vfs.begin_replay()`, which
-        // already armed the cycle. Nothing to do per-cycle here;
-        // the trait's `begin` exists for sinks that allocate state
-        // lazily.
         if self.handle.is_none() {
             return Err(anyhow!("HaqliteTurboliteReplaySink: begin called after consume"));
         }
@@ -96,10 +71,8 @@ impl PageReplaySink for HaqliteTurboliteReplaySink {
     }
 
     fn abort(&mut self) -> Result<()> {
-        // walrust's driver calls abort on lifecycle failure (including
-        // a failed `begin`/`finalize`). Tolerate the post-consume
-        // case (finalize already took the handle and we're now being
-        // asked to abort because finalize itself returned Err).
+        // Tolerate post-consume aborts: walrust's driver calls
+        // abort() if finalize() returned Err.
         if let Some(handle) = self.handle.take() {
             handle
                 .abort()

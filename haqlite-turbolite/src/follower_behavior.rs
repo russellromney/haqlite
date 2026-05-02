@@ -68,34 +68,17 @@ impl TurboliteFollowerBehavior {
         self.walrust_storage.is_some() || self.walrust_prefix.is_some()
     }
 
-    /// Apply a published hybrid manifest. Updates Turbolite's
-    /// in-memory manifest, materializes the manifest's pages into
-    /// the live cache file, then if the payload carries a walrust
-    /// cursor, replays delta pages from `current cursor → latest
-    /// uploaded` via `walrust::sync::pull_incremental_into_sink` +
-    /// `TurboliteVfs::begin_replay`. No temp SQLite restore file.
-    /// `apply_page` writes go into staging on the `ReplayHandle`;
-    /// `finalize` (driven by the walrust pull) installs them.
+    /// Apply a published hybrid manifest: materialize the base then
+    /// replay walrust delta pages on top. The whole sequence runs
+    /// under one VFS replay-gate write so VFS-routed reads either
+    /// complete before the gate is taken or block at xLock until
+    /// apply finishes.
     ///
-    /// `current_version` is the follower's last-applied manifest
-    /// version. We decode the published manifest's version FIRST
-    /// (a pure read, no state mutation) and skip the entire apply
-    /// when the manifest is a pure-checkpoint payload at the same
-    /// or older version. Without this guard, a routine no-new-data
-    /// poll would still rewrite `data.cache` via
-    /// `materialize_to_file` and re-run replay, briefly clobbering
-    /// pages a follower-read shortcut might be observing right now.
-    ///
-    /// The skip is gated on `walrust.is_none()` — a continuous
-    /// manifest can be republished at the same version while new
-    /// walrust frames continue to upload (the manifest's `walrust`
-    /// field carries the embed cursor, not the upload head). If we
-    /// skipped a same-version continuous manifest after pulling 0
-    /// frames on a tight first attempt, we'd never re-pull and the
-    /// follower would stall indefinitely on storage that races the
-    /// publish. Continuous followers stay on the original
-    /// always-apply path; the no-op-skip optimization is a
-    /// checkpoint-only concern today.
+    /// Skip the apply entirely when the manifest is a no-walrust
+    /// payload at the same or older version. The skip is gated on
+    /// `walrust.is_none()` because a continuous manifest can be
+    /// republished at the same version while new walrust frames
+    /// upload — skipping it would latch the follower stale.
     async fn apply_manifest_payload(
         &self,
         db_name: &str,
@@ -103,14 +86,6 @@ impl TurboliteFollowerBehavior {
         payload: &[u8],
         current_version: u64,
     ) -> Result<u64> {
-        // Decode without mutating local state so we can early-exit
-        // on a pure-checkpoint no-op poll. The skip is gated on
-        // `walrust.is_none()` because a continuous manifest can be
-        // republished at the same version while new walrust frames
-        // upload (the manifest's walrust field is the embed cursor,
-        // not the upload head); skipping a same-version continuous
-        // payload after a tight no-frames-yet first attempt would
-        // latch the follower stale.
         let (decoded_manifest, decoded_walrust) =
             turbolite::tiered::TurboliteVfs::decode_manifest_bytes(payload)
                 .map_err(|e| anyhow!("turbolite decode_manifest_bytes failed: {}", e))?;
@@ -125,55 +100,15 @@ impl TurboliteFollowerBehavior {
             ));
         }
 
-        // The full apply runs inside one `spawn_blocking` so the
-        // VFS replay-gate write lock can be held across:
-        //   1. `set_manifest_bytes` — adopts the new manifest in
-        //      VFS in-memory state.
-        //   2. `materialize_to_file` — rewrites `data.cache` from
-        //      the manifest's page-group objects.
-        //   3. `sync_after_external_restore` — clears mem cache,
-        //      marks all pages present, persists bitmap.
-        //   4. `walrust::sync::pull_incremental_into_sink` followed
-        //      by `ReplayHandle::finalize_assuming_external_write` —
-        //      layers walrust delta pages on top of the materialized
-        //      base.
+        // Replay finalize would normally take the gate itself;
+        // we use `finalize_assuming_external_write` (parking_lot's
+        // RwLock isn't reentrant) to share the outer write lock.
+        // walrust pull is async, so block_on it on the runtime
+        // handle to keep the gate held across the full apply.
         //
-        // Holding the gate over the whole sequence prevents two
-        // distinct reader-visible inconsistencies:
-        //   - Torn bytes mid-`materialize_to_file` (the file is
-        //     truncated then re-written page-by-page).
-        //   - Logical tear between materialize and replay (manifest
-        //     swap done, base materialized, walrust deltas not yet
-        //     applied — VFS reads would see a snapshot the leader
-        //     never published).
-        //
-        // VFS-routed follower reads take the read half on
-        // `xLock(SHARED)`, so they either complete before the gate
-        // is taken or block at xLock until apply finishes.
-        //
-        // Replay finalize would normally take the same write lock
-        // itself; we use `finalize_assuming_external_write` (via
-        // `HaqliteTurboliteReplaySink::new_under_external_write`) to
-        // skip the inner take. parking_lot's `RwLock` is not
-        // re-entrant, so without that variant the second take would
-        // deadlock.
-        //
-        // walrust pull is async (storage I/O). To run it under the
-        // sync write guard we use the captured tokio runtime handle
-        // to `block_on` the pull future — same pattern as the
-        // sync-API shims documented in the cinch-cloud `CLAUDE.md`
-        // ("don't reach for block_on" exceptions). The gate is
-        // released the instant the closure returns.
-        //
-        // A missing page-group object during materialize is a
-        // transient race against the leader's publish ordering:
-        // the manifest can name a page-group key that the leader's
-        // background uploader hasn't pushed yet (or has already
-        // re-keyed under a higher version's churn). We surface
-        // that as `io::ErrorKind::NotFound` from
-        // `materialize_to_file` and translate it here into a
-        // no-op-skip return: don't bump the position, don't error
-        // the follower; the next poll re-fetches and retries.
+        // A missing page-group during materialize is a transient
+        // upload race; surface it as TransientRetry so the next
+        // poll retries without advancing position.
         let runtime = tokio::runtime::Handle::current();
         let vfs = self.vfs.clone();
         let cache_path = self.vfs.cache_file_path();
@@ -183,47 +118,20 @@ impl TurboliteFollowerBehavior {
         let walrust_storage = self.walrust_storage.clone();
         let walrust_prefix = self.walrust_prefix.clone();
 
-        // Decode the candidate manifest WITHOUT mutating VFS state
-        // so we can materialize from it and only commit
-        // (`set_manifest_bytes`) once the page-group fetches have
-        // all succeeded. Order is critical for missing-group
-        // retry safety:
-        //   1. Decode (pure read).
-        //   2. Materialize from the decoded manifest (preflights
-        //      fetches in memory; on NotFound returns BEFORE
-        //      truncating `data.cache`).
-        //   3. set_manifest_bytes (now the only mutation; commits
-        //      the new manifest, evicts changed page groups,
-        //      persists local manifest).
-        //   4. sync_after_external_restore (clear mem cache, mark
-        //      all pages present, persist bitmap).
-        //   5. Replay walrust frames if continuous.
-        //
-        // If step 2 returns NotFound, steps 3–5 don't run. VFS
-        // state stays exactly as it was: shared_manifest unchanged,
-        // page bitmap unchanged, db_header unchanged, evictions
-        // not performed, data.cache untouched. Reads after the
-        // gate releases see the previous (still-valid) snapshot;
-        // the next manifest poll retries.
+        // Materialize before set_manifest_bytes: pre-flighting
+        // fetches BEFORE the only-mutation step keeps a missing-group
+        // transient from leaving the VFS half-applied.
         let decoded_manifest_for_materialize = decoded_manifest.clone();
 
         let result = tokio::task::spawn_blocking(move || -> Result<ApplyOutcome> {
             let _gate = gate.write();
 
-            // Materialize the decoded manifest WITHOUT yet committing
-            // it to the VFS. Pre-flight semantics: on missing-group
-            // / fetch failure, returns before File::create touches
-            // `data.cache`.
             match vfs
                 .shared_state()
                 .materialize_manifest_to_file(&decoded_manifest_for_materialize, &cache_path)
             {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Transient: leader publish raced the page-group
-                    // upload. VFS state unchanged because we haven't
-                    // called set_manifest_bytes yet. Caller skips
-                    // advancing position so the next poll retries.
                     return Ok(ApplyOutcome::TransientRetry(format!(
                         "missing page-group during materialize for '{}': {}",
                         db_name_owned, e
@@ -234,8 +142,6 @@ impl TurboliteFollowerBehavior {
                 }
             }
 
-            // Materialize succeeded. Now safe to commit the new
-            // manifest to live VFS state.
             let walrust = vfs
                 .set_manifest_bytes(&payload_owned)
                 .map_err(|e| anyhow!("turbolite set_manifest_bytes failed: {}", e))?;
