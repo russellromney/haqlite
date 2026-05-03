@@ -853,6 +853,120 @@ async fn retry_forwarding_succeeds_on_first_attempt() {
 }
 
 #[tokio::test]
+async fn close_preserves_forwarded_writes_in_final_sync() {
+    let tmp = TempDir::new().unwrap();
+    let leader_dir = tmp.path().join("leader");
+    let follower_dir = tmp.path().join("follower");
+    let audit_dir = tmp.path().join("audit");
+    std::fs::create_dir_all(&leader_dir).unwrap();
+    std::fs::create_dir_all(&follower_dir).unwrap();
+    std::fs::create_dir_all(&audit_dir).unwrap();
+
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
+    let lease_store: Arc<dyn hadb::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    let leader_storage = walrust_storage.clone();
+    let leader_lease = lease_store.clone();
+    let leader_path = leader_dir.join("ha.db");
+    let leader_task = tokio::spawn(async move {
+        let mut leader = HaQLite::from_coordinator(
+            build_coordinator(
+                leader_storage,
+                leader_lease,
+                "close-leader",
+                "http://localhost:19280",
+            ),
+            leader_path.to_str().unwrap(),
+            SCHEMA,
+            19280,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        for id in 0..3 {
+            leader
+                .execute_async(
+                    "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
+                    &[
+                        SqlValue::Integer(id),
+                        SqlValue::Text(format!("leader-{id}")),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        leader.close().await.unwrap();
+    });
+
+    let follower_storage = walrust_storage.clone();
+    let follower_lease = lease_store.clone();
+    let follower_path = follower_dir.join("ha.db");
+    let follower_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut follower = HaQLite::from_coordinator(
+            build_coordinator(
+                follower_storage,
+                follower_lease,
+                "close-follower",
+                "http://localhost:19281",
+            ),
+            follower_path.to_str().unwrap(),
+            SCHEMA,
+            19281,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        for id in 3..6 {
+            follower
+                .execute_async(
+                    "INSERT INTO test_data (id, value) VALUES (?1, ?2)",
+                    &[
+                        SqlValue::Integer(id),
+                        SqlValue::Text(format!("follower-{id}")),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        follower.close().await.unwrap();
+    });
+
+    let (leader_result, follower_result) = tokio::join!(leader_task, follower_task);
+    leader_result.unwrap();
+    follower_result.unwrap();
+
+    let mut auditor = HaQLite::from_coordinator(
+        build_coordinator(
+            walrust_storage,
+            lease_store,
+            "close-auditor",
+            "http://localhost:19282",
+        ),
+        audit_dir.join("ha.db").to_str().unwrap(),
+        SCHEMA,
+        19282,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    let count: i64 = auditor
+        .query_row("SELECT COUNT(*) FROM test_data", &[], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 6,
+        "all acknowledged local and forwarded writes survive close"
+    );
+
+    auditor.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn retry_forwarding_retries_on_connection_error() {
     // Follower points to dead leader -- connection error should be retried,
     // then eventually fail with LeaderUnavailable after all retries exhausted.

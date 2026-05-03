@@ -1424,13 +1424,25 @@ impl HaQLite {
         // 1. Close read semaphore -- new reads get EngineClosed immediately.
         self.inner.read_semaphore.close();
 
-        // 2. Close connection (drains in-flight writes via the Mutex).
-        self.inner.set_conn(None);
+        // 2. Stop accepting forwarded writes before the final replication sync.
+        // A forwarded write that lands after walrust has measured the WAL but
+        // before the connection closes can be acknowledged yet missed by the
+        // final changeset.
+        self.inner.stop_forwarding_server().await;
 
-        // 3. Flush tiered storage pages if a sibling crate registered an on_flush callback.
+        // 3. Wait for any in-flight execute/forwarded-execute using the SQLite
+        // connection to finish. The final sync below needs a quiet WAL.
+        if let Some(conn_arc) = self.inner.get_conn()? {
+            drop(conn_arc.lock());
+        }
+
+        // 4. Flush tiered storage pages if a sibling crate registered an on_flush callback.
         self.flush_turbolite()?;
 
-        // 4. Leave the cluster (releases lease).
+        // 5. Leave the cluster while the SQLite connection is still open.
+        // walrust's final sync reads the live WAL during coordinator.leave();
+        // closing the last connection first can checkpoint/remove the WAL and
+        // turn acknowledged writes into unsynced local-only bytes.
         if let Some(ref coordinator) = self.inner.coordinator {
             coordinator
                 .leave(&self.inner.db_name)
@@ -1438,8 +1450,10 @@ impl HaQLite {
                 .map_err(|e| HaQLiteError::CoordinatorError(e.to_string()))?;
         }
 
-        // 5. Stop forwarding server and abort background tasks.
-        self.inner.stop_forwarding_server().await;
+        // 6. Now the final sync is done, close the connection.
+        self.inner.set_conn(None);
+
+        // 7. Abort background role listener.
         self._role_handle.abort();
 
         Ok(())
