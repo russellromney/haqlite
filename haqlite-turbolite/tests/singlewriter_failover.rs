@@ -291,6 +291,17 @@ async fn wait_for_checksum(db: &HaQLite, expected: &str, timeout: Duration) -> R
     ))
 }
 
+async fn wait_for_caught_up(db: &HaQLite, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if db.is_caught_up() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Err(anyhow!("timed out waiting for follower caught-up flag"))
+}
+
 async fn close_node_for_test(node: &mut BuiltNode) {
     node.db.close().await.expect("clean haqlite test shutdown");
 }
@@ -2199,8 +2210,7 @@ async fn follower_apply_is_atomic_under_missing_page_group_race() {
     wait_for_count(&follower.db, 15, Duration::from_secs(5))
         .await
         .expect("follower converges after storage unpauses");
-    assert!(
-        follower.db.is_caught_up(),
-        "follower should report caught-up after the retry succeeds"
-    );
+    wait_for_caught_up(&follower.db, Duration::from_secs(5))
+        .await
+        .expect("follower should report caught-up after the retry succeeds");
 }
