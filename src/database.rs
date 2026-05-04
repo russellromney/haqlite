@@ -124,6 +124,7 @@ pub struct HaQLiteBuilder {
     role: Option<Role>,
     durability: Option<hadb::Durability>,
     manifest_poll_interval: Option<Duration>,
+    follower_pull_interval: Option<Duration>,
     write_timeout: Option<Duration>,
     walrust_storage: Option<Arc<dyn hadb_storage::StorageBackend>>,
     lease_ttl: Option<u64>,
@@ -157,6 +158,7 @@ impl HaQLiteBuilder {
             role: None,
             durability: None,
             manifest_poll_interval: None,
+            follower_pull_interval: None,
             write_timeout: None,
             walrust_storage: None,
             lease_ttl: None,
@@ -291,6 +293,12 @@ impl HaQLiteBuilder {
         self
     }
 
+    /// SingleWriter follower data pull interval. Default: 1s.
+    pub fn follower_pull_interval(mut self, interval: Duration) -> Self {
+        self.follower_pull_interval = Some(interval);
+        self
+    }
+
     /// Write timeout for lease acquisition in SharedWriter mode. Default: 5s.
     pub fn write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = Some(timeout);
@@ -394,6 +402,9 @@ impl HaQLiteBuilder {
     pub fn get_manifest_poll_interval(&self) -> Option<Duration> {
         self.manifest_poll_interval
     }
+    pub fn get_follower_pull_interval(&self) -> Option<Duration> {
+        self.follower_pull_interval
+    }
     pub fn get_write_timeout(&self) -> Option<Duration> {
         self.write_timeout
     }
@@ -490,6 +501,12 @@ impl HaQLiteBuilder {
         }
         if let Some(d) = self.lease_follower_poll_interval {
             lease_cfg.follower_poll_interval = d;
+        }
+        if let Some(d) = self.manifest_poll_interval {
+            config.manifest_poll_interval = d;
+        }
+        if let Some(d) = self.follower_pull_interval {
+            config.follower_pull_interval = d;
         }
         config.lease = Some(lease_cfg);
         config.requested_role = self.role;

@@ -22,11 +22,11 @@ categories = ["database", "network-programming"]
 
 [dependencies]
 # HA coordination framework
-hadb = { path = "../hadb/hadb", version = "0.4.0" }
-hadb-lease-s3 = { path = "../hadb/hadb-lease-s3", version = "0.4.0" }
+hadb = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb", branch = "hoist-prereq-internal-lease-store" }
+hadb-lease-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-lease-s3", branch = "hoist-prereq-internal-lease-store" }
 
 # WAL sync primitives
-walrust = { path = "../walrust/crates/walrust-core", version = "0.3.1" }
+walrust = { git = "https://github.com/russellromney/walrust.git", version = "0.3.1", package = "walrust", branch = "hoist-public-deps" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -57,25 +57,25 @@ axum = "0.8"
 reqwest = { version = "0.12", features = ["json"] }
 
 # NATS lease store (optional)
-hadb-lease-nats = { path = "../hadb/hadb-lease-nats", version = "0.4.0", optional = true }
+hadb-lease-nats = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-lease-nats", branch = "hoist-prereq-internal-lease-store", optional = true }
 
 # Lease abstractions (trait crate provides FenceSource used by the
 # Cinch storage adapter for fenced writes).
-hadb-lease = { path = "../hadb/hadb-lease", version = "0.4.0" }
+hadb-lease = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-lease", branch = "hoist-prereq-internal-lease-store" }
 
 # Storage substrate (trait + impls)
-hadb-storage = { path = "../hadb/hadb-storage", version = "0.4.0" }
-hadb-storage-s3 = { path = "../hadb/hadb-storage-s3", version = "0.4.0" }
-hadb-storage-cinch = { path = "../hadb/hadb-storage-cinch", version = "0.4.0" }
+hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", branch = "hoist-prereq-internal-lease-store" }
+hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", branch = "hoist-prereq-internal-lease-store" }
+hadb-storage-cinch = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-cinch", branch = "hoist-prereq-internal-lease-store" }
 
 # Cinch-protocol HTTP lease store
-hadb-lease-cinch = { path = "../hadb/hadb-lease-cinch", version = "0.4.0" }
+hadb-lease-cinch = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-lease-cinch", branch = "hoist-prereq-internal-lease-store" }
 
 # Shared CLI framework
-hadb-cli = { path = "../hadb/hadb-cli", version = "0.4.0" }
+hadb-cli = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-cli", branch = "hoist-prereq-internal-lease-store" }
 
 # Hrana protocol (libSQL HTTP API)
-hrana-server = { path = "../hrana-server", version = "0.1.0" }
+hrana-server = { git = "https://github.com/russellromney/hrana-server.git", version = "0.1.0", package = "hrana-server" }
 
 # CLI + logging
 clap = { version = "4", features = ["derive", "env"] }
@@ -127,5 +127,5 @@ http-body-util = "0.1"
 axum = "0.8"
 proptest = "1.5"
 proptest-derive = "0.5"
-hadb-storage-local = { path = "../hadb/hadb-storage-local", version = "0.4.0" }
-redlite = { path = "../redlite/crates/redlite", version = "0.1.0" }
+hadb-storage-local = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-local", branch = "hoist-prereq-internal-lease-store" }
+redlite = { git = "https://github.com/russellromney/redlite.git", version = "0.1.0", package = "redlite", branch = "hoist-public-deps" }

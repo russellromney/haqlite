@@ -1,0 +1,9 @@
+.git
+.DS_Store
+target
+**/target
+node_modules
+**/node_modules
+.direnv
+.env
+.env.*

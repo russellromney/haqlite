@@ -14,18 +14,18 @@ categories = ["database", "network-programming"]
 haqlite = { path = "..", version = "0.4.0" }
 
 # HA coordination
-hadb = { path = "../../hadb/hadb", version = "0.4.0" }
-hadb-lease = { path = "../../hadb/hadb-lease", version = "0.4.0" }
+hadb = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb", branch = "hoist-prereq-internal-lease-store" }
+hadb-lease = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-lease", branch = "hoist-prereq-internal-lease-store" }
 
 # Storage substrate
-turbodb = { path = "../../hadb/turbodb", version = "0.4.0" }
-turbodb-manifest-cinch = { path = "../../hadb/turbodb-manifest-cinch", version = "0.4.0" }
+turbodb = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "turbodb", branch = "hoist-prereq-internal-lease-store" }
+turbodb-manifest-cinch = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "turbodb-manifest-cinch", branch = "hoist-prereq-internal-lease-store" }
 
 # Turbolite VFS
-turbolite = { path = "../../turbolite", version = "0.4.0", features = ["zstd", "wal"] }
+turbolite = { git = "https://github.com/russellromney/turbolite.git", version = "0.4.0", features = ["zstd", "wal"], branch = "benchmark/s3-express-verify" }
 
 # WAL sync (walrust is always present for Continuous/Checkpoint paths)
-walrust = { path = "../../walrust/crates/walrust-core", version = "0.3.1" }
+walrust = { git = "https://github.com/russellromney/walrust.git", version = "0.3.1", package = "walrust", branch = "hoist-public-deps" }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
@@ -43,12 +43,12 @@ rmp-serde = "1"
 reqwest = { version = "0.12", features = ["json"] }
 
 # Cinch-protocol HTTP lease store (for builder convenience)
-hadb-lease-cinch = { path = "../../hadb/hadb-lease-cinch", version = "0.4.0" }
+hadb-lease-cinch = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-lease-cinch", branch = "hoist-prereq-internal-lease-store" }
 
 # S3 storage backend (optional, for direct S3 use)
-hadb-storage = { path = "../../hadb/hadb-storage", version = "0.4.0" }
-hadb-storage-s3 = { path = "../../hadb/hadb-storage-s3", version = "0.4.0", optional = true }
-hadb-storage-cinch = { path = "../../hadb/hadb-storage-cinch", version = "0.4.0" }
+hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", branch = "hoist-prereq-internal-lease-store" }
+hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", branch = "hoist-prereq-internal-lease-store", optional = true }
+hadb-storage-cinch = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-cinch", branch = "hoist-prereq-internal-lease-store" }
 
 # SQLite
 rusqlite = { version = "0.35", features = ["bundled"] }
@@ -58,10 +58,15 @@ default = ["s3"]
 s3 = ["dep:hadb-storage-s3"]
 legacy-s3-mode-tests = ["s3"]
 
+[[bin]]
+name = "haqlite-turbolite-bench"
+path = "src/bin/tiered_bench.rs"
+required-features = ["s3"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-turbodb-manifest-mem = { path = "../../hadb/turbodb-manifest-mem", version = "0.4.0" }
-hadb-storage-local = { path = "../../hadb/hadb-storage-local", version = "0.4.0" }
+turbodb-manifest-mem = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "turbodb-manifest-mem", branch = "hoist-prereq-internal-lease-store" }
+hadb-storage-local = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-local", branch = "hoist-prereq-internal-lease-store" }
 proptest = "1"

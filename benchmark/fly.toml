@@ -1,0 +1,16 @@
+app = "haqlite-turbolite-bench"
+primary_region = "iad"
+
+[build]
+  dockerfile = "benchmark/Dockerfile"
+
+[env]
+  RUST_LOG = "warn"
+  BENCH_VERBOSE = "1"
+
+[processes]
+  app = "--replication-latency --iterations 25 --warmup 3 --replication-interval-ms 1 --manifest-poll-ms 1 --follower-poll-ms 1 --latency-batch-rows 8 --latency-payload-bytes 8192 --latency-timeout-ms 10000"
+
+[[vm]]
+  size = "performance-2x"
+  memory = "4096"

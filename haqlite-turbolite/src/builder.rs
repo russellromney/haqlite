@@ -243,8 +243,18 @@ impl Builder {
         self
     }
 
+    pub fn coordinator_config(mut self, config: hadb::CoordinatorConfig) -> Self {
+        self.inner = self.inner.coordinator_config(config);
+        self
+    }
+
     pub fn manifest_poll_interval(mut self, interval: Duration) -> Self {
         self.inner = self.inner.manifest_poll_interval(interval);
+        self
+    }
+
+    pub fn follower_pull_interval(mut self, interval: Duration) -> Self {
+        self.inner = self.inner.follower_pull_interval(interval);
         self
     }
 
@@ -719,6 +729,12 @@ impl Builder {
         }
         if let Some(d) = self.inner.get_lease_follower_poll_interval() {
             lease_cfg.follower_poll_interval = d;
+        }
+        if let Some(d) = self.inner.get_manifest_poll_interval() {
+            config.manifest_poll_interval = d;
+        }
+        if let Some(d) = self.inner.get_follower_pull_interval() {
+            config.follower_pull_interval = d;
         }
         config.lease = Some(lease_cfg);
         config.requested_role = self.role;
