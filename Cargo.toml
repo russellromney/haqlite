@@ -128,4 +128,3 @@ axum = "0.8"
 proptest = "1.5"
 proptest-derive = "0.5"
 hadb-storage-local = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-local", branch = "hoist-prereq-internal-lease-store" }
-redlite = { git = "https://github.com/russellromney/redlite.git", version = "0.1.0", package = "redlite", branch = "hoist-public-deps" }
