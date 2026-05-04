@@ -15,6 +15,77 @@ use async_trait::async_trait;
 use hadb_storage::{CasResult, StorageBackend};
 use tokio::sync::Mutex;
 
+#[cfg(feature = "legacy-s3-mode-tests")]
+static S3_VFS_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature = "s3")]
+pub fn s3_env_available() -> bool {
+    std::env::var("TIERED_TEST_BUCKET").is_ok()
+}
+
+#[cfg(feature = "s3")]
+pub fn test_bucket() -> String {
+    std::env::var("TIERED_TEST_BUCKET").expect("TIERED_TEST_BUCKET required")
+}
+
+#[cfg(feature = "s3")]
+pub fn endpoint_url() -> Option<String> {
+    std::env::var("AWS_ENDPOINT_URL")
+        .or_else(|_| std::env::var("AWS_ENDPOINT_URL_S3"))
+        .ok()
+}
+
+#[cfg(feature = "s3")]
+pub async fn s3_backend(s3_prefix: &str) -> Arc<dyn hadb_storage::StorageBackend> {
+    let storage = hadb_storage_s3::S3Storage::from_env(test_bucket(), endpoint_url().as_deref())
+        .await
+        .expect("create S3 storage")
+        .with_prefix(s3_prefix);
+    Arc::new(storage)
+}
+
+#[cfg(feature = "legacy-s3-mode-tests")]
+pub async fn make_s3_vfs(
+    cache_dir: &std::path::Path,
+    vfs_prefix: &str,
+    s3_prefix: &str,
+    compression_level: i32,
+    encryption_key: Option<[u8; 32]>,
+) -> (
+    turbolite::tiered::SharedTurboliteVfs,
+    String,
+    Arc<dyn hadb_storage::StorageBackend>,
+) {
+    let n = S3_VFS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let vfs_name = format!("{}_{}", vfs_prefix, n);
+    let config = turbolite::tiered::TurboliteConfig {
+        cache_dir: cache_dir.to_path_buf(),
+        cache: turbolite::tiered::CacheConfig {
+            pages_per_group: 4,
+            sub_pages_per_frame: 2,
+            ..Default::default()
+        },
+        compression: turbolite::tiered::CompressionConfig {
+            level: compression_level,
+            ..Default::default()
+        },
+        encryption: turbolite::tiered::EncryptionConfig {
+            key: encryption_key,
+        },
+        ..Default::default()
+    };
+    let backend = s3_backend(s3_prefix).await;
+    let vfs = turbolite::tiered::TurboliteVfs::with_backend(
+        config,
+        backend.clone(),
+        tokio::runtime::Handle::current(),
+    )
+    .expect("create S3-backed VFS");
+    let shared_vfs = turbolite::tiered::SharedTurboliteVfs::new(vfs);
+    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
+    (shared_vfs, vfs_name, backend)
+}
+
 pub struct InMemoryStorage {
     objects: Mutex<HashMap<String, Vec<u8>>>,
 }

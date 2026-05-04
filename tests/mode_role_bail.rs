@@ -11,6 +11,8 @@
 
 use std::sync::Arc;
 
+mod common;
+
 use haqlite::{HaMode, HaQLite, InMemoryLeaseStore, Role};
 use tempfile::TempDir;
 
@@ -19,20 +21,24 @@ fn db_path(tmp: &TempDir, name: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn singlewriter_client_bails_with_planned_message() {
+async fn singlewriter_client_opens_but_write_bails_with_planned_message() {
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(InMemoryLeaseStore::new());
 
-    let err = HaQLite::builder()
+    let db = HaQLite::builder()
         .prefix("test/")
         .mode(HaMode::SingleWriter)
         .role(Role::Client)
         .lease_store(lease)
+        .walrust_storage(Arc::new(common::InMemoryStorage::new()))
         .instance_id("node-1")
         .open(&db_path(&tmp, "client.db"), "")
         .await
-        .err()
-        .expect("Client must bail");
+        .expect("SingleWriter Client can open");
+
+    let err = db
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[])
+        .expect_err("Client writes must bail");
 
     let msg = format!("{err:#}");
     assert!(

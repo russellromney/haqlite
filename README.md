@@ -13,7 +13,9 @@ Part of the [hadb](https://github.com/russellromney/hadb) ecosystem for making a
 ```rust
 use haqlite::{HaQLite, SqlValue};
 
-let db = HaQLite::builder()
+let mut db = HaQLite::builder()
+    .lease_store(my_lease_store)              // e.g. NATS, S3, HTTP, or an in-memory store for tests
+    .walrust_storage(my_walrust_storage)      // e.g. S3/Tigris/R2 for replicated WAL segments
     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);")
     .await?;
 
@@ -24,7 +26,7 @@ db.execute(
 )?;
 
 // Reads: always local
-let count: i64 = db.query_row("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;
+let count: i64 = db.query_row_local("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;
 
 // Clean shutdown
 db.close().await?;

@@ -56,6 +56,7 @@ rusqlite = { version = "0.35", features = ["bundled"] }
 [features]
 default = ["s3"]
 s3 = ["dep:hadb-storage-s3"]
+legacy-s3-mode-tests = ["s3"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -1,11 +1,13 @@
 //! Full test matrix for haqlite multiwriter modes.
 //!
 //! Tests encoding combos (plain, zstd, encrypted, zstd+encrypted) across:
-//! - Mode Sync: S3 turbolite S3Primary + Synchronous durability (requires turbolite-cloud)
+//! - Mode Sync: S3 turbolite S3Primary + Synchronous durability (requires s3)
 //!
 //! Mode A (single node, no HA) is tested by turbolite's own tests.
 
-#![cfg(feature = "turbolite-cloud")]
+#![cfg(feature = "legacy-s3-mode-tests")]
+
+mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,15 +17,8 @@ use haqlite::{HaQLite, SqlValue};
 use haqlite_turbolite::{Builder, HaMode};
 use tempfile::TempDir;
 use turbodb_manifest_mem::MemManifestStore;
-use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT)";
-
-static VFS_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-fn unique_vfs(prefix: &str) -> String {
-    let n = VFS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    format!("{}_{}", prefix, n)
-}
 
 // ============================================================================
 // Encoding combos
@@ -71,14 +66,6 @@ fn encodings() -> Vec<Encoding> {
 // S3 helpers
 // ============================================================================
 
-fn test_bucket() -> String {
-    std::env::var("TIERED_TEST_BUCKET").expect("TIERED_TEST_BUCKET required")
-}
-
-fn endpoint_url() -> Option<String> {
-    std::env::var("AWS_ENDPOINT_URL").ok()
-}
-
 fn unique_prefix(name: &str) -> String {
     format!(
         "test/mode_matrix/{}/{}",
@@ -103,32 +90,17 @@ async fn run_mode_sync(enc: &Encoding) {
 
     let shared_prefix = unique_prefix(enc.name);
 
-    let build_node = |cache_dir: &std::path::Path, instance_id: &str| {
-        let vfs_name = unique_vfs(&format!("ms_{}", enc.name));
-        let config = TurboliteConfig {
-            bucket: test_bucket(),
-            prefix: shared_prefix.clone(),
-            cache_dir: cache_dir.to_path_buf(),
-            endpoint_url: endpoint_url(),
-            region: Some("auto".to_string()),
-            compression_level: enc.compression_level,
-            encryption_key: enc.encryption_key,
-            pages_per_group: 4,
-            sub_pages_per_frame: 2,
-            eager_index_load: false,
-            runtime_handle: Some(tokio::runtime::Handle::current()),
-            ..Default::default()
-        };
-        let vfs = TurboliteVfs::new(config).expect("vfs");
-        let shared_vfs = SharedTurboliteVfs::new(vfs);
-        turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register");
-        (shared_vfs, vfs_name)
-    };
-
     // Create and open nodes sequentially so each VFS sees the latest S3 state.
     // VFS fetches the S3 manifest at creation time; creating both upfront means
     // the second VFS would have a stale view of S3.
-    let (vfs_a, vfs_name_a) = build_node(tmp_a.path(), "a");
+    let (vfs_a, vfs_name_a, _) = common::make_s3_vfs(
+        tmp_a.path(),
+        &format!("ms_{}_a", enc.name),
+        &shared_prefix,
+        enc.compression_level,
+        enc.encryption_key,
+    )
+    .await;
     let mut db_a = Builder::new()
         .prefix("test/")
         .mode(HaMode::SharedWriter)
@@ -142,7 +114,14 @@ async fn run_mode_sync(enc: &Encoding) {
         .await
         .expect("open a");
 
-    let (vfs_b, vfs_name_b) = build_node(tmp_b.path(), "b");
+    let (vfs_b, vfs_name_b, _) = common::make_s3_vfs(
+        tmp_b.path(),
+        &format!("ms_{}_b", enc.name),
+        &shared_prefix,
+        enc.compression_level,
+        enc.encryption_key,
+    )
+    .await;
     let mut db_b = Builder::new()
         .prefix("test/")
         .mode(HaMode::SharedWriter)
@@ -162,7 +141,6 @@ async fn run_mode_sync(enc: &Encoding) {
             "INSERT INTO t VALUES (?1, ?2)",
             &[SqlValue::Integer(i), SqlValue::Text(format!("a_{}", i))],
         )
-        .await
         .expect("insert a");
     }
 
@@ -172,7 +150,6 @@ async fn run_mode_sync(enc: &Encoding) {
             "INSERT INTO t VALUES (?1, ?2)",
             &[SqlValue::Integer(i), SqlValue::Text(format!("b_{}", i))],
         )
-        .await
         .expect("insert b");
     }
 

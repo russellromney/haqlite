@@ -8,7 +8,9 @@
 //! # async fn main() -> anyhow::Result<()> {
 //! use haqlite::{HaQLite, SqlValue};
 //!
-//! let db = HaQLite::builder()
+//! let mut db = HaQLite::builder()
+//!     .lease_store(my_lease_store)
+//!     .walrust_storage(my_storage)
 //!     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);")
 //!     .await?;
 //!
@@ -16,7 +18,7 @@
 //! db.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Alice".into())])?;
 //!
 //! // Reads: always local
-//! let count: i64 = db.query_row("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;
+//! let count: i64 = db.query_row_local("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;
 //! # Ok(())
 //! # }
 //! ```

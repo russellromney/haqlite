@@ -88,12 +88,16 @@ fn build_coordinator(
     instance_id: &str,
     address: &str,
 ) -> Arc<Coordinator> {
+    let lease = LeaseConfig::new(lease_store, instance_id.to_string(), address.to_string());
+    build_coordinator_with_lease(walrust_storage, lease)
+}
+
+fn build_coordinator_with_lease(
+    walrust_storage: Arc<dyn hadb_storage::StorageBackend>,
+    lease: LeaseConfig,
+) -> Arc<Coordinator> {
     let config = CoordinatorConfig {
-        lease: Some(LeaseConfig::new(
-            lease_store,
-            instance_id.to_string(),
-            address.to_string(),
-        )),
+        lease: Some(lease),
         ..Default::default()
     };
 
@@ -235,12 +239,13 @@ async fn lease_renewal_uses_custom_store() {
     let walrust_storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(InMemoryStorage::new());
     let tracking_store = Arc::new(TrackingLeaseStore::new());
 
-    let coordinator = build_coordinator(
-        walrust_storage,
+    let mut lease = LeaseConfig::new(
         tracking_store.clone(),
-        "node-renewal",
-        "http://localhost:19104",
+        "node-renewal".to_string(),
+        "http://localhost:19104".to_string(),
     );
+    lease.renew_interval = Duration::from_millis(25);
+    let coordinator = build_coordinator_with_lease(walrust_storage, lease);
 
     let mut db = HaQLite::from_coordinator(
         coordinator,
@@ -255,12 +260,20 @@ async fn lease_renewal_uses_custom_store() {
     let ops_at_join = tracking_store.total_ops();
     assert!(ops_at_join > 0);
 
-    // Wait for at least one lease renewal cycle.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let renewal_seen = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let ops_after = tracking_store.total_ops();
+            if ops_after > ops_at_join {
+                return ops_after;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
 
     let ops_after = tracking_store.total_ops();
     assert!(
-        ops_after > ops_at_join,
+        renewal_seen.is_ok(),
         "Expected lease renewal ops: before={}, after={}",
         ops_at_join,
         ops_after

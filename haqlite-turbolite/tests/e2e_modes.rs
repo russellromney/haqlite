@@ -6,11 +6,11 @@
 //! Each test opens multiple nodes, writes from each, and verifies
 //! all data is visible to all nodes via fresh reads.
 //!
-//! Requires turbolite-cloud feature and S3 credentials.
+//! Requires the s3 feature and S3 credentials.
 
-#![cfg(feature = "turbolite-cloud")]
+#![cfg(feature = "legacy-s3-mode-tests")]
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +18,6 @@ use haqlite::{HaQLite, InMemoryLeaseStore, SqlValue};
 use haqlite_turbolite::{Builder, HaMode};
 use tempfile::TempDir;
 use turbodb_manifest_mem::MemManifestStore;
-use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 mod common;
 use common::InMemoryStorage;
@@ -28,20 +27,6 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS items (
     node TEXT NOT NULL,
     value TEXT NOT NULL
 );";
-
-static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
-fn unique_vfs(prefix: &str) -> String {
-    let n = VFS_COUNTER.fetch_add(1, Ordering::SeqCst);
-    format!("e2e_{}_{}", prefix, n)
-}
-
-fn test_bucket() -> String {
-    std::env::var("TIERED_TEST_BUCKET").expect("TIERED_TEST_BUCKET required")
-}
-
-fn endpoint_url() -> Option<String> {
-    std::env::var("AWS_ENDPOINT_URL").ok()
-}
 
 fn unique_prefix(name: &str) -> String {
     format!(
@@ -63,23 +48,14 @@ async fn build_node(
     walrust_storage: Option<Arc<InMemoryStorage>>,
     instance_id: &str,
 ) -> HaQLite {
-    let vfs_name = unique_vfs(instance_id);
-    let config = TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: s3_prefix.to_string(),
-        cache_dir: cache_dir.to_path_buf(),
-        endpoint_url: endpoint_url(),
-        region: Some("auto".to_string()),
-        compression_level: 0,
-        pages_per_group: 4,
-        sub_pages_per_frame: 2,
-        eager_index_load: false,
-        runtime_handle: Some(tokio::runtime::Handle::current()),
-        ..Default::default()
-    };
-    let vfs = TurboliteVfs::new(config).expect("create VFS");
-    let shared_vfs = SharedTurboliteVfs::new(vfs);
-    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
+    let (shared_vfs, vfs_name, _) = common::make_s3_vfs(
+        cache_dir,
+        &format!("e2e_{}", instance_id),
+        s3_prefix,
+        0,
+        None,
+    )
+    .await;
 
     let db_path = cache_dir.join("e2e.db");
     let mut builder = Builder::new()
@@ -146,7 +122,6 @@ async fn e2e_synchronous_two_nodes_sequential() {
                 SqlValue::Text(format!("val_{}", i)),
             ],
         )
-        .await
         .expect("node-a write");
     }
 
@@ -160,7 +135,6 @@ async fn e2e_synchronous_two_nodes_sequential() {
                 SqlValue::Text(format!("val_{}", i)),
             ],
         )
-        .await
         .expect("node-b write");
     }
 
@@ -223,17 +197,14 @@ async fn e2e_synchronous_four_nodes_concurrent() {
             let db = db.lock().await;
             for i in 0..5 {
                 let id = (node_id * 5 + i) as i64;
-                match db
-                    .execute(
-                        "INSERT INTO items (id, node, value) VALUES (?1, ?2, ?3)",
-                        &[
-                            SqlValue::Integer(id),
-                            SqlValue::Text(format!("n{}", node_id)),
-                            SqlValue::Text(format!("val_{}", id)),
-                        ],
-                    )
-                    .await
-                {
+                match db.execute(
+                    "INSERT INTO items (id, node, value) VALUES (?1, ?2, ?3)",
+                    &[
+                        SqlValue::Integer(id),
+                        SqlValue::Text(format!("n{}", node_id)),
+                        SqlValue::Text(format!("val_{}", id)),
+                    ],
+                ) {
                     Ok(_) => {
                         s.fetch_add(1, Ordering::Relaxed);
                     }
@@ -310,20 +281,8 @@ async fn e2e_write_fails_without_lease() {
 
     // Build a node with very short write timeout
     let tmp = TempDir::new().expect("tmp");
-    let vfs_name = unique_vfs("blocked");
-    let config = TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: prefix.clone(),
-        cache_dir: tmp.path().to_path_buf(),
-        endpoint_url: endpoint_url(),
-        region: Some("auto".to_string()),
-        eager_index_load: false,
-        runtime_handle: Some(tokio::runtime::Handle::current()),
-        ..Default::default()
-    };
-    let vfs = TurboliteVfs::new(config).expect("vfs");
-    let shared_vfs = SharedTurboliteVfs::new(vfs);
-    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("reg");
+    let (shared_vfs, vfs_name, _) =
+        common::make_s3_vfs(tmp.path(), "e2e_blocked", &prefix, 0, None).await;
 
     let db = Builder::new()
         .prefix("test/")
@@ -338,12 +297,10 @@ async fn e2e_write_fails_without_lease() {
         .await
         .expect("open");
 
-    let result = db
-        .execute(
-            "INSERT INTO items (id, node, value) VALUES (1, 'blocked', 'should_fail')",
-            &[],
-        )
-        .await;
+    let result = db.execute(
+        "INSERT INTO items (id, node, value) VALUES (1, 'blocked', 'should_fail')",
+        &[],
+    );
 
     assert!(result.is_err(), "write without lease should fail");
     let err_str = format!("{}", result.unwrap_err());

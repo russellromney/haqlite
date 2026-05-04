@@ -50,7 +50,7 @@ fn endpoint_url() -> Option<String> {
     std::env::var("AWS_ENDPOINT_URL").ok()
 }
 
-#[cfg(feature = "turbolite-cloud")]
+#[cfg(feature = "legacy-s3-mode-tests")]
 fn make_s3_vfs(cache_dir: &std::path::Path, s3_prefix: &str) -> (SharedTurboliteVfs, String) {
     let n = VFS_COUNTER.fetch_add(1, Ordering::SeqCst);
     let vfs_name = format!("tms_s3_{}", n);

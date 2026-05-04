@@ -133,6 +133,11 @@ pub(crate) async fn handle_forwarded_execute(
         tracing::error!("Forwarded execute failed: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    tracing::debug!(
+        rows_affected,
+        sql = %req.sql,
+        "leader handled forwarded execute"
+    );
 
     Ok(Json(ExecuteResult {
         rows_affected: rows_affected as u64,

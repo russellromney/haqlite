@@ -253,6 +253,21 @@ impl Builder {
         self
     }
 
+    pub fn lease_ttl(mut self, ttl_secs: u64) -> Self {
+        self.inner = self.inner.lease_ttl(ttl_secs);
+        self
+    }
+
+    pub fn lease_renew_interval(mut self, interval: Duration) -> Self {
+        self.inner = self.inner.lease_renew_interval(interval);
+        self
+    }
+
+    pub fn lease_follower_poll_interval(mut self, interval: Duration) -> Self {
+        self.inner = self.inner.lease_follower_poll_interval(interval);
+        self
+    }
+
     pub fn lease_store(mut self, store: Arc<dyn LeaseStore>) -> Self {
         self.inner = self.inner.lease_store(store);
         self
@@ -387,11 +402,11 @@ impl Builder {
             .map_err(|e| anyhow::anyhow!("invalid mode/role combination: {e}"))?;
 
         match (self.mode, self.role) {
-            (HaMode::SingleWriter, None | Some(Role::Leader) | Some(Role::Follower)) => {
-                self.open_writer(db_path, schema).await
-            }
-            (HaMode::SingleWriter, Some(Role::Client))
-            | (HaMode::SharedWriter, Some(Role::Client)) => {
+            (
+                HaMode::SingleWriter,
+                None | Some(Role::Leader) | Some(Role::Follower) | Some(Role::Client),
+            ) => self.open_writer(db_path, schema).await,
+            (HaMode::SharedWriter, Some(Role::Client)) => {
                 anyhow::bail!("Client mode not yet implemented in haqlite-turbolite")
             }
             (HaMode::SharedWriter, None | Some(Role::LatentWriter)) => {
@@ -706,19 +721,12 @@ impl Builder {
             lease_cfg.follower_poll_interval = d;
         }
         config.lease = Some(lease_cfg);
+        config.requested_role = self.role;
         if let Some((_, fence_writer)) = shared_fence {
             config.fence_writer = Some(fence_writer);
         }
 
         let replicator_for_flush = replicator.clone();
-        let coordinator = haqlite::Coordinator::new(
-            replicator,
-            None,
-            None,
-            follower_behavior,
-            self.inner.get_prefix(),
-            config,
-        );
 
         // Build connection opener for turbolite VFS.
         let vfs_name_for_opener = vfs_name.clone();
@@ -736,7 +744,10 @@ impl Builder {
         let connection_opener: Arc<
             dyn Fn() -> Result<rusqlite::Connection, haqlite::HaQLiteError> + Send + Sync,
         > = Arc::new(move || {
-            let vfs_uri = format!("file:{}?vfs={}", db_filename_for_opener, vfs_name_for_opener);
+            let vfs_uri = format!(
+                "file:{}?vfs={}",
+                db_filename_for_opener, vfs_name_for_opener
+            );
             let conn = rusqlite::Connection::open_with_flags(
                 &vfs_uri,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -793,21 +804,43 @@ impl Builder {
 
         let db_name_for_flush = db_name.clone();
         let flush_runtime = tokio::runtime::Handle::current();
+        let flush_mutex = Arc::new(Mutex::new(()));
         let on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>> =
             Some(Arc::new(move || {
+                let _guard = flush_mutex.lock().map_err(|_| {
+                    anyhow::anyhow!("haqlite-turbolite sync/publish mutex poisoned")
+                })?;
                 let replicator = replicator_for_flush.clone();
                 let db_name = db_name_for_flush.clone();
-                flush_runtime.spawn(async move {
-                    if let Err(e) = replicator.sync(&db_name).await {
-                        tracing::error!(
-                            "haqlite-turbolite: background sync/publish failed for '{}': {}",
-                            db_name,
-                            e
-                        );
-                    }
-                });
-                Ok(())
+                let handle = flush_runtime.clone();
+                std::thread::spawn(move || {
+                    handle.block_on(async move { replicator.sync(&db_name).await })
+                })
+                .join()
+                .map_err(|_| anyhow::anyhow!("haqlite-turbolite sync/publish thread panicked"))?
+                .map_err(|e| anyhow::anyhow!("haqlite-turbolite sync/publish failed: {e}"))
             }));
+
+        let schema_for_leader_setup = schema.to_string();
+        let opener_for_leader_setup = connection_opener.clone();
+        config.before_leader_add = Some(Arc::new(move || {
+            let conn = opener_for_leader_setup()
+                .map_err(|e| anyhow::anyhow!("turbolite leader setup open failed: {e}"))?;
+            if !schema_for_leader_setup.trim().is_empty() {
+                conn.execute_batch(&schema_for_leader_setup)
+                    .map_err(|e| anyhow::anyhow!("turbolite leader setup schema failed: {e}"))?;
+            }
+            Ok(())
+        }));
+
+        let coordinator = haqlite::Coordinator::new(
+            replicator,
+            None,
+            None,
+            follower_behavior,
+            self.inner.get_prefix(),
+            config,
+        );
 
         haqlite::database::open_with_coordinator(
             coordinator,
@@ -823,6 +856,7 @@ impl Builder {
             Some(connection_opener),
             Some(follower_read_connection_opener),
             on_flush,
+            true,
         )
         .await
         .map_err(|e| e.into())

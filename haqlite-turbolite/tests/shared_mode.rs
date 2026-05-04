@@ -3,9 +3,9 @@
 //! Multi-node sharedwriter mode requires S3-backed turbolite for catch-up
 //! (set_manifest evicts groups, next read fetches from S3).
 //!
-//! Requires turbolite-cloud feature.
+//! Requires the s3 feature.
 
-#![cfg(feature = "turbolite-cloud")]
+#![cfg(feature = "legacy-s3-mode-tests")]
 
 mod common;
 

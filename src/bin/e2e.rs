@@ -15,7 +15,7 @@
 //!   TIERED_TEST_BUCKET=haqlite-test AWS_ENDPOINT_URL=https://fly.storage.tigris.dev \
 //!   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=auto \
 //!   cargo run --bin haqlite-e2e -- \
-//!     --durability synchronous --workers 4 --writes-per-worker 20
+//!     --durability cloud --workers 4 --writes-per-worker 20
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +26,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::{error, info, warn};
 
-use haqlite::{HaMode, HaQLite, SqlValue};
+use haqlite::{HaMode, HaQLite, S3LeaseStore, SqlValue};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS e2e (
     id TEXT PRIMARY KEY,
@@ -40,8 +40,8 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS e2e (
 #[command(name = "haqlite-e2e")]
 #[command(about = "End-to-end semantic verification for haqlite")]
 struct Args {
-    /// Durability: synchronous or eventual
-    #[arg(long, default_value = "synchronous")]
+    /// Durability: cloud
+    #[arg(long, default_value = "cloud")]
     durability: String,
 
     /// Number of concurrent workers
@@ -102,12 +102,25 @@ async fn open_node(
     args: &Args,
 ) -> Result<HaQLite> {
     let db_path = db_dir.join("e2e.db");
+    let base_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .load()
+        .await;
+    let mut s3_builder = aws_sdk_s3::config::Builder::from(&base_config).force_path_style(true);
+    if let Some(ref ep) = args.endpoint {
+        s3_builder = s3_builder.endpoint_url(ep);
+    }
+    let s3_client = aws_sdk_s3::Client::from_conf(s3_builder.build());
+    let lease_store = S3LeaseStore::new(s3_client, args.bucket.clone()).with_prefix(prefix);
+    let walrust_storage =
+        hadb_storage_s3::S3Storage::from_env(args.bucket.clone(), args.endpoint.as_deref()).await?;
 
     let mut builder = HaQLite::builder()
         .prefix(prefix)
         .mode(HaMode::SingleWriter)
         .durability(hadb::Durability::Replicated(Duration::from_secs(1)))
         .instance_id(instance_id)
+        .lease_store(Arc::new(lease_store))
+        .walrust_storage(Arc::new(walrust_storage))
         .lease_ttl(args.lease_ttl)
         .write_timeout(Duration::from_secs(args.write_timeout));
 
@@ -356,7 +369,7 @@ async fn main() -> Result<()> {
     let prefix = format!("e2e/cloud/{}/", run_id);
 
     info!(
-        "=== haqlite e2e: SharedWriter + Cloud | {} workers x {} ops ===",
+        "=== haqlite e2e: SingleWriter + explicit S3 stores | {} workers x {} ops ===",
         args.workers, args.writes_per_worker
     );
     info!("Bucket: {}, Prefix: {}", args.bucket, prefix);

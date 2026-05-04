@@ -11,10 +11,13 @@ use hadb::{FollowerBehavior, HaMetrics, Replicator};
 use hadb_storage::StorageBackend;
 use turbodb::ManifestStore;
 
-use crate::replay_sink::HaqliteTurboliteReplaySink;
+use crate::replay_sink::{
+    apply_prepared_page_replay, prepare_page_replay, HaqliteTurboliteReplaySink,
+};
 
 enum ApplyOutcome {
     Applied(u64),
+    Noop,
     TransientRetry(String),
 }
 
@@ -85,12 +88,12 @@ impl TurboliteFollowerBehavior {
         _db_path: &Path,
         payload: &[u8],
         current_version: u64,
-    ) -> Result<u64> {
+    ) -> Result<ApplyOutcome> {
         let (decoded_manifest, decoded_walrust) =
             turbolite::tiered::TurboliteVfs::decode_manifest_bytes(payload)
                 .map_err(|e| anyhow!("turbolite decode_manifest_bytes failed: {}", e))?;
         if decoded_walrust.is_none() && decoded_manifest.version <= current_version {
-            return Ok(current_version);
+            return Ok(ApplyOutcome::Noop);
         }
 
         if self.requires_hybrid_payload() && decoded_walrust.is_none() {
@@ -100,87 +103,110 @@ impl TurboliteFollowerBehavior {
             ));
         }
 
-        // Replay finalize would normally take the gate itself;
-        // we use `finalize_assuming_external_write` (parking_lot's
-        // RwLock isn't reentrant) to share the outer write lock.
-        // walrust pull is async, so block_on it on the runtime
-        // handle to keep the gate held across the full apply.
-        //
         // A missing page-group during materialize is a transient
         // upload race; surface it as TransientRetry so the next
         // poll retries without advancing position.
-        let runtime = tokio::runtime::Handle::current();
         let vfs = self.vfs.clone();
         let cache_path = self.vfs.cache_file_path();
         let gate = self.vfs.replay_gate();
         let payload_owned = payload.to_vec();
         let db_name_owned = db_name.to_string();
-        let walrust_storage = self.walrust_storage.clone();
-        let walrust_prefix = self.walrust_prefix.clone();
 
         // Materialize before set_manifest_bytes: pre-flighting
         // fetches BEFORE the only-mutation step keeps a missing-group
         // transient from leaving the VFS half-applied.
+        //
+        // Continuous mode tracks follower position as a walrust seq,
+        // not a Turbolite manifest version. Once this process has the
+        // base manifest installed, a same-base poll should only pull
+        // WAL objects after the caller's current seq; rematerializing
+        // the old base every poll creates a base/replay churn window.
+        let materialize_base = match decoded_walrust.as_ref() {
+            Some((_base_seq, _)) => {
+                let local_manifest = self.vfs.manifest();
+                decoded_manifest.version > local_manifest.version
+            }
+            None => true,
+        };
+        let replay_start_seq = match decoded_walrust.as_ref() {
+            Some((base_seq, _)) if !materialize_base => current_version.max(*base_seq),
+            Some((base_seq, _)) => *base_seq,
+            None => 0,
+        };
+        let prepared_replay = match decoded_walrust.as_ref() {
+            Some((_base_seq, _changeset_prefix)) => {
+                let storage = self
+                    .walrust_storage
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow!("continuous follower '{}' missing walrust storage", db_name)
+                    })?
+                    .clone();
+                let prefix = self
+                    .walrust_prefix
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow!("continuous follower '{}' missing walrust prefix", db_name)
+                    })?
+                    .clone();
+                Some(
+                    prepare_page_replay(storage.as_ref(), &prefix, db_name, replay_start_seq)
+                        .await?,
+                )
+            }
+            None => None,
+        };
         let decoded_manifest_for_materialize = decoded_manifest.clone();
+        let decoded_walrust_for_replay = decoded_walrust.clone();
 
         let result = tokio::task::spawn_blocking(move || -> Result<ApplyOutcome> {
-            let _gate = gate.write();
+            let _gate = loop {
+                if let Some(guard) = gate.try_write() {
+                    break guard;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
 
-            match vfs
-                .shared_state()
-                .materialize_manifest_to_file(&decoded_manifest_for_materialize, &cache_path)
-            {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(ApplyOutcome::TransientRetry(format!(
-                        "missing page-group during materialize for '{}': {}",
-                        db_name_owned, e
-                    )));
+            if materialize_base {
+                match vfs
+                    .shared_state()
+                    .materialize_manifest_to_file(&decoded_manifest_for_materialize, &cache_path)
+                {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(ApplyOutcome::TransientRetry(format!(
+                            "missing page-group during materialize for '{}': {}",
+                            db_name_owned, e
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(anyhow!("turbolite materialize failed: {}", e));
+                    }
                 }
-                Err(e) => {
-                    return Err(anyhow!("turbolite materialize failed: {}", e));
-                }
+
+                vfs.set_manifest_bytes(&payload_owned)
+                    .map_err(|e| anyhow!("turbolite set_manifest_bytes failed: {}", e))?;
+
+                let page_count = vfs.manifest().page_count;
+                vfs.sync_after_external_restore(page_count);
             }
 
-            let walrust = vfs
-                .set_manifest_bytes(&payload_owned)
-                .map_err(|e| anyhow!("turbolite set_manifest_bytes failed: {}", e))?;
-
-            let page_count = vfs.manifest().page_count;
-            vfs.sync_after_external_restore(page_count);
-
-            if let Some((walrust_seq, _changeset_prefix)) = walrust {
-                let storage = walrust_storage.ok_or_else(|| {
-                    anyhow!(
-                        "continuous follower '{}' missing walrust storage",
-                        db_name_owned
-                    )
-                })?;
-                let prefix = walrust_prefix.ok_or_else(|| {
-                    anyhow!(
-                        "continuous follower '{}' missing walrust prefix",
-                        db_name_owned
-                    )
-                })?;
-
+            if let Some(_walrust) = decoded_walrust_for_replay {
                 let handle = vfs
                     .begin_replay()
                     .map_err(|e| anyhow!("turbolite begin_replay failed: {}", e))?;
                 let mut sink = HaqliteTurboliteReplaySink::new_under_external_write(handle);
-                let final_seq = runtime
-                    .block_on(walrust::sync::pull_incremental_into_sink(
-                        storage.as_ref(),
-                        &prefix,
-                        &db_name_owned,
-                        &mut sink,
-                        walrust_seq,
-                    ))?;
+                let final_seq = apply_prepared_page_replay(
+                    &mut sink,
+                    prepared_replay.expect("decoded walrust requires prepared replay"),
+                )?;
                 tracing::debug!(
                     "Follower '{}': replayed walrust {} -> {} via direct page sink",
                     db_name_owned,
-                    walrust_seq,
+                    replay_start_seq,
                     final_seq,
                 );
+                return Ok(ApplyOutcome::Applied(final_seq));
             }
 
             Ok(ApplyOutcome::Applied(vfs.manifest().version))
@@ -188,13 +214,7 @@ impl TurboliteFollowerBehavior {
         .await
         .map_err(|e| anyhow!("turbolite apply task panicked: {}", e))??;
 
-        match result {
-            ApplyOutcome::Applied(v) => Ok(v),
-            ApplyOutcome::TransientRetry(msg) => {
-                tracing::warn!("Follower '{}': apply transient ({}); will retry on next poll", db_name, msg);
-                Ok(current_version)
-            }
-        }
+        Ok(result)
     }
 
     async fn poll_manifest_store(
@@ -202,7 +222,7 @@ impl TurboliteFollowerBehavior {
         db_name: &str,
         db_path: &Path,
         current_version: u64,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<ApplyOutcome>> {
         let Some(store) = &self.manifest_store else {
             return Ok(None);
         };
@@ -214,10 +234,10 @@ impl TurboliteFollowerBehavior {
         let Some(manifest) = store.get(key).await? else {
             return Ok(None);
         };
-        let version = self
+        let outcome = self
             .apply_manifest_payload(db_name, db_path, &manifest.payload, current_version)
             .await?;
-        Ok(Some(version))
+        Ok(Some(outcome))
     }
 }
 
@@ -262,7 +282,9 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
                     .poll_manifest_store(db_name, db_path, current_version)
                     .await
                 {
-                    Ok(Some(new_version)) if new_version > current_version => {
+                    Ok(Some(ApplyOutcome::Applied(new_version)))
+                        if new_version > current_version =>
+                    {
                         tracing::debug!(
                             "Follower '{}': manifest v{} -> v{}",
                             db_name,
@@ -277,7 +299,19 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
                         caught_up.store(true, Ordering::SeqCst);
                         metrics.follower_caught_up.store(1, Ordering::Relaxed);
                     }
-                    Ok(Some(_)) | Ok(None) => {
+                    Ok(Some(ApplyOutcome::TransientRetry(msg))) => {
+                        tracing::warn!(
+                            "Follower '{}': apply transient ({}); will retry on next poll",
+                            db_name,
+                            msg
+                        );
+                        caught_up.store(false, Ordering::SeqCst);
+                        metrics.follower_caught_up.store(0, Ordering::Relaxed);
+                        metrics.inc(&metrics.follower_pulls_failed);
+                    }
+                    Ok(Some(ApplyOutcome::Applied(_)))
+                    | Ok(Some(ApplyOutcome::Noop))
+                    | Ok(None) => {
                         caught_up.store(true, Ordering::SeqCst);
                         metrics.follower_caught_up.store(1, Ordering::Relaxed);
                         metrics.inc(&metrics.follower_pulls_no_new_data);
@@ -288,6 +322,8 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
                             db_name,
                             e
                         );
+                        caught_up.store(false, Ordering::SeqCst);
+                        metrics.follower_caught_up.store(0, Ordering::Relaxed);
                         metrics.inc(&metrics.follower_pulls_failed);
                     }
                 }
@@ -348,8 +384,16 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
         position: u64,
     ) -> Result<()> {
         if self.manifest_store.is_some() {
-            let _ = self.poll_manifest_store(db_name, db_path, position).await?;
-            return Ok(());
+            match self.poll_manifest_store(db_name, db_path, position).await? {
+                Some(ApplyOutcome::TransientRetry(msg)) => {
+                    return Err(anyhow!(
+                        "promotion catch-up for '{}' hit transient apply failure: {}",
+                        db_name,
+                        msg
+                    ));
+                }
+                Some(ApplyOutcome::Applied(_)) | Some(ApplyOutcome::Noop) | None => return Ok(()),
+            }
         }
 
         let vfs_clone = self.vfs.clone();

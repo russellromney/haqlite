@@ -10,7 +10,9 @@ use hadb_storage::StorageBackend;
 use turbodb::ManifestStore;
 use turbolite::tiered::SharedTurboliteVfs;
 
-use crate::replay_sink::HaqliteTurboliteReplaySink;
+use crate::replay_sink::{
+    apply_prepared_page_replay, prepare_page_replay, HaqliteTurboliteReplaySink,
+};
 
 fn manifest_key(prefix: &str, db_name: &str) -> String {
     format!("{}{}/_manifest", prefix, db_name)
@@ -52,7 +54,6 @@ pub fn seed_local_sqlite_for_import(path: &Path) -> std::io::Result<()> {
 fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
 }
-
 
 #[cfg(test)]
 mod seed_tests {
@@ -469,16 +470,11 @@ impl TurboliteWalReplicator {
             return Err(anyhow!("{}", hybrid_manifest_required_message(name)));
         };
 
-        // Full-apply gate + materialize-before-commit, same shape
-        // as `TurboliteFollowerBehavior::apply_manifest_payload`.
-        let runtime = tokio::runtime::Handle::current();
         let vfs = self.vfs.clone();
         let cache_path = self.vfs.cache_file_path();
         let gate = self.vfs.replay_gate();
         let payload_owned = manifest.payload.clone();
         let name_owned = name.to_string();
-        let walrust_storage = self.walrust_storage.clone();
-        let walrust_prefix = self.walrust_prefix.clone();
 
         let (decoded_manifest, decoded_walrust) =
             turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&payload_owned)
@@ -490,19 +486,30 @@ impl TurboliteWalReplicator {
                 name
             ));
         }
+        let (walrust_seq, _changeset_prefix) = decoded_walrust.expect("decoded_walrust was Some");
+        let prepared_replay = prepare_page_replay(
+            self.walrust_storage.as_ref(),
+            &self.walrust_prefix,
+            name,
+            walrust_seq,
+        )
+        .await?;
 
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let _gate = gate.write();
+            let _gate = loop {
+                if let Some(guard) = gate.try_write() {
+                    break guard;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
 
             vfs.shared_state()
                 .materialize_manifest_to_file(&decoded_manifest, &cache_path)
                 .map_err(|e| anyhow!("turbolite materialize failed: {}", e))?;
 
             // Materialize succeeded; commit the new manifest.
-            let walrust = vfs
-                .set_manifest_bytes(&payload_owned)
+            vfs.set_manifest_bytes(&payload_owned)
                 .map_err(|e| anyhow!("turbolite set_manifest_bytes failed: {}", e))?;
-            let (walrust_seq, _changeset_prefix) = walrust.expect("decoded_walrust was Some");
 
             let page_count = vfs.manifest().page_count;
             vfs.sync_after_external_restore(page_count);
@@ -511,14 +518,7 @@ impl TurboliteWalReplicator {
                 .begin_replay()
                 .map_err(|e| anyhow!("turbolite begin_replay failed: {}", e))?;
             let mut sink = HaqliteTurboliteReplaySink::new_under_external_write(handle);
-            let final_seq = runtime
-                .block_on(walrust::sync::pull_incremental_into_sink(
-                    walrust_storage.as_ref(),
-                    &walrust_prefix,
-                    &name_owned,
-                    &mut sink,
-                    walrust_seq,
-                ))?;
+            let final_seq = apply_prepared_page_replay(&mut sink, prepared_replay)?;
 
             tracing::debug!(
                 "TurboliteWalReplicator::pull('{}') replayed walrust {} -> {} via direct page sink",

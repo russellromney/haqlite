@@ -3,13 +3,13 @@
 //! Prove: at most one writer succeeds at any time in SharedWriter mode,
 //! even when leases expire due to slow S3 operations.
 //!
-//! Requires turbolite-cloud feature (multi-node catch-up needs S3 turbolite).
+//! Requires the s3 feature (multi-node catch-up needs S3 turbolite).
 
-#![cfg(feature = "turbolite-cloud")]
+#![cfg(feature = "legacy-s3-mode-tests")]
 
 mod common;
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,23 +20,8 @@ use haqlite_turbolite::{Builder, HaMode};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 use turbodb_manifest_mem::MemManifestStore;
-use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
-
-static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
-fn unique_vfs(prefix: &str) -> String {
-    let n = VFS_COUNTER.fetch_add(1, Ordering::SeqCst);
-    format!("{}_{}", prefix, n)
-}
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)";
-
-fn test_bucket() -> String {
-    std::env::var("TIERED_TEST_BUCKET").expect("TIERED_TEST_BUCKET required")
-}
-
-fn endpoint_url() -> Option<String> {
-    std::env::var("AWS_ENDPOINT_URL").ok()
-}
 
 fn unique_prefix(name: &str) -> String {
     format!(
@@ -125,23 +110,14 @@ async fn build_node(
     lease_ttl: u64,
     write_timeout_secs: u64,
 ) -> HaQLite {
-    let vfs_name = unique_vfs(&format!("lsb_{}", instance_id));
-    let config = TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: s3_prefix.to_string(),
-        cache_dir: tmp.path().to_path_buf(),
-        endpoint_url: endpoint_url(),
-        region: Some("auto".to_string()),
-        compression_level: 0,
-        pages_per_group: 4,
-        sub_pages_per_frame: 2,
-        eager_index_load: false,
-        runtime_handle: Some(tokio::runtime::Handle::current()),
-        ..Default::default()
-    };
-    let vfs = TurboliteVfs::new(config).expect("create VFS");
-    let shared_vfs = SharedTurboliteVfs::new(vfs);
-    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
+    let (shared_vfs, vfs_name, _) = common::make_s3_vfs(
+        tmp.path(),
+        &format!("lsb_{}", instance_id),
+        s3_prefix,
+        0,
+        None,
+    )
+    .await;
 
     let db_path = tmp.path().join(format!("{}.db", name));
     Builder::new()
@@ -208,11 +184,9 @@ async fn baseline_two_nodes_sequential_writes() {
     .await;
 
     db_a.execute("INSERT OR REPLACE INTO kv VALUES ('k1', 'from_a')", &[])
-        .await
         .expect("node A write should succeed");
 
     db_b.execute("INSERT OR REPLACE INTO kv VALUES ('k2', 'from_b')", &[])
-        .await
         .expect("node B write should succeed");
 
     let rows = db_b
@@ -270,16 +244,13 @@ async fn concurrent_writes_no_data_loss() {
         tokio::spawn(async move {
             let db = db.lock().await;
             for i in 0..10 {
-                match db
-                    .execute(
-                        "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
-                        &[
-                            SqlValue::Text(format!("a_{}", i)),
-                            SqlValue::Text(format!("val_a_{}", i)),
-                        ],
-                    )
-                    .await
-                {
+                match db.execute(
+                    "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
+                    &[
+                        SqlValue::Text(format!("a_{}", i)),
+                        SqlValue::Text(format!("val_a_{}", i)),
+                    ],
+                ) {
                     Ok(_) => {
                         successes.fetch_add(1, Ordering::Relaxed);
                     }
@@ -295,16 +266,13 @@ async fn concurrent_writes_no_data_loss() {
         tokio::spawn(async move {
             let db = db.lock().await;
             for i in 0..10 {
-                match db
-                    .execute(
-                        "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
-                        &[
-                            SqlValue::Text(format!("b_{}", i)),
-                            SqlValue::Text(format!("val_b_{}", i)),
-                        ],
-                    )
-                    .await
-                {
+                match db.execute(
+                    "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
+                    &[
+                        SqlValue::Text(format!("b_{}", i)),
+                        SqlValue::Text(format!("val_b_{}", i)),
+                    ],
+                ) {
                     Ok(_) => {
                         successes.fetch_add(1, Ordering::Relaxed);
                     }
@@ -492,16 +460,13 @@ async fn many_writers_short_lease_no_corruption() {
             .await;
 
             for i in 0..5 {
-                match db
-                    .execute(
-                        "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
-                        &[
-                            SqlValue::Text(format!("n{}_{}", node_id, i)),
-                            SqlValue::Text(format!("val_{}_{}", node_id, i)),
-                        ],
-                    )
-                    .await
-                {
+                match db.execute(
+                    "INSERT OR REPLACE INTO kv VALUES (?1, ?2)",
+                    &[
+                        SqlValue::Text(format!("n{}_{}", node_id, i)),
+                        SqlValue::Text(format!("val_{}_{}", node_id, i)),
+                    ],
+                ) {
                     Ok(_) => {
                         successes.fetch_add(1, Ordering::Relaxed);
                     }

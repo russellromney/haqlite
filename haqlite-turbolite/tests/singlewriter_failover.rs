@@ -16,6 +16,32 @@ use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{CacheConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT NOT NULL);";
+const CANONICAL_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        row_version INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS posts (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        payload BLOB NOT NULL,
+        row_version INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY,
+        post_id INTEGER NOT NULL REFERENCES posts(id),
+        kind TEXT NOT NULL,
+        meta TEXT NOT NULL,
+        row_version INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+    CREATE INDEX IF NOT EXISTS idx_posts_user ON posts(user_id);
+    CREATE INDEX IF NOT EXISTS idx_events_post_kind ON events(post_id, kind);
+";
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
 static FAILOVER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -74,6 +100,9 @@ async fn build_singlewriter_node(
         .walrust_storage(walrust_storage)
         .turbolite_vfs(shared_vfs.clone(), &vfs_name)
         .instance_id(instance_id)
+        .lease_ttl(2)
+        .lease_renew_interval(Duration::from_millis(250))
+        .lease_follower_poll_interval(Duration::from_millis(100))
         .manifest_poll_interval(Duration::from_millis(50))
         .disable_forwarding()
         .open(db_path.to_str().expect("valid path"), SCHEMA)
@@ -84,6 +113,186 @@ async fn build_singlewriter_node(
         vfs: shared_vfs,
         vfs_name,
     }
+}
+
+async fn build_singlewriter_node_with_schema(
+    cache_dir: &Path,
+    db_name: &str,
+    schema: &str,
+    durability: turbodb::Durability,
+    lease_store: Arc<InMemoryLeaseStore>,
+    manifest_store: Arc<dyn ManifestStore>,
+    tiered_storage: Arc<dyn hadb_storage::StorageBackend>,
+    walrust_storage: Arc<dyn hadb_storage::StorageBackend>,
+    instance_id: &str,
+    lease_ttl_secs: u64,
+) -> BuiltNode {
+    let (shared_vfs, vfs_name) = make_remote_vfs(cache_dir, tiered_storage);
+    let db_path = cache_dir.join(format!("{}.db", db_name));
+
+    let db = Builder::new()
+        .prefix("test/")
+        .mode(HaMode::SingleWriter)
+        .durability(durability)
+        .lease_store(lease_store)
+        .manifest_store(manifest_store)
+        .walrust_storage(walrust_storage)
+        .turbolite_vfs(shared_vfs.clone(), &vfs_name)
+        .instance_id(instance_id)
+        .lease_ttl(lease_ttl_secs)
+        .lease_renew_interval(Duration::from_millis(250))
+        .lease_follower_poll_interval(Duration::from_millis(100))
+        .manifest_poll_interval(Duration::from_millis(50))
+        .disable_forwarding()
+        .open(db_path.to_str().expect("valid path"), schema)
+        .await
+        .expect("open haqlite-turbolite singlewriter canonical node");
+    BuiltNode {
+        db,
+        vfs: shared_vfs,
+        vfs_name,
+    }
+}
+
+async fn apply_canonical_workload(db: &HaQLite) -> Result<()> {
+    db.execute_async("BEGIN IMMEDIATE", &[]).await?;
+    for i in 1..=128 {
+        db.execute_async(
+            "INSERT INTO users VALUES (?1, ?2, ?3, ?4)",
+            &[
+                SqlValue::Integer(i),
+                SqlValue::Text(format!("user_{i:04}")),
+                SqlValue::Text(format!("user_{i:04}@example.com")),
+                SqlValue::Integer(1),
+            ],
+        )
+        .await?;
+    }
+
+    for i in 1..=768 {
+        let payload = vec![(i % 251) as u8; 1024 + ((i % 7) as usize * 31)];
+        db.execute_async(
+            "INSERT INTO posts VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                SqlValue::Integer(i),
+                SqlValue::Integer(((i - 1) % 128) + 1),
+                SqlValue::Text(format!("post_{i:04}")),
+                SqlValue::Text(format!(
+                    "body for post {i:04} with enough text to span real pages"
+                )),
+                SqlValue::Blob(payload),
+                SqlValue::Integer(1),
+            ],
+        )
+        .await?;
+    }
+
+    for i in 1..=512 {
+        db.execute_async(
+            "INSERT INTO events VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                SqlValue::Integer(i),
+                SqlValue::Integer(((i - 1) % 768) + 1),
+                SqlValue::Text(if i % 2 == 0 { "view" } else { "edit" }.to_string()),
+                SqlValue::Text(format!(r#"{{"event":{i},"bucket":{}}}"#, i % 13)),
+                SqlValue::Integer(1),
+            ],
+        )
+        .await?;
+    }
+    db.execute_async("COMMIT", &[]).await?;
+
+    db.execute_async("BEGIN IMMEDIATE", &[]).await?;
+    db.execute_async(
+        "UPDATE users SET row_version = row_version + 10 WHERE id % 17 = 0",
+        &[],
+    )
+    .await?;
+    db.execute_async(
+        "UPDATE posts SET row_version = row_version + 3, body = body || ' updated' WHERE id % 19 = 0",
+        &[],
+    )
+    .await?;
+    db.execute_async("DELETE FROM events WHERE id % 11 = 0", &[])
+        .await?;
+    for i in 10001..=10032 {
+        db.execute_async(
+            "INSERT INTO posts VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                SqlValue::Integer(i),
+                SqlValue::Integer(((i - 10001) % 128) + 1),
+                SqlValue::Text(format!("late_post_{i}")),
+                SqlValue::Text("late insert after delete/update churn".to_string()),
+                SqlValue::Blob(vec![(i % 199) as u8; 1500]),
+                SqlValue::Integer(7),
+            ],
+        )
+        .await?;
+    }
+    db.execute_async("ANALYZE", &[]).await?;
+    db.execute_async("COMMIT", &[]).await?;
+    Ok(())
+}
+
+fn one_int_tuple(rows: &[Vec<SqlValue>], label: &str) -> Result<Vec<i64>> {
+    let row = rows
+        .first()
+        .ok_or_else(|| anyhow!("{label}: expected one row"))?;
+    row.iter()
+        .map(|value| match value {
+            SqlValue::Integer(n) => Ok(*n),
+            other => Err(anyhow!("{label}: expected integer, got {:?}", other)),
+        })
+        .collect()
+}
+
+async fn canonical_checksum(db: &HaQLite) -> Result<String> {
+    let users = one_int_tuple(
+        &db.query_values_fresh(
+            "SELECT COUNT(*), SUM(id), SUM(row_version), SUM(length(name) + length(email)) FROM users",
+            &[],
+        )
+        .await?,
+        "users checksum",
+    )?;
+    let posts = one_int_tuple(
+        &db.query_values_fresh(
+            "SELECT COUNT(*), SUM(id), SUM(user_id), SUM(row_version), SUM(length(body)), SUM(length(payload)) FROM posts",
+            &[],
+        )
+        .await?,
+        "posts checksum",
+    )?;
+    let events = one_int_tuple(
+        &db.query_values_fresh(
+            "SELECT COUNT(*), SUM(id), SUM(post_id), SUM(row_version), SUM(length(kind) + length(meta)) FROM events",
+            &[],
+        )
+        .await?,
+        "events checksum",
+    )?;
+    Ok(format!("users={users:?};posts={posts:?};events={events:?}"))
+}
+
+async fn wait_for_checksum(db: &HaQLite, expected: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last: Option<String> = None;
+    while Instant::now() < deadline {
+        match canonical_checksum(db).await {
+            Ok(checksum) if checksum == expected => return Ok(()),
+            Ok(checksum) => last = Some(checksum),
+            Err(e) => last = Some(format!("error: {e}")),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow!(
+        "timed out waiting for canonical checksum; expected={expected}; last={}",
+        last.unwrap_or_else(|| "<none>".to_string())
+    ))
+}
+
+async fn close_node_for_test(node: &mut BuiltNode) {
+    node.db.close().await.expect("clean haqlite test shutdown");
 }
 
 async fn dump_replication_state(
@@ -106,6 +315,125 @@ async fn dump_replication_state(
         }
         None => format!("manifest=<none> wal_keys={:?}", wal_keys),
     }
+}
+
+#[cfg(feature = "s3")]
+async fn dump_storage_backed_replication_state(
+    manifest_store: &Arc<dyn ManifestStore>,
+    manifest_key: &str,
+    walrust_storage: &Arc<dyn hadb_storage::StorageBackend>,
+) -> String {
+    let manifest = manifest_store
+        .get(manifest_key)
+        .await
+        .map_err(|e| anyhow!("manifest get failed: {e}"));
+    let wal_keys = walrust_storage
+        .list("", None)
+        .await
+        .map_err(|e| anyhow!("walrust list failed: {e}"));
+
+    let manifest_summary = match manifest {
+        Ok(Some(m)) => match turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&m.payload) {
+            Ok((decoded, walrust)) => format!(
+                "envelope_version={} writer_id={} decoded_version={} page_count={} groups={} change_counter={} walrust={:?}",
+                m.version,
+                m.writer_id,
+                decoded.version,
+                decoded.page_count,
+                decoded.page_group_keys.len(),
+                decoded.change_counter,
+                walrust
+            ),
+            Err(e) => format!(
+                "envelope_version={} writer_id={} decode_error={e}",
+                m.version, m.writer_id
+            ),
+        },
+        Ok(None) => "manifest=<none>".to_string(),
+        Err(e) => format!("manifest_error={e}"),
+    };
+
+    let wal_summary = match wal_keys {
+        Ok(mut keys) => {
+            keys.sort();
+            let total = keys.len();
+            let preview: Vec<_> = keys.into_iter().take(20).collect();
+            format!("wal_keys_total={total} wal_keys_preview={preview:?}")
+        }
+        Err(e) => format!("wal_keys_error={e}"),
+    };
+
+    format!("{manifest_summary}; {wal_summary}")
+}
+
+#[cfg(feature = "s3")]
+async fn diagnose_plain_walrust_replay(
+    vfs: &SharedTurboliteVfs,
+    manifest_store: &Arc<dyn ManifestStore>,
+    manifest_key: &str,
+    walrust_storage: &Arc<dyn hadb_storage::StorageBackend>,
+    db_name: &str,
+) -> String {
+    let Some(manifest) = (match manifest_store.get(manifest_key).await {
+        Ok(m) => m,
+        Err(e) => return format!("manifest_get_error={e}"),
+    }) else {
+        return "manifest=<none>".to_string();
+    };
+    let (decoded, Some((seq, prefix))) =
+        (match turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload) {
+            Ok(v) => v,
+            Err(e) => return format!("manifest_decode_error={e}"),
+        })
+    else {
+        return "manifest_has_no_walrust_cursor".to_string();
+    };
+
+    let tmp = match TempDir::new() {
+        Ok(tmp) => tmp,
+        Err(e) => return format!("tmp_error={e}"),
+    };
+    let db_path = tmp.path().join("plain-replay.db");
+    let shared = vfs.shared_state();
+    let materialize_path = db_path.clone();
+    let materialize = tokio::task::spawn_blocking(move || {
+        shared.materialize_manifest_to_file(&decoded, &materialize_path)
+    })
+    .await;
+    match materialize {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return format!("materialize_error={e}"),
+        Err(e) => return format!("materialize_panic={e}"),
+    }
+
+    let replay =
+        walrust::sync::pull_incremental(walrust_storage.as_ref(), &prefix, db_name, &db_path, seq)
+            .await;
+    let final_seq = match replay {
+        Ok(seq) => seq,
+        Err(e) => return format!("plain_pull_error={e}"),
+    };
+
+    let conn = match rusqlite::Connection::open(&db_path) {
+        Ok(conn) => conn,
+        Err(e) => return format!("plain_open_error={e}"),
+    };
+    let users: rusqlite::Result<(i64, i64)> = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(id), 0) FROM users",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+    let posts: rusqlite::Result<(i64, i64)> = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(id), 0) FROM posts",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+    let events: rusqlite::Result<(i64, i64)> = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(id), 0) FROM events",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+    format!("plain_pull_seq={seq}->{final_seq} users={users:?} posts={posts:?} events={events:?}")
 }
 
 fn local_vfs_state(vfs: &SharedTurboliteVfs) -> String {
@@ -137,6 +465,34 @@ fn raw_cache_snapshot(cache_path: &Path) -> String {
             format!("raw_cache(count={:?}, rows={:?})", count.ok(), rows.ok())
         }
         Err(e) => format!("raw_cache(open_error={e})"),
+    }
+}
+
+#[cfg(feature = "s3")]
+fn raw_canonical_cache_snapshot(cache_path: &Path) -> String {
+    match rusqlite::Connection::open_with_flags(
+        cache_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(conn) => {
+            let users: rusqlite::Result<(i64, i64)> = conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(id), 0) FROM users",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            );
+            let posts: rusqlite::Result<(i64, i64)> = conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(id), 0) FROM posts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            );
+            let events: rusqlite::Result<(i64, i64)> = conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(id), 0) FROM events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            );
+            format!("raw_cache users={users:?} posts={posts:?} events={events:?}")
+        }
+        Err(e) => format!("raw_cache open_error={e}"),
     }
 }
 
@@ -181,10 +537,7 @@ fn scan_for_restore_artifacts(dir: &Path) -> Vec<PathBuf> {
                 continue;
             }
             let lower = name.to_ascii_lowercase();
-            if lower.contains("restore")
-                || lower.ends_with(".sqlite")
-                || lower.ends_with(".db")
-            {
+            if lower.contains("restore") || lower.ends_with(".sqlite") || lower.ends_with(".db") {
                 hits.push(path);
             }
         }
@@ -488,6 +841,417 @@ async fn singlewriter_continuous_failover_promotes_and_keeps_writing() {
     .expect("continuous failover");
 }
 
+#[cfg(feature = "s3")]
+#[derive(Clone, Copy)]
+enum ObjectStorePostPromotionVisibility {
+    BaseOnly,
+    WalrustDelta,
+}
+
+#[cfg(feature = "s3")]
+async fn run_singlewriter_failover_on_object_storage(
+    durability: turbodb::Durability,
+    test_name: &str,
+    post_promotion_visibility: ObjectStorePostPromotionVisibility,
+) -> Result<()> {
+    let leader_tmp = TempDir::new().expect("leader tmp");
+    let follower_tmp = TempDir::new().expect("follower tmp");
+    let base_only_third_tmp = TempDir::new().expect("base-only third tmp");
+    let walrust_third_tmp = TempDir::new().expect("walrust third tmp");
+
+    let prefix = format!(
+        "test/singlewriter-object/{}/{}",
+        test_name,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    );
+    let tiered_storage = common::s3_backend(&format!("{}/pages", prefix)).await;
+    let walrust_storage = common::s3_backend(&format!("{}/wal", prefix)).await;
+
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store_impl = Arc::new(MemManifestStore::new());
+    let manifest_store: Arc<dyn ManifestStore> = manifest_store_impl.clone();
+
+    let mut leader = build_singlewriter_node(
+        leader_tmp.path(),
+        "failover",
+        durability.clone(),
+        lease_store.clone(),
+        manifest_store.clone(),
+        tiered_storage.clone(),
+        walrust_storage.clone(),
+        "object-leader",
+    )
+    .await;
+    wait_for_role(&leader.db, Role::Leader, Duration::from_secs(3)).await?;
+
+    let mut follower = build_singlewriter_node(
+        follower_tmp.path(),
+        "failover",
+        durability.clone(),
+        lease_store.clone(),
+        manifest_store.clone(),
+        tiered_storage.clone(),
+        walrust_storage.clone(),
+        "object-follower",
+    )
+    .await;
+    wait_for_role(&follower.db, Role::Follower, Duration::from_secs(3)).await?;
+
+    let mut base_only_third: Option<BuiltNode> = None;
+    let mut walrust_third: Option<BuiltNode> = None;
+
+    let result = async {
+        leader
+            .db
+            .execute_async(
+                "INSERT INTO t (id, val) VALUES (?1, ?2)",
+                &[
+                    SqlValue::Integer(1),
+                    SqlValue::Text("before-crash".to_string()),
+                ],
+            )
+            .await
+            .map_err(|e| anyhow!("object-store leader write before crash: {e}"))?;
+        wait_for_value(&follower.db, 1, "before-crash", Duration::from_secs(8)).await?;
+
+        leader
+            .db
+            .coordinator()
+            .ok_or_else(|| anyhow!("leader missing coordinator"))?
+            .abort_tasks_for_test()
+            .await;
+        wait_for_role(&follower.db, Role::Leader, Duration::from_secs(12)).await?;
+        wait_for_value(&follower.db, 1, "before-crash", Duration::from_secs(8)).await?;
+
+        follower
+            .db
+            .execute_async(
+                "INSERT INTO t (id, val) VALUES (?1, ?2)",
+                &[
+                    SqlValue::Integer(2),
+                    SqlValue::Text("after-promotion".to_string()),
+                ],
+            )
+            .await
+            .map_err(|e| anyhow!("object-store promoted follower write: {e}"))?;
+        wait_for_value(&follower.db, 2, "after-promotion", Duration::from_secs(8)).await?;
+
+        let third_empty_walrust = common::s3_backend(&format!("{}/third-empty-wal", prefix)).await;
+        base_only_third = Some(
+            build_singlewriter_node(
+                base_only_third_tmp.path(),
+                "failover",
+                durability.clone(),
+                lease_store.clone(),
+                manifest_store.clone(),
+                tiered_storage.clone(),
+                third_empty_walrust,
+                "object-base-only-third",
+            )
+            .await,
+        );
+        let base_only = base_only_third
+            .as_ref()
+            .expect("base-only third node initialized");
+        wait_for_role(&base_only.db, Role::Follower, Duration::from_secs(5)).await?;
+        wait_for_value(&base_only.db, 1, "before-crash", Duration::from_secs(12)).await?;
+
+        match post_promotion_visibility {
+            ObjectStorePostPromotionVisibility::BaseOnly => {
+                wait_for_value(&base_only.db, 2, "after-promotion", Duration::from_secs(12))
+                    .await?;
+            }
+            ObjectStorePostPromotionVisibility::WalrustDelta => {
+                let diagnostic_manifest_store = manifest_store.clone();
+                let diagnostic_walrust_storage = walrust_storage.clone();
+                walrust_third = Some(
+                    build_singlewriter_node(
+                        walrust_third_tmp.path(),
+                        "failover",
+                        durability,
+                        lease_store,
+                        manifest_store,
+                        tiered_storage,
+                        walrust_storage,
+                        "object-walrust-third",
+                    )
+                    .await,
+                );
+                let walrust = walrust_third
+                    .as_ref()
+                    .expect("walrust third node initialized");
+                wait_for_role(&walrust.db, Role::Follower, Duration::from_secs(5)).await?;
+                wait_for_value(&walrust.db, 1, "before-crash", Duration::from_secs(12)).await?;
+                if let Err(e) =
+                    wait_for_value(&walrust.db, 2, "after-promotion", Duration::from_secs(12)).await
+                {
+                    let state = dump_storage_backed_replication_state(
+                        &diagnostic_manifest_store,
+                        "test/failover/_manifest",
+                        &diagnostic_walrust_storage,
+                    )
+                    .await;
+                    return Err(anyhow!("{e}; replication_state_after_row2_wait={state}"));
+                }
+            }
+        }
+
+        Ok(())
+    }
+    .await;
+
+    if let Some(node) = walrust_third.as_mut() {
+        close_node_for_test(node).await;
+    }
+    if let Some(node) = base_only_third.as_mut() {
+        close_node_for_test(node).await;
+    }
+    close_node_for_test(&mut follower).await;
+    close_node_for_test(&mut leader).await;
+
+    result
+}
+
+#[cfg(feature = "s3")]
+async fn run_canonical_user_contract_on_object_storage(
+    durability: turbodb::Durability,
+    test_name: &str,
+    third_walrust_storage: Option<Arc<dyn hadb_storage::StorageBackend>>,
+    promote_before_third: bool,
+) -> Result<()> {
+    let leader_tmp = TempDir::new().expect("leader tmp");
+    let follower_tmp = TempDir::new().expect("follower tmp");
+    let third_tmp = TempDir::new().expect("third tmp");
+
+    let prefix = format!(
+        "test/singlewriter-canonical/{}/{}",
+        test_name,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    );
+    let tiered_storage = common::s3_backend(&format!("{}/pages", prefix)).await;
+    let walrust_storage = common::s3_backend(&format!("{}/wal", prefix)).await;
+
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let manifest_store_impl = Arc::new(MemManifestStore::new());
+    let manifest_store: Arc<dyn ManifestStore> = manifest_store_impl.clone();
+    let lease_ttl_secs = if promote_before_third { 2 } else { 60 };
+
+    let mut leader = build_singlewriter_node_with_schema(
+        leader_tmp.path(),
+        "canonical",
+        CANONICAL_SCHEMA,
+        durability.clone(),
+        lease_store.clone(),
+        manifest_store.clone(),
+        tiered_storage.clone(),
+        walrust_storage.clone(),
+        "canonical-leader",
+        lease_ttl_secs,
+    )
+    .await;
+    wait_for_role(&leader.db, Role::Leader, Duration::from_secs(3)).await?;
+
+    let mut follower = build_singlewriter_node_with_schema(
+        follower_tmp.path(),
+        "canonical",
+        CANONICAL_SCHEMA,
+        durability.clone(),
+        lease_store.clone(),
+        manifest_store.clone(),
+        tiered_storage.clone(),
+        walrust_storage.clone(),
+        "canonical-follower",
+        lease_ttl_secs,
+    )
+    .await;
+    wait_for_role(&follower.db, Role::Follower, Duration::from_secs(3)).await?;
+
+    let mut third: Option<BuiltNode> = None;
+    let result = async {
+        apply_canonical_workload(&leader.db)
+            .await
+            .map_err(|e| anyhow!("canonical leader workload failed: {e}"))?;
+        let expected = canonical_checksum(&leader.db).await?;
+        if let Err(e) = wait_for_checksum(&follower.db, &expected, Duration::from_secs(20)).await {
+            let state = dump_storage_backed_replication_state(
+                &manifest_store,
+                "test/canonical/_manifest",
+                &walrust_storage,
+            )
+            .await;
+            let plain = diagnose_plain_walrust_replay(
+                &leader.vfs,
+                &manifest_store,
+                "test/canonical/_manifest",
+                &walrust_storage,
+                "canonical",
+            )
+            .await;
+            return Err(anyhow!(
+                "{e}; replication_state_after_follower_wait={state}; {plain}"
+            ));
+        }
+
+        if promote_before_third {
+            leader
+                .db
+                .coordinator()
+                .ok_or_else(|| anyhow!("leader missing coordinator"))?
+                .abort_tasks_for_test()
+                .await;
+            wait_for_role(&follower.db, Role::Leader, Duration::from_secs(12)).await?;
+            wait_for_checksum(&follower.db, &expected, Duration::from_secs(12)).await?;
+        }
+
+        let third_walrust = third_walrust_storage.unwrap_or_else(|| walrust_storage.clone());
+        third = Some(
+            build_singlewriter_node_with_schema(
+                third_tmp.path(),
+                "canonical",
+                CANONICAL_SCHEMA,
+                durability,
+                lease_store,
+                manifest_store.clone(),
+                tiered_storage,
+                third_walrust,
+                "canonical-third",
+                lease_ttl_secs,
+            )
+            .await,
+        );
+        let third = third.as_ref().expect("third node initialized");
+        wait_for_role(&third.db, Role::Follower, Duration::from_secs(5)).await?;
+        if let Err(e) = wait_for_checksum(&third.db, &expected, Duration::from_secs(20)).await {
+            let state = dump_storage_backed_replication_state(
+                &manifest_store,
+                "test/canonical/_manifest",
+                &walrust_storage,
+            )
+            .await;
+            let plain = diagnose_plain_walrust_replay(
+                &leader.vfs,
+                &manifest_store,
+                "test/canonical/_manifest",
+                &walrust_storage,
+                "canonical",
+            )
+            .await;
+            let raw = raw_canonical_cache_snapshot(&third.vfs.cache_file_path());
+            return Err(anyhow!(
+                "{e}; replication_state_after_third_wait={state}; {plain}; third_{raw}"
+            ));
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Some(node) = third.as_mut() {
+        close_node_for_test(node).await;
+    }
+    close_node_for_test(&mut follower).await;
+    close_node_for_test(&mut leader).await;
+
+    result
+}
+
+#[cfg(feature = "s3")]
+#[tokio::test(flavor = "multi_thread")]
+async fn singlewriter_checkpoint_failover_works_on_object_storage() {
+    if !common::s3_env_available() {
+        eprintln!("skipping object-storage failover test: TIERED_TEST_BUCKET is not set");
+        return;
+    }
+
+    let _guard = FAILOVER_TEST_LOCK.lock().await;
+    run_singlewriter_failover_on_object_storage(
+        turbodb::Durability::Checkpoint(turbodb::CheckpointConfig::default()),
+        "checkpoint",
+        ObjectStorePostPromotionVisibility::BaseOnly,
+    )
+    .await
+    .expect("checkpoint object-storage failover");
+}
+
+#[cfg(feature = "s3")]
+#[tokio::test(flavor = "multi_thread")]
+async fn singlewriter_continuous_failover_works_on_object_storage() {
+    if !common::s3_env_available() {
+        eprintln!("skipping object-storage failover test: TIERED_TEST_BUCKET is not set");
+        return;
+    }
+
+    let _guard = FAILOVER_TEST_LOCK.lock().await;
+    run_singlewriter_failover_on_object_storage(
+        turbodb::Durability::Continuous {
+            checkpoint: Default::default(),
+            replication_interval: Duration::from_millis(50),
+        },
+        "continuous",
+        ObjectStorePostPromotionVisibility::WalrustDelta,
+    )
+    .await
+    .expect("continuous object-storage failover");
+}
+
+#[cfg(feature = "s3")]
+#[tokio::test(flavor = "multi_thread")]
+async fn singlewriter_checkpoint_canonical_workload_works_on_object_storage() {
+    if !common::s3_env_available() {
+        eprintln!(
+            "skipping canonical checkpoint object-storage test: TIERED_TEST_BUCKET is not set"
+        );
+        return;
+    }
+
+    let _guard = FAILOVER_TEST_LOCK.lock().await;
+    let empty_walrust = common::s3_backend(&format!(
+        "test/singlewriter-canonical/checkpoint-empty-wal/{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ))
+    .await;
+    run_canonical_user_contract_on_object_storage(
+        turbodb::Durability::Checkpoint(turbodb::CheckpointConfig::default()),
+        "checkpoint",
+        Some(empty_walrust),
+        true,
+    )
+    .await
+    .expect("checkpoint canonical object-storage user contract");
+}
+
+#[cfg(feature = "s3")]
+#[tokio::test(flavor = "multi_thread")]
+async fn singlewriter_continuous_canonical_workload_works_on_object_storage() {
+    if !common::s3_env_available() {
+        eprintln!(
+            "skipping canonical continuous object-storage test: TIERED_TEST_BUCKET is not set"
+        );
+        return;
+    }
+
+    let _guard = FAILOVER_TEST_LOCK.lock().await;
+    run_canonical_user_contract_on_object_storage(
+        turbodb::Durability::Continuous {
+            checkpoint: Default::default(),
+            replication_interval: Duration::from_millis(50),
+        },
+        "continuous",
+        None,
+        false,
+    )
+    .await
+    .expect("continuous canonical object-storage user contract");
+}
+
 /// A no-op manifest poll (same version, no walrust) must not
 /// rewrite `data.cache`. Uses checkpoint durability because the
 /// skip is gated on `walrust.is_none()`.
@@ -699,10 +1463,7 @@ async fn follower_reads_remain_consistent_during_concurrent_materialize() {
                 leader_db
                     .execute_async(
                         "INSERT INTO t (id, val) VALUES (?1, ?2)",
-                        &[
-                            SqlValue::Integer(i),
-                            SqlValue::Text(format!("row-{}", i)),
-                        ],
+                        &[SqlValue::Integer(i), SqlValue::Text(format!("row-{}", i))],
                     )
                     .await
                     .expect("leader concurrent insert");
@@ -878,9 +1639,8 @@ async fn singlewriter_promotion_publishes_usable_base() {
             .expect("manifest_store get post-promotion")
             .expect("post-promotion manifest exists")
             .payload;
-        let (m, walrust_now) =
-            turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
-                .expect("decode post-promotion manifest");
+        let (m, walrust_now) = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
+            .expect("decode post-promotion manifest");
         let cursor_now = walrust_now.as_ref().map(|(seq, _)| *seq);
         let cursor_advanced = match (pre_walrust_cursor, cursor_now) {
             (Some(pre), Some(now)) => now > pre,
@@ -1136,8 +1896,7 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
             .payload;
         let (m, _) = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
             .expect("decode post-promotion manifest");
-        let post_keys: std::collections::HashSet<&String> =
-            m.page_group_keys.iter().collect();
+        let post_keys: std::collections::HashSet<&String> = m.page_group_keys.iter().collect();
         let has_new_key = post_keys
             .iter()
             .any(|k| !k.is_empty() && !pre_keys.contains(*k));
@@ -1175,7 +1934,8 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
         !new_keys.is_empty(),
         "post-promotion manifest must carry at least one fresh page-group key \
          (the flush of accumulated replay state). pre_keys={:?} post_keys={:?}",
-        pre_keys, post_manifest.page_group_keys
+        pre_keys,
+        post_manifest.page_group_keys
     );
     assert!(
         post_walrust_cursor.is_some(),
@@ -1312,10 +2072,7 @@ async fn follower_apply_is_atomic_under_missing_page_group_race() {
             .db
             .execute_async(
                 "INSERT INTO t (id, val) VALUES (?1, ?2)",
-                &[
-                    SqlValue::Integer(i),
-                    SqlValue::Text(format!("seed-{}", i)),
-                ],
+                &[SqlValue::Integer(i), SqlValue::Text(format!("seed-{}", i))],
             )
             .await
             .expect("seed insert");
@@ -1412,6 +2169,11 @@ async fn follower_apply_is_atomic_under_missing_page_group_race() {
         pre_cache_mtime, mid_cache_mtime,
         "data.cache mtime advanced during failed apply"
     );
+    assert!(
+        !follower.db.is_caught_up(),
+        "follower must not report caught-up while a newer manifest is known but \
+         page-group materialization is retrying"
+    );
 
     // Reads during the paused window must still succeed and return
     // the pre-pause snapshot.
@@ -1437,4 +2199,8 @@ async fn follower_apply_is_atomic_under_missing_page_group_race() {
     wait_for_count(&follower.db, 15, Duration::from_secs(5))
         .await
         .expect("follower converges after storage unpauses");
+    assert!(
+        follower.db.is_caught_up(),
+        "follower should report caught-up after the retry succeeds"
+    );
 }

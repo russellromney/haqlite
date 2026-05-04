@@ -5,14 +5,14 @@
 //! # async fn main() -> anyhow::Result<()> {
 //! use haqlite::{HaQLite, SqlValue};
 //!
-//! let db = HaQLite::builder()
+//! let mut db = HaQLite::builder()
 //!     .lease_store(my_lease_store)
 //!     .walrust_storage(my_storage)
 //!     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);")
 //!     .await?;
 //!
 //! db.execute("INSERT INTO users (name) VALUES (?1)", &[SqlValue::Text("Alice".into())])?;
-//! let count: i64 = db.query_row("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;
+//! let count: i64 = db.query_row_local("SELECT COUNT(*) FROM users", &[], |r| r.get(0))?;
 //! # Ok(())
 //! # }
 //! ```
@@ -90,14 +90,16 @@ pub use hadb::{validate_mode_durability, validate_mode_role, Durability, HaMode}
 
 /// Builder for creating an HA SQLite instance.
 ///
-/// Only the bucket is required — everything else has sensible defaults.
+/// SingleWriter mode requires an explicit lease store and WAL storage.
 ///
 /// ```no_run
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
 /// use haqlite::HaQLite;
 ///
-/// let db = HaQLite::builder()
+/// let mut db = HaQLite::builder()
+///     .lease_store(my_lease_store)
+///     .walrust_storage(my_storage)
 ///     .prefix("myapp/")
 ///     .forwarding_port(19000)
 ///     .open("/data/my.db", "CREATE TABLE IF NOT EXISTS ...")
@@ -423,9 +425,6 @@ impl HaQLiteBuilder {
             .map_err(|e| anyhow::anyhow!("invalid mode/role combination: {e}"))?;
 
         match (self.mode, self.role) {
-            (HaMode::SingleWriter, Some(Role::Client)) => {
-                anyhow::bail!("Client mode not yet implemented in base haqlite")
-            }
             (HaMode::SharedWriter, Some(Role::Client)) => {
                 anyhow::bail!("Client mode not yet implemented in base haqlite")
             }
@@ -434,7 +433,10 @@ impl HaQLiteBuilder {
                     "SharedWriter not implemented in base haqlite - would require sync WAL replication before commit ack"
                 )
             }
-            (HaMode::SingleWriter, None | Some(Role::Leader) | Some(Role::Follower)) => {}
+            (
+                HaMode::SingleWriter,
+                None | Some(Role::Leader) | Some(Role::Follower) | Some(Role::Client),
+            ) => {}
             (HaMode::SingleWriter, Some(Role::LatentWriter))
             | (HaMode::SharedWriter, Some(Role::Leader | Role::Follower)) => {
                 unreachable!("mode/role validation should reject this combination")
@@ -490,6 +492,7 @@ impl HaQLiteBuilder {
             lease_cfg.follower_poll_interval = d;
         }
         config.lease = Some(lease_cfg);
+        config.requested_role = self.role;
 
         let (sync_interval, skip_snapshot) = match walrust_durability {
             hadb::Durability::Replicated(dur) => (dur, false),
@@ -534,6 +537,7 @@ impl HaQLiteBuilder {
             None,
             None,
             None,
+            false,
         )
         .await
     }
@@ -785,6 +789,31 @@ impl HaQLiteInner {
         }
         open_leader_connection(&self.db_path)
             .map_err(|e| HaQLiteError::DatabaseError(format!("open leader connection: {e}")))
+    }
+
+    fn apply_schema_if_needed(&self, conn: &rusqlite::Connection) -> Result<(), HaQLiteError> {
+        if self.schema_applied.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let Some(schema) = self.schema_sql.as_deref() else {
+            self.schema_applied.store(true, Ordering::SeqCst);
+            return Ok(());
+        };
+
+        if !schema.trim().is_empty() {
+            conn.execute_batch(schema).map_err(|e| {
+                HaQLiteError::DatabaseError(format!("apply schema after join failed: {e}"))
+            })?;
+            if let Some(ref callback) = self.on_flush {
+                callback().map_err(|e| {
+                    HaQLiteError::DatabaseError(format!("flush after schema failed: {e}"))
+                })?;
+            }
+        }
+
+        self.schema_applied.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     fn leader_addr(&self) -> std::result::Result<String, HaQLiteError> {
@@ -1049,10 +1078,11 @@ impl HaQLite {
             forward_timeout,
             secret,
             DEFAULT_READ_CONCURRENCY,
-            None, // no custom authorizer for from_coordinator
-            None, // no custom connection opener
-            None, // no custom follower read opener
-            None, // no tiered storage flush
+            None,  // no custom authorizer for from_coordinator
+            None,  // no custom connection opener
+            None,  // no custom follower read opener
+            None,  // no tiered storage flush
+            false, // schema was applied by the plain bootstrap connection
         )
         .await
     }
@@ -1165,7 +1195,7 @@ impl HaQLite {
                 conn.query_row(sql, params, f)
                     .map_err(|e| HaQLiteError::DatabaseError(format!("query_row failed: {e}")))
             }
-            Some(Role::Follower) => {
+            Some(Role::Follower) | Some(Role::Client) => {
                 // Bound concurrent follower reads via semaphore.
                 let _permit = self
                     .inner
@@ -1184,9 +1214,6 @@ impl HaQLite {
                 conn.query_row(sql, params, f)
                     .map_err(|e| HaQLiteError::DatabaseError(format!("query_row failed: {e}")))
             }
-            Some(Role::Client) => Err(HaQLiteError::ConfigurationError(
-                "Client mode not yet implemented in base haqlite".into(),
-            )),
             Some(Role::LatentWriter) => Err(HaQLiteError::ConfigurationError(
                 "LatentWriter requires SharedWriter mode".into(),
             )),
@@ -1258,7 +1285,7 @@ impl HaQLite {
                 let conn = conn_arc.lock();
                 query_with(&conn)
             }
-            Some(Role::Follower) => {
+            Some(Role::Follower) | Some(Role::Client) => {
                 let _permit = self
                     .inner
                     .read_semaphore
@@ -1272,9 +1299,6 @@ impl HaQLite {
                 let conn = self.inner.open_follower_read_conn()?;
                 query_with(&conn)
             }
-            Some(Role::Client) => Err(HaQLiteError::ConfigurationError(
-                "Client mode not yet implemented in base haqlite".into(),
-            )),
             Some(Role::LatentWriter) => Err(HaQLiteError::ConfigurationError(
                 "LatentWriter requires SharedWriter mode".into(),
             )),
@@ -1355,8 +1379,10 @@ impl HaQLite {
     pub fn is_caught_up(&self) -> bool {
         match self.inner.current_role() {
             Some(Role::Leader) | None => true,
-            Some(Role::Follower) => self.inner.follower_caught_up.load(Ordering::SeqCst),
-            Some(Role::Client) | Some(Role::LatentWriter) => false,
+            Some(Role::Follower) | Some(Role::Client) => {
+                self.inner.follower_caught_up.load(Ordering::SeqCst)
+            }
+            Some(Role::LatentWriter) => false,
         }
     }
 
@@ -1436,8 +1462,13 @@ impl HaQLite {
             drop(conn_arc.lock());
         }
 
-        // 4. Flush tiered storage pages if a sibling crate registered an on_flush callback.
-        self.flush_turbolite()?;
+        // 4. Flush tiered storage pages if this instance can have local writes.
+        // Followers only read/apply remote state; asking them to publish on
+        // shutdown can call into writer-only replication paths they never
+        // registered.
+        if matches!(self.inner.current_role(), Some(Role::Leader) | None) {
+            self.flush_turbolite()?;
+        }
 
         // 5. Leave the cluster while the SQLite connection is still open.
         // walrust's final sync reads the live WAL during coordinator.leave();
@@ -1676,6 +1707,12 @@ impl HaQLite {
                         "failed to parse leader response: {e}"
                     ))
                 })?;
+                tracing::debug!(
+                    db = %self.inner.db_name,
+                    leader_addr = %leader_addr,
+                    rows_affected = result.rows_affected,
+                    "forwarded execute acknowledged by leader"
+                );
                 return Ok(result.rows_affected);
             }
 
@@ -1734,16 +1771,22 @@ pub async fn open_with_coordinator(
         Arc<dyn Fn() -> Result<rusqlite::Connection, HaQLiteError> + Send + Sync>,
     >,
     on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
+    schema_already_applied_after_join: bool,
 ) -> Result<HaQLite> {
-    let bootstrap_conn = ensure_schema(&db_path, schema, connection_opener.as_ref())?;
+    let custom_connection_opener = connection_opener.is_some();
+    let bootstrap_conn = if custom_connection_opener {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        None
+    } else {
+        ensure_schema(&db_path, schema, None)?
+    };
 
-    // Drop the bootstrap connection BEFORE coordinator.join. join()
-    // calls Replicator::pull on followers, which (for direct hybrid
-    // page replay) drives finalize → replay_gate.write(). A live
-    // bootstrap_conn parked at xLock=Shared holds a read_arc on the
-    // same gate and would deadlock the join. The leader path reopens
-    // through `try_open_leader_conn` once the role is known; the
-    // schema is durable in the VFS at this point.
+    // Drop the bootstrap connection BEFORE coordinator.join. For
+    // custom VFS-backed openers we also skip pre-join schema writes:
+    // the join path acquires the HA lease/fence, and only then may
+    // turbolite safely flush schema pages to remote storage.
     drop(bootstrap_conn);
 
     // Subscribe to role events BEFORE join.
@@ -1776,9 +1819,8 @@ pub async fn open_with_coordinator(
         role: AtomicU8::new(match initial_role {
             Role::Leader => ROLE_LEADER,
             Role::Follower => ROLE_FOLLOWER,
-            Role::Client | Role::LatentWriter => {
-                unreachable!("Coordinator join only yields Leader or Follower")
-            }
+            Role::Client => ROLE_CLIENT,
+            Role::LatentWriter => unreachable!("Coordinator join only yields valid HA roles"),
         }),
         conn: arc_swap::ArcSwapOption::new(None),
         leader_address: RwLock::new(leader_addr),
@@ -1797,8 +1839,11 @@ pub async fn open_with_coordinator(
         cached_manifest_version: AtomicU64::new(0),
         write_timeout: DEFAULT_FORWARD_TIMEOUT,
         lease_ttl: 5,
-        schema_sql: None,
-        schema_applied: AtomicBool::new(true),
+        schema_sql: (custom_connection_opener && !schema_already_applied_after_join)
+            .then(|| schema.to_string()),
+        schema_applied: AtomicBool::new(
+            !custom_connection_opener || schema_already_applied_after_join,
+        ),
         authorizer,
         forwarding_mode,
         fwd_handle: tokio::sync::Mutex::new(None),
@@ -1814,6 +1859,7 @@ pub async fn open_with_coordinator(
         match inner.try_open_leader_conn() {
             Ok(conn) => {
                 inner.apply_initial_authorizer(&conn);
+                inner.apply_schema_if_needed(&conn)?;
                 inner.set_conn(Some(Arc::new(Mutex::new(conn))));
             }
             Err(e) => {
@@ -1862,11 +1908,28 @@ pub async fn run_role_listener(
                 if inner.get_conn().ok().flatten().is_some() {
                     // Connection already exists (was fenced). Unfence it.
                     inner.unfence_connection();
+                    if let Ok(Some(conn_arc)) = inner.get_conn() {
+                        let conn = conn_arc.lock();
+                        if let Err(e) = inner.apply_schema_if_needed(&conn) {
+                            tracing::error!(
+                                "HaQLite: failed to apply schema on promotion for '{}': {}",
+                                db_name,
+                                e
+                            );
+                        }
+                    }
                 } else {
                     // No connection (first promotion or after sleep). Open one.
                     match inner.try_open_leader_conn() {
                         Ok(conn) => {
                             inner.apply_initial_authorizer(&conn);
+                            if let Err(e) = inner.apply_schema_if_needed(&conn) {
+                                tracing::error!(
+                                    "HaQLite: failed to apply schema on promotion for '{}': {}",
+                                    db_name,
+                                    e
+                                );
+                            }
                             inner.set_conn(Some(Arc::new(Mutex::new(conn))));
                         }
                         Err(e) => {
