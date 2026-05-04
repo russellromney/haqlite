@@ -28,6 +28,8 @@ pub struct TurboliteFollowerBehavior {
     walrust_storage: Option<Arc<dyn StorageBackend>>,
     walrust_prefix: Option<String>,
     wakeup: Option<Arc<tokio::sync::Notify>>,
+    replay_base_seq: Option<Arc<AtomicU64>>,
+    replay_base_pending_publish: Option<Arc<AtomicBool>>,
 }
 
 impl TurboliteFollowerBehavior {
@@ -39,6 +41,8 @@ impl TurboliteFollowerBehavior {
             walrust_storage: None,
             walrust_prefix: None,
             wakeup: None,
+            replay_base_seq: None,
+            replay_base_pending_publish: None,
         }
     }
 
@@ -64,6 +68,16 @@ impl TurboliteFollowerBehavior {
 
     pub fn with_wakeup(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
         self.wakeup = Some(notify);
+        self
+    }
+
+    pub fn with_replay_base_tracking(
+        mut self,
+        seq: Arc<AtomicU64>,
+        pending_publish: Arc<AtomicBool>,
+    ) -> Self {
+        self.replay_base_seq = Some(seq);
+        self.replay_base_pending_publish = Some(pending_publish);
         self
     }
 
@@ -111,6 +125,8 @@ impl TurboliteFollowerBehavior {
         let gate = self.vfs.replay_gate();
         let payload_owned = payload.to_vec();
         let db_name_owned = db_name.to_string();
+        let replay_base_seq = self.replay_base_seq.clone();
+        let replay_base_pending_publish = self.replay_base_pending_publish.clone();
 
         // Materialize before set_manifest_bytes: pre-flighting
         // fetches BEFORE the only-mutation step keeps a missing-group
@@ -206,6 +222,14 @@ impl TurboliteFollowerBehavior {
                     replay_start_seq,
                     final_seq,
                 );
+                if final_seq > replay_start_seq {
+                    if let (Some(seq), Some(pending)) =
+                        (replay_base_seq, replay_base_pending_publish)
+                    {
+                        seq.store(final_seq, Ordering::Release);
+                        pending.store(true, Ordering::Release);
+                    }
+                }
                 return Ok(ApplyOutcome::Applied(final_seq));
             }
 

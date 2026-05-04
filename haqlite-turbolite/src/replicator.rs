@@ -1,5 +1,6 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -321,6 +322,9 @@ pub struct TurboliteWalReplicator {
     walrust_prefix: String,
     walrust_storage: Arc<dyn StorageBackend>,
     walrust: Arc<haqlite::ExternalSnapshotSqliteReplicator>,
+    replay_base_seq: Arc<AtomicU64>,
+    replay_base_pending_publish: Arc<AtomicBool>,
+    live_wal_path: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl TurboliteWalReplicator {
@@ -334,6 +338,8 @@ impl TurboliteWalReplicator {
         walrust_prefix: String,
         walrust_storage: Arc<dyn StorageBackend>,
         walrust: Arc<haqlite::ExternalSnapshotSqliteReplicator>,
+        replay_base_seq: Arc<AtomicU64>,
+        replay_base_pending_publish: Arc<AtomicBool>,
     ) -> Self {
         Self {
             vfs,
@@ -343,6 +349,9 @@ impl TurboliteWalReplicator {
             walrust_prefix,
             walrust_storage,
             walrust,
+            replay_base_seq,
+            replay_base_pending_publish,
+            live_wal_path: Mutex::new(None),
         }
     }
 
@@ -371,7 +380,22 @@ impl TurboliteWalReplicator {
             .ok_or_else(|| anyhow!("walrust database '{}' is not registered", name))
     }
 
-    async fn publish_current_manifest(&self, name: &str) -> Result<()> {
+    async fn live_wal_has_frames(&self) -> bool {
+        let wal_path = self
+            .live_wal_path
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(wal_path) = wal_path else {
+            return false;
+        };
+        walrust::wal::get_wal_size(&wal_path)
+            .await
+            .map(|size| size > 32)
+            .unwrap_or(false)
+    }
+
+    async fn publish_current_manifest(&self, name: &str, has_new_wal_frames: bool) -> Result<()> {
         let current_manifest = self.vfs.manifest();
         if !should_publish_manifest(&self.vfs) {
             return Err(anyhow!(
@@ -387,19 +411,31 @@ impl TurboliteWalReplicator {
         // expects WAL frames after that cursor, not after the
         // latest in-memory walrust seq.
         let current_walrust_seq = self.current_walrust_seq(name).await?;
-        let walrust_seq =
-            if let Some(existing) = self.manifest_store.get(&self.manifest_key).await? {
-                match turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&existing.payload) {
-                    Ok((published_manifest, Some((published_seq, _))))
-                        if published_manifest.version == current_manifest.version =>
-                    {
-                        published_seq
-                    }
-                    Ok(_) | Err(_) => current_walrust_seq,
+        let live_wal_has_frames = self.live_wal_has_frames().await;
+        let mut used_pending_replay_base = false;
+        let walrust_seq = if let Some(existing) = self.manifest_store.get(&self.manifest_key).await?
+        {
+            match turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&existing.payload) {
+                Ok((published_manifest, Some((published_seq, _))))
+                    if published_manifest.version == current_manifest.version =>
+                {
+                    published_seq
                 }
-            } else {
-                current_walrust_seq
-            };
+                Ok(_) | Err(_) if self.replay_base_pending_publish.load(Ordering::Acquire) => {
+                    used_pending_replay_base = true;
+                    self.replay_base_seq.load(Ordering::Acquire)
+                }
+                Ok((_published_manifest, Some((published_seq, _))))
+                    if has_new_wal_frames
+                        || (live_wal_has_frames && current_walrust_seq > published_seq) =>
+                {
+                    published_seq
+                }
+                Ok(_) | Err(_) => current_walrust_seq,
+            }
+        } else {
+            current_walrust_seq
+        };
 
         // Route through `publish_replayed_base`. For a leader that
         // checkpointed via the SQLite write path, pending replay
@@ -421,7 +457,14 @@ impl TurboliteWalReplicator {
             &self.writer_id,
             payload,
         )
-        .await
+        .await?;
+
+        if used_pending_replay_base {
+            self.replay_base_pending_publish
+                .store(false, Ordering::Release);
+        }
+
+        Ok(())
     }
 
     async fn ensure_base_manifest(&self, name: &str, path: &Path) -> Result<()> {
@@ -471,7 +514,7 @@ impl TurboliteWalReplicator {
                 .map_err(|e| anyhow!("turbolite import failed: {}", e))?;
         }
 
-        self.publish_current_manifest(name).await
+        self.publish_current_manifest(name, false).await
     }
 
     async fn restore_from_manifest(&self, name: &str, _path: &Path) -> Result<()> {
@@ -511,6 +554,8 @@ impl TurboliteWalReplicator {
             let payload_for_attempt = payload_owned.clone();
             let decoded_manifest_for_attempt = decoded_manifest.clone();
             let name_owned = name.to_string();
+            let replay_base_seq = self.replay_base_seq.clone();
+            let replay_base_pending_publish = self.replay_base_pending_publish.clone();
             let attempt = tokio::task::spawn_blocking(move || -> Result<()> {
                 let _gate = loop {
                     if let Some(guard) = gate.try_write() {
@@ -542,6 +587,10 @@ impl TurboliteWalReplicator {
                     walrust_seq,
                     final_seq
                 );
+                if final_seq > walrust_seq {
+                    replay_base_seq.store(final_seq, Ordering::Release);
+                    replay_base_pending_publish.store(true, Ordering::Release);
+                }
 
                 Ok(())
             })
@@ -570,6 +619,9 @@ impl Replicator for TurboliteWalReplicator {
     async fn add(&self, name: &str, path: &Path) -> Result<()> {
         let cache_path = self.vfs.cache_file_path();
         let wal_path = self.live_wal_path(path)?;
+        if let Ok(mut guard) = self.live_wal_path.lock() {
+            *guard = Some(wal_path.clone());
+        }
         self.walrust
             .add_with_wal_path(name, &cache_path, &wal_path)
             .await?;
@@ -579,6 +631,9 @@ impl Replicator for TurboliteWalReplicator {
     async fn add_continuing(&self, name: &str, path: &Path) -> Result<()> {
         let cache_path = self.vfs.cache_file_path();
         let wal_path = self.live_wal_path(path)?;
+        if let Ok(mut guard) = self.live_wal_path.lock() {
+            *guard = Some(wal_path.clone());
+        }
         self.walrust
             .add_without_snapshot_with_wal_path(name, &cache_path, &wal_path)
             .await?;
@@ -588,7 +643,7 @@ impl Replicator for TurboliteWalReplicator {
         // replay state now so a fresh follower joining before the
         // next commit still sees the replayed pages in the
         // published base.
-        self.publish_current_manifest(name).await
+        self.publish_current_manifest(name, false).await
     }
 
     async fn pull(&self, name: &str, path: &Path) -> Result<()> {
@@ -596,13 +651,27 @@ impl Replicator for TurboliteWalReplicator {
     }
 
     async fn remove(&self, name: &str) -> Result<()> {
-        self.walrust.sync(name).await?;
-        self.publish_current_manifest(name).await?;
+        let frames = self.walrust.inner().flush(name).await?;
+        if frames > 0 {
+            tracing::info!(
+                "TurboliteWalReplicator::remove('{}') flushed {} frames",
+                name,
+                frames,
+            );
+        }
+        self.publish_current_manifest(name, frames > 0).await?;
         self.walrust.remove(name).await
     }
 
     async fn sync(&self, name: &str) -> Result<()> {
-        self.walrust.sync(name).await?;
-        self.publish_current_manifest(name).await
+        let frames = self.walrust.inner().flush(name).await?;
+        if frames > 0 {
+            tracing::info!(
+                "TurboliteWalReplicator::sync('{}') flushed {} frames",
+                name,
+                frames,
+            );
+        }
+        self.publish_current_manifest(name, frames > 0).await
     }
 }

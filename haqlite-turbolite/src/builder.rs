@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -612,6 +613,9 @@ impl Builder {
                 self.inner.get_prefix()
             };
 
+        let replay_base_seq = Arc::new(AtomicU64::new(0));
+        let replay_base_pending_publish = Arc::new(AtomicBool::new(false));
+
         // Pick replicator. Three sources, in priority order:
         // 1. Caller-supplied via `.replicator(...)` (test harnesses, alt WAL shippers).
         // 2. `Cloud` durability → `NoOpReplicator`.
@@ -669,6 +673,8 @@ impl Builder {
                             .expect("continuous durability validated walrust storage")
                             .clone(),
                         delta_replicator,
+                        replay_base_seq.clone(),
+                        replay_base_pending_publish.clone(),
                     ))
                 }
             }
@@ -698,6 +704,10 @@ impl Builder {
                                 .expect("continuous durability validated walrust storage")
                                 .clone(),
                             walrust_prefix.to_string(),
+                        )
+                        .with_replay_base_tracking(
+                            replay_base_seq.clone(),
+                            replay_base_pending_publish.clone(),
                         );
                 }
             }

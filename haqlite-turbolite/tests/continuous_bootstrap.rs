@@ -156,6 +156,47 @@ fn make_remote_vfs(
     (shared_vfs, vfs_name)
 }
 
+async fn open_continuous_remote(
+    cache_dir: &std::path::Path,
+    db_file: &str,
+    instance_id: &str,
+    forwarding_port: u16,
+    lease_store: Arc<InMemoryLeaseStore>,
+    manifest_store: Arc<dyn ManifestStore>,
+    walrust_storage: Arc<dyn StorageBackend>,
+    tiered_storage: Arc<dyn StorageBackend>,
+) -> haqlite::HaQLite {
+    let db_path = cache_dir.join(db_file);
+    let (vfs, vfs_name) = make_remote_vfs(cache_dir, tiered_storage);
+    Builder::new()
+        .prefix("test/")
+        .mode(HaMode::SingleWriter)
+        .durability(turbodb::Durability::Continuous {
+            checkpoint: Default::default(),
+            replication_interval: Duration::from_millis(50),
+        })
+        .lease_store(lease_store)
+        .manifest_store(manifest_store)
+        .walrust_storage(walrust_storage)
+        .turbolite_vfs(vfs, &vfs_name)
+        .instance_id(instance_id)
+        .forwarding_port(forwarding_port)
+        .open(db_path.to_str().expect("path"), SCHEMA)
+        .await
+        .expect("open continuous mode")
+}
+
+fn max_physical_wal_seq(keys: &[String]) -> u64 {
+    keys.iter()
+        .filter_map(|key| {
+            let name = key.rsplit('/').next()?;
+            let hex = name.strip_suffix(".hadbp")?;
+            u64::from_str_radix(hex, 16).ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 async fn assert_manifest_page_groups_exist(
     vfs: &SharedTurboliteVfs,
     manifest: &Manifest,
@@ -180,6 +221,124 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS bootstrap_test (
     id INTEGER PRIMARY KEY,
     value TEXT NOT NULL
 );";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continuous_fresh_writer_replays_raw_connection_writes() {
+    let tmp = TempDir::new().expect("temp dir");
+    let walrust_storage_impl = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn StorageBackend> = walrust_storage_impl.clone();
+    let tiered_storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
+    let manifest_store = Arc::new(MemManifestStore::new()) as Arc<dyn ManifestStore>;
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+
+    let mut writer_a = open_continuous_remote(
+        &tmp.path().join("a"),
+        "direct.db",
+        "writer-a",
+        19401,
+        lease_store.clone(),
+        manifest_store.clone(),
+        walrust_storage.clone(),
+        tiered_storage.clone(),
+    )
+    .await;
+    writer_a
+        .execute_async(
+            "INSERT INTO bootstrap_test (id, value) VALUES (1, 'embedded-a')",
+            &[],
+        )
+        .await
+        .expect("writer A insert");
+    writer_a.close().await.expect("close writer A");
+
+    let mut writer_b = open_continuous_remote(
+        &tmp.path().join("b"),
+        "direct.db",
+        "writer-b",
+        19402,
+        lease_store.clone(),
+        manifest_store.clone(),
+        walrust_storage.clone(),
+        tiered_storage.clone(),
+    )
+    .await;
+    let value: String = writer_b
+        .query_row("SELECT value FROM bootstrap_test WHERE id = 1", &[], |r| {
+            r.get(0)
+        })
+        .expect("writer B sees writer A");
+    assert_eq!(value, "embedded-a");
+    {
+        let conn = writer_b.connection().expect("writer B connection");
+        let c = conn.lock();
+        c.execute(
+            "INSERT INTO bootstrap_test (id, value) VALUES (2, 'raw-hosted-b')",
+            [],
+        )
+        .expect("raw connection insert");
+    }
+    writer_b.close().await.expect("close writer B");
+
+    let manifest = manifest_store
+        .get("test/direct/_manifest")
+        .await
+        .expect("fetch manifest after writer B")
+        .expect("manifest after writer B");
+    let (_base, walrust) =
+        turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
+            .expect("decode manifest after writer B");
+    let (base_cursor, _) = walrust.expect("continuous manifest has cursor");
+    let max_seq = max_physical_wal_seq(&walrust_storage_impl.keys().await);
+    assert!(
+        base_cursor < max_seq,
+        "raw connection WAL must remain ahead of the published base cursor; cursor={base_cursor}, max_seq={max_seq}"
+    );
+
+    let mut writer_c = open_continuous_remote(
+        &tmp.path().join("c"),
+        "direct.db",
+        "writer-c",
+        19403,
+        lease_store.clone(),
+        manifest_store.clone(),
+        walrust_storage.clone(),
+        tiered_storage.clone(),
+    )
+    .await;
+    let value: String = writer_c
+        .query_row("SELECT value FROM bootstrap_test WHERE id = 2", &[], |r| {
+            r.get(0)
+        })
+        .expect("writer C sees raw writer B");
+    assert_eq!(value, "raw-hosted-b");
+    writer_c
+        .execute_async(
+            "INSERT INTO bootstrap_test (id, value) VALUES (3, 'embedded-c')",
+            &[],
+        )
+        .await
+        .expect("writer C insert");
+    writer_c.close().await.expect("close writer C");
+
+    let mut writer_d = open_continuous_remote(
+        &tmp.path().join("d"),
+        "direct.db",
+        "writer-d",
+        19404,
+        lease_store,
+        manifest_store,
+        walrust_storage,
+        tiered_storage,
+    )
+    .await;
+    let value: String = writer_d
+        .query_row("SELECT value FROM bootstrap_test WHERE id = 3", &[], |r| {
+            r.get(0)
+        })
+        .expect("writer D sees writer C");
+    assert_eq!(value, "embedded-c");
+    writer_d.close().await.expect("close writer D");
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn continuous_open_publishes_hybrid_manifest_for_fresh_database() {
