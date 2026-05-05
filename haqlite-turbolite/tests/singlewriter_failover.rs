@@ -320,8 +320,8 @@ async fn dump_replication_state(
             let decoded = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&m.payload)
                 .expect("decode manifest payload");
             format!(
-                "manifest.version={} change_counter={} walrust={:?} wal_keys={:?}",
-                decoded.0.version, decoded.0.change_counter, decoded.1, wal_keys
+                "manifest.version={} change_counter={} wal_keys={:?}",
+                decoded.version, decoded.change_counter, wal_keys
             )
         }
         None => format!("manifest=<none> wal_keys={:?}", wal_keys),
@@ -345,15 +345,14 @@ async fn dump_storage_backed_replication_state(
 
     let manifest_summary = match manifest {
         Ok(Some(m)) => match turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&m.payload) {
-            Ok((decoded, walrust)) => format!(
-                "envelope_version={} writer_id={} decoded_version={} page_count={} groups={} change_counter={} walrust={:?}",
+            Ok(decoded) => format!(
+                "envelope_version={} writer_id={} decoded_version={} page_count={} groups={} change_counter={}",
                 m.version,
                 m.writer_id,
                 decoded.version,
                 decoded.page_count,
                 decoded.page_group_keys.len(),
-                decoded.change_counter,
-                walrust
+                decoded.change_counter
             ),
             Err(e) => format!(
                 "envelope_version={} writer_id={} decode_error={e}",
@@ -391,14 +390,12 @@ async fn diagnose_plain_walrust_replay(
     }) else {
         return "manifest=<none>".to_string();
     };
-    let (decoded, Some((seq, prefix))) =
-        (match turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload) {
-            Ok(v) => v,
-            Err(e) => return format!("manifest_decode_error={e}"),
-        })
-    else {
-        return "manifest_has_no_walrust_cursor".to_string();
+    let decoded = match turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload) {
+        Ok(v) => v,
+        Err(e) => return format!("manifest_decode_error={e}"),
     };
+    let seq = decoded.change_counter;
+    let prefix = "test/";
 
     let tmp = match TempDir::new() {
         Ok(tmp) => tmp,
@@ -1594,10 +1591,9 @@ async fn singlewriter_promotion_publishes_usable_base() {
         .expect("manifest_store get pre-promotion")
         .expect("pre-promotion manifest exists")
         .payload;
-    let (pre_manifest, pre_walrust) =
+    let pre_manifest =
         turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&pre_promotion_manifest_bytes)
             .expect("decode pre-promotion manifest");
-    let pre_walrust_cursor = pre_walrust.as_ref().map(|(seq, _)| *seq);
     let pre_keys: std::collections::HashSet<String> =
         pre_manifest.page_group_keys.iter().cloned().collect();
 
@@ -1641,7 +1637,7 @@ async fn singlewriter_promotion_publishes_usable_base() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Wait for both the promotion publish AND the post-INSERT
-    // publish to land — version + cursor must both advance.
+    // publish to land — the pure base manifest version must advance.
     let deadline = Instant::now() + Duration::from_secs(8);
     let post_promotion_manifest_bytes = loop {
         let bytes = manifest_store
@@ -1650,31 +1646,26 @@ async fn singlewriter_promotion_publishes_usable_base() {
             .expect("manifest_store get post-promotion")
             .expect("post-promotion manifest exists")
             .payload;
-        let (m, walrust_now) = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
+        let m = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
             .expect("decode post-promotion manifest");
-        let cursor_now = walrust_now.as_ref().map(|(seq, _)| *seq);
-        let cursor_advanced = match (pre_walrust_cursor, cursor_now) {
-            (Some(pre), Some(now)) => now > pre,
-            _ => true,
-        };
-        if m.version > pre_manifest.version && cursor_advanced {
+        if m.version > pre_manifest.version {
             break bytes;
         }
         if Instant::now() >= deadline {
             panic!(
-                "post-promotion manifest did not advance past pre-promotion v{} (cursor pre={:?} now={:?}) within timeout",
-                pre_manifest.version, pre_walrust_cursor, cursor_now
+                "post-promotion manifest did not advance past pre-promotion v{} within timeout",
+                pre_manifest.version
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    let (post_manifest, post_walrust) =
+    let post_manifest =
         turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&post_promotion_manifest_bytes)
             .expect("decode post-promotion manifest (final)");
 
     // The post-promotion manifest must be a real usable base:
     // version advanced, page coverage at least as wide, fresh
-    // page-group keys uploaded, walrust cursor advanced.
+    // page-group keys uploaded.
     assert!(
         post_manifest.version > pre_manifest.version,
         "post-promotion manifest version did not advance: {} -> {}",
@@ -1700,20 +1691,6 @@ async fn singlewriter_promotion_publishes_usable_base() {
         pre_keys,
         post_manifest.page_group_keys
     );
-    let post_walrust_cursor = post_walrust.as_ref().map(|(seq, _)| *seq);
-    assert!(
-        post_walrust_cursor.is_some(),
-        "post-promotion manifest dropped its walrust cursor"
-    );
-    if let (Some(pre), Some(post)) = (pre_walrust_cursor, post_walrust_cursor) {
-        assert!(
-            post > pre,
-            "post-promotion walrust cursor did not advance: {} -> {}",
-            pre,
-            post
-        );
-    }
-
     // Fresh third node sharing the same storage — joins as
     // Follower and must catch up to both rows.
     let third = build_singlewriter_node(
@@ -1739,14 +1716,11 @@ async fn singlewriter_promotion_publishes_usable_base() {
         let walrust_keys = walrust_storage_impl.keys().await;
         panic!(
             "third node count: {}; \
-             pre_walrust_cursor={:?} post_walrust_cursor={:?} \
              pre_keys={:?} post_keys={:?} \
              walrust_keys={:?} \
              promoted_leader: {}; \
              third: {}; {}; {}; {}",
             e,
-            pre_walrust_cursor,
-            post_walrust_cursor,
             pre_keys,
             post_manifest.page_group_keys,
             walrust_keys,
@@ -1865,10 +1839,9 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
         .expect("manifest_store get pre-promotion")
         .expect("pre-promotion manifest exists")
         .payload;
-    let (pre_manifest, pre_walrust) =
+    let pre_manifest =
         turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&pre_promotion_manifest_bytes)
             .expect("decode pre-promotion manifest");
-    let pre_walrust_cursor = pre_walrust.as_ref().map(|(seq, _)| *seq);
     let pre_keys: std::collections::HashSet<String> =
         pre_manifest.page_group_keys.iter().cloned().collect();
     let pre_envelope_version = manifest_store
@@ -1905,7 +1878,7 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
             .expect("manifest_store get post-promotion")
             .expect("manifest exists post-promotion")
             .payload;
-        let (m, _) = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
+        let m = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
             .expect("decode post-promotion manifest");
         let post_keys: std::collections::HashSet<&String> = m.page_group_keys.iter().collect();
         let has_new_key = post_keys
@@ -1932,10 +1905,9 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
     };
 
     // Manifest-inspection assertions (pre vs post).
-    let (post_manifest, post_walrust) =
+    let post_manifest =
         turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&post_promotion_manifest_bytes)
             .expect("decode post-promotion manifest (final)");
-    let post_walrust_cursor = post_walrust.as_ref().map(|(seq, _)| *seq);
     let new_keys: Vec<&String> = post_manifest
         .page_group_keys
         .iter()
@@ -1947,10 +1919,6 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
          (the flush of accumulated replay state). pre_keys={:?} post_keys={:?}",
         pre_keys,
         post_manifest.page_group_keys
-    );
-    assert!(
-        post_walrust_cursor.is_some(),
-        "post-promotion manifest dropped its walrust cursor"
     );
 
     // Empty walrust storage for the third: if `before-crash`
@@ -1980,15 +1948,8 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
             panic!(
                 "third node did not see row 1 from materialize alone: {}; \
                  pre_keys={:?} post_keys={:?} new_keys_in_post={:?} \
-                 pre_walrust_cursor={:?} post_walrust_cursor={:?} \
                  third_walrust_keys={:?}",
-                e,
-                pre_keys,
-                post_manifest.page_group_keys,
-                new_keys,
-                pre_walrust_cursor,
-                post_walrust_cursor,
-                third_walrust_keys,
+                e, pre_keys, post_manifest.page_group_keys, new_keys, third_walrust_keys,
             )
         });
 
