@@ -726,9 +726,9 @@ impl Builder {
             };
         let walrust_prefix =
             if self.inner.get_walrust_storage().is_none() && self.turbolite_http.is_some() {
-                // Cinch's HTTP sync API already scopes WAL objects by Bearer token
-                // or internal `database_id`; adding the builder prefix again would
-                // make walrust paths look like `/v1/sync/wal/{database_id}/...`.
+                // The HTTP sync API already scopes WAL objects by credential
+                // or database id; adding the builder prefix again would make
+                // walrust paths double-scope under `/v1/sync/wal/...`.
                 ""
             } else {
                 self.inner.get_prefix()

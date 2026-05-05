@@ -24,7 +24,7 @@ Only one node should be writing at a time. The mechanism for that is a *lease*: 
 
 Networks lie. A leader can be sure it's still the leader after the cluster has decided otherwise. The protection is a *fence token*: a counter that goes up every time the lease changes hands. The storage system that holds the actual data refuses any write tagged with a counter older than the latest one. So even if the old leader is confused and tries to write, the storage rejects it. This is the load-bearing safety property — nothing else compensates for getting it wrong. The mechanism details live in `hadb`; haqlite consumes them.
 
-A practical caveat: Tigris S3 isn't a safe lease store. Its conditional writes aren't atomic when two clients race — both can succeed. Use NATS, Cinch HTTP, or AWS S3.
+A practical caveat: Tigris S3 isn't a safe lease store. Its conditional writes aren't atomic when two clients race — both can succeed. Use NATS, a fenced HTTP lease backend, or AWS S3.
 
 There's also a second fence inside SQLite itself. When a node loses its lease, the *authorizer* (a SQLite plugin that vets every statement) gets re-installed in a mode that blocks writes outright. Two layers of defense — the storage rejects fenced writes from outside, and the SQLite connection won't even attempt them.
 
@@ -34,7 +34,7 @@ Replication is how data gets from the writer to other nodes — and to durable c
 
 There are two ways data flows to the cloud, and they compose. The first is **log shipping**: SQLite has a write-ahead log of every change, and the leader can ship those log entries to S3 on a schedule (never, on an interval, or after every single commit). Followers pull the log down and replay it locally. The crate that handles this for haqlite is `walrust`. The second way is **page tiering**: instead of (or alongside) shipping the log, the data pages themselves get uploaded — either at checkpoints, continuously, or after every commit. With tiering, followers (and brand-new nodes) can pull pages directly from S3. The crate that handles this is `turbolite`.
 
-Defaults: when the turbolite sibling crate is in use, the default is "continuous" — pages get uploaded at checkpoints, and the log gets shipped every second. cinch-cloud relies on this default to hit its cold-start performance.
+Defaults: when the turbolite sibling crate is in use, the default is "continuous" — pages get uploaded at checkpoints, and the log gets shipped every second. Production embedders rely on this default for cold-start performance.
 
 Which replicator runs at the turbolite layer is decided like this: a caller-supplied replicator wins; "Cloud" durability uses a no-op replicator (pages are the replication, so there's no log to ship); everything else uses walrust.
 

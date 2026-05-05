@@ -475,8 +475,8 @@ async fn continuous_open_accepts_same_writer_manifest_when_meta_lags() {
 /// Regression: a fresh tenant in turbolite-VFS mode must bootstrap even
 /// when the caller passes an empty schema.
 ///
-/// The cinch engine's redis tenant create path (`pool/redis.rs::create`)
-/// calls `builder.open(db_path, "")` for a brand-new tenant. Without
+/// A tenant create path can call `builder.open(db_path, "")` for a brand-new
+/// tenant. Without
 /// a schema to execute, ensure_schema's opener-call doesn't push any
 /// pages through the VFS, and the local OS path at `db_path` never
 /// gets a file. ensure_base_manifest then calls
@@ -516,7 +516,7 @@ async fn continuous_open_publishes_hybrid_manifest_for_fresh_database_with_empty
         .forwarding_port(19310)
         .open(db_path.to_str().expect("path"), "")
         .await
-        .expect("fresh empty-schema bootstrap must succeed (cinch redis-create path)");
+        .expect("fresh empty-schema bootstrap must succeed");
 
     let manifest = manifest_store
         .get("test/empty_schema_bootstrap/_manifest")

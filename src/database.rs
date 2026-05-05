@@ -252,8 +252,7 @@ impl HaQLiteBuilder {
         self
     }
 
-    /// Use the Cinch-protocol HTTP LeaseStore (for embedded replicas via
-    /// Grabby or the engine's embedded lease API).
+    /// Use the HTTP LeaseStore (for embedded replicas via a remote lease API).
     ///
     /// Shorthand for `.lease_store(Arc::new(CinchLeaseStore::new(endpoint, token)))`.
     pub fn lease_endpoint(self, endpoint: &str, token: &str) -> Self {
@@ -328,7 +327,7 @@ impl HaQLiteBuilder {
     }
 
     /// Use a custom storage backend for walrust's WAL/snapshot writes.
-    /// Pass any `Arc<dyn hadb_storage::StorageBackend>` (S3, Cinch HTTP,
+    /// Pass any `Arc<dyn hadb_storage::StorageBackend>` (S3, fenced HTTP,
     /// in-memory, etc.). For tests this is the in-memory backend; for
     /// production it's typically `hadb_storage_s3::S3Storage` or
     /// `hadb_storage_cinch::CinchHttpStorage`.

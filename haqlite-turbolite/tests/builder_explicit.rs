@@ -2,10 +2,7 @@
 //!
 //! These tests pin the new contract:
 //! - `lease_store()` must be called for any HA mode.
-//! - `manifest_store()` must be called for SingleWriter+Sync,
-//!   which is exercised by cinch-cloud's e2e tests since constructing an
-//!   in-memory walrust `StorageBackend` here would require pulling in
-//!   walrust's private test helpers).
+//! - `manifest_store()` must be called for SingleWriter+Sync.
 //! - SharedWriter is visible in the API but intentionally fails clearly until
 //!   the real implementation lands.
 //! - The env-var helpers live in `haqlite::env::*` for callers that want

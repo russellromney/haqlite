@@ -73,10 +73,7 @@ pub async fn lease_store_from_env(
     if url.starts_with("http://") || url.starts_with("https://") {
         let parsed = parse_url_params(&url);
         let token = parsed.params.get("token").cloned().unwrap_or_default();
-        tracing::info!(
-            "haqlite::env: using Cinch HTTP lease store: {}",
-            parsed.base
-        );
+        tracing::info!("haqlite::env: using HTTP lease store: {}", parsed.base);
         return Ok(Arc::new(hadb_lease_cinch::CinchLeaseStore::new(
             &parsed.base,
             &token,

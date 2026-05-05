@@ -77,8 +77,8 @@ reqwest = { version = "0.12", features = ["json"] }
 # NATS lease store (optional)
 hadb-lease-nats = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-lease-nats", branch = "hoist-prereq-internal-lease-store", optional = true }
 
-# Lease abstractions (trait crate provides FenceSource used by the
-# Cinch storage adapter for fenced writes).
+# Lease abstractions (trait crate provides FenceSource used by fenced
+# storage adapters).
 hadb-lease = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-lease", branch = "hoist-prereq-internal-lease-store" }
 
 # Storage substrate (trait + impls)
@@ -86,7 +86,7 @@ hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0
 hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", branch = "hoist-prereq-internal-lease-store" }
 hadb-storage-cinch = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-cinch", branch = "hoist-prereq-internal-lease-store" }
 
-# Cinch-protocol HTTP lease store
+# HTTP lease store
 hadb-lease-cinch = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-lease-cinch", branch = "hoist-prereq-internal-lease-store" }
 
 # Shared CLI framework
