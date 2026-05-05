@@ -1,10 +1,6 @@
 # haqlite
 
-> **Experimental / active development.** haqlite is useful for exploration and
-> internal integration work, but it is not yet a stable public database
-> substrate. APIs, wire/storage formats, default durability behavior, and
-> failover semantics may change without notice. Treat the README as a current
-> working model, not a compatibility promise.
+> **Experimental.** haqlite is under active development and contains bugs. Be careful.
 
 Embed HA SQLite in your app with one line of code. Leader election, WAL replication, write forwarding.
 
