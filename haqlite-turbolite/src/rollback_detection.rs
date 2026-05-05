@@ -5,13 +5,23 @@ use anyhow::{Context, Result};
 /// Detects manifest epoch mismatches between local cache and remote storage.
 /// Wipes the local cache when a fork or rollback is detected.
 pub struct RollbackDetector {
+    client: reqwest::Client,
     storage_url: String,
     token: String,
 }
 
 impl RollbackDetector {
     pub fn new(storage_url: &str, token: &str) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("failed to build HTTP client for rollback detection");
+        Self::with_client(client, storage_url, token)
+    }
+
+    pub fn with_client(client: reqwest::Client, storage_url: &str, token: &str) -> Self {
         Self {
+            client,
             storage_url: storage_url.to_string(),
             token: token.to_string(),
         }
@@ -100,15 +110,12 @@ impl RollbackDetector {
     }
 
     async fn fetch_remote_manifest(&self) -> Result<Option<(Vec<u8>, u64)>> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .context("build HTTP client for manifest fetch")?;
         let url = format!(
             "{}/v1/sync/pages/manifest.msgpack",
             self.storage_url.trim_end_matches('/')
         );
-        let resp = client
+        let resp = self
+            .client
             .get(&url)
             .bearer_auth(&self.token)
             .send()

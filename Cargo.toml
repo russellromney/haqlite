@@ -2,6 +2,24 @@
 members = [".", "haqlite-turbolite"]
 resolver = "2"
 
+[patch."https://github.com/russellromney/hadb.git"]
+hadb = { path = "../hadb/hadb" }
+hadb-changeset = { path = "../hadb/hadb-changeset" }
+hadb-cli = { path = "../hadb/hadb-cli" }
+hadb-io = { path = "../hadb/hadb-io" }
+hadb-lease = { path = "../hadb/hadb-lease" }
+hadb-lease-cinch = { path = "../hadb/hadb-lease-cinch" }
+hadb-lease-mem = { path = "../hadb/hadb-lease-mem" }
+hadb-lease-nats = { path = "../hadb/hadb-lease-nats" }
+hadb-lease-s3 = { path = "../hadb/hadb-lease-s3" }
+hadb-storage = { path = "../hadb/hadb-storage" }
+hadb-storage-cinch = { path = "../hadb/hadb-storage-cinch" }
+hadb-storage-local = { path = "../hadb/hadb-storage-local" }
+hadb-storage-s3 = { path = "../hadb/hadb-storage-s3" }
+turbodb = { path = "../hadb/turbodb" }
+turbodb-manifest-cinch = { path = "../hadb/turbodb-manifest-cinch" }
+turbodb-manifest-mem = { path = "../hadb/turbodb-manifest-mem" }
+
 [workspace.package]
 version = "0.4.0"
 edition = "2021"

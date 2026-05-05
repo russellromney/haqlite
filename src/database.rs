@@ -771,6 +771,7 @@ impl HaQLiteInner {
         let mut handle = self.fwd_handle.lock().await;
         if let Some(h) = handle.take() {
             h.abort();
+            let _ = h.await;
             tracing::debug!(db = %self.db_name, "Forwarding server stopped");
         }
     }
@@ -1501,8 +1502,11 @@ impl HaQLite {
         // 6. Now the final sync is done, close the connection.
         self.inner.set_conn(None);
 
-        // 7. Abort background role listener.
-        self._role_handle.abort();
+        // 7. Abort and await the background role listener so its resources are
+        // released before close() returns.
+        let role_handle = std::mem::replace(&mut self._role_handle, tokio::spawn(async {}));
+        role_handle.abort();
+        let _ = role_handle.await;
 
         Ok(())
     }

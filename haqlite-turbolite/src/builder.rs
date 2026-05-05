@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -14,10 +14,12 @@ use turbolite::tiered::SharedTurboliteVfs;
 #[derive(Debug, Clone)]
 enum CinchHttpConfig {
     Public {
+        client: reqwest::Client,
         endpoint: String,
         token: String,
     },
     Internal {
+        client: reqwest::Client,
         endpoint: String,
         database_id: String,
     },
@@ -32,34 +34,59 @@ impl CinchHttpConfig {
 
     fn manifest_store(&self) -> turbodb_manifest_cinch::CinchManifestStore {
         match self {
-            Self::Public { endpoint, token } => {
-                turbodb_manifest_cinch::CinchManifestStore::new(endpoint, token)
-            }
+            Self::Public {
+                client,
+                endpoint,
+                token,
+            } => turbodb_manifest_cinch::CinchManifestStore::with_client(
+                client.clone(),
+                endpoint,
+                token,
+            ),
             Self::Internal {
+                client,
                 endpoint,
                 database_id,
-            } => turbodb_manifest_cinch::CinchManifestStore::new_internal(endpoint, database_id),
+            } => turbodb_manifest_cinch::CinchManifestStore::with_client_internal(
+                client.clone(),
+                endpoint,
+                database_id,
+            ),
         }
     }
 
     fn storage(&self, prefix: &str) -> hadb_storage_cinch::CinchHttpStorage {
         match self {
-            Self::Public { endpoint, token } => {
-                hadb_storage_cinch::CinchHttpStorage::new(endpoint, token, prefix)
-            }
+            Self::Public {
+                client,
+                endpoint,
+                token,
+            } => hadb_storage_cinch::CinchHttpStorage::with_client(
+                client.clone(),
+                endpoint,
+                token,
+                prefix,
+            ),
             Self::Internal {
+                client,
                 endpoint,
                 database_id,
-            } => hadb_storage_cinch::CinchHttpStorage::new_internal(endpoint, database_id, prefix),
+            } => hadb_storage_cinch::CinchHttpStorage::with_client_internal(
+                client.clone(),
+                endpoint,
+                database_id,
+                prefix,
+            ),
         }
     }
 
     fn identity_key(&self) -> String {
         match self {
-            Self::Public { endpoint, token } => format!("public:{endpoint}:{token}"),
+            Self::Public { endpoint, .. } => format!("public:{endpoint}"),
             Self::Internal {
                 endpoint,
                 database_id,
+                ..
             } => format!("internal:{endpoint}:{database_id}"),
         }
     }
@@ -72,6 +99,7 @@ struct AutoVfsRegistration {
     shared_vfs: SharedTurboliteVfs,
     vfs_name: String,
     shared_fence: Option<SharedFence>,
+    auth_token: Option<Arc<RwLock<String>>>,
 }
 
 static AUTO_VFS_REGISTRY: OnceLock<Mutex<HashMap<String, AutoVfsRegistration>>> = OnceLock::new();
@@ -112,7 +140,11 @@ fn auto_vfs_key(
 
 fn get_or_register_auto_vfs<F>(key: String, create: F) -> Result<AutoVfsRegistration>
 where
-    F: FnOnce() -> Result<(SharedTurboliteVfs, Option<SharedFence>)>,
+    F: FnOnce() -> Result<(
+        SharedTurboliteVfs,
+        Option<SharedFence>,
+        Option<Arc<RwLock<String>>>,
+    )>,
 {
     let mut registry = auto_vfs_registry()
         .lock()
@@ -122,7 +154,7 @@ where
     }
 
     let vfs_name = stable_vfs_name(&key);
-    let (shared_vfs, shared_fence) = create()?;
+    let (shared_vfs, shared_fence, auth_token) = create()?;
     turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone())
         .map_err(|e| anyhow::anyhow!("register VFS: {e}"))?;
 
@@ -130,6 +162,7 @@ where
         shared_vfs,
         vfs_name,
         shared_fence,
+        auth_token,
     };
     registry.insert(key, registration.clone());
     Ok(registration)
@@ -167,6 +200,7 @@ pub struct Builder {
     rollback_database_id: Option<String>,
     rollback_token: Option<String>,
     rollback_url: Option<String>,
+    rollback_client: Option<reqwest::Client>,
 }
 
 impl Default for Builder {
@@ -191,6 +225,7 @@ impl Builder {
             rollback_database_id: None,
             rollback_token: None,
             rollback_url: None,
+            rollback_client: None,
         }
     }
 
@@ -304,8 +339,27 @@ impl Builder {
         self
     }
 
-    pub fn turbolite_http(mut self, endpoint: &str, token: &str) -> Self {
+    pub fn turbolite_http(self, endpoint: &str, token: &str) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
+        self.turbolite_http_with_client(client, endpoint, token)
+    }
+
+    /// Use grabby's public HTTP sync API with a caller-provided client.
+    ///
+    /// Reusing one `reqwest::Client` across lease, manifest, WAL, and page
+    /// storage keeps repeated open/close cycles from creating one transport
+    /// pool per database handle.
+    pub fn turbolite_http_with_client(
+        mut self,
+        client: reqwest::Client,
+        endpoint: &str,
+        token: &str,
+    ) -> Self {
         self.turbolite_http = Some(CinchHttpConfig::Public {
+            client,
             endpoint: endpoint.to_string(),
             token: token.to_string(),
         });
@@ -314,8 +368,23 @@ impl Builder {
 
     /// Use grabby's internal NoAuth sync API for turbolite page/WAL storage.
     /// Requests carry `database_id` as a query parameter instead of Bearer auth.
-    pub fn turbolite_http_internal(mut self, endpoint: &str, database_id: &str) -> Self {
+    pub fn turbolite_http_internal(self, endpoint: &str, database_id: &str) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
+        self.turbolite_http_internal_with_client(client, endpoint, database_id)
+    }
+
+    /// Use grabby's internal NoAuth sync API with a caller-provided client.
+    pub fn turbolite_http_internal_with_client(
+        mut self,
+        client: reqwest::Client,
+        endpoint: &str,
+        database_id: &str,
+    ) -> Self {
         self.turbolite_http = Some(CinchHttpConfig::Internal {
+            client,
             endpoint: endpoint.to_string(),
             database_id: database_id.to_string(),
         });
@@ -325,6 +394,16 @@ impl Builder {
     pub fn turbolite_storage(mut self, storage: Arc<dyn hadb_storage::StorageBackend>) -> Self {
         self.turbolite_storage = Some(storage);
         self
+    }
+
+    fn refresh_registered_auth(registration: &AutoVfsRegistration, cfg: &CinchHttpConfig) {
+        if let (CinchHttpConfig::Public { token, .. }, Some(auth_token)) =
+            (cfg, registration.auth_token.as_ref())
+        {
+            if let Ok(mut guard) = auth_token.write() {
+                *guard = token.clone();
+            }
+        }
     }
 
     pub fn turbolite_vfs(mut self, vfs: SharedTurboliteVfs, vfs_name: &str) -> Self {
@@ -338,8 +417,23 @@ impl Builder {
         self
     }
 
-    pub fn manifest_endpoint(mut self, endpoint: &str, token: &str) -> Self {
+    pub fn manifest_endpoint(self, endpoint: &str, token: &str) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
+        self.manifest_endpoint_with_client(client, endpoint, token)
+    }
+
+    /// Use grabby's public manifest API with a caller-provided client.
+    pub fn manifest_endpoint_with_client(
+        mut self,
+        client: reqwest::Client,
+        endpoint: &str,
+        token: &str,
+    ) -> Self {
         self.manifest_http = Some(CinchHttpConfig::Public {
+            client,
             endpoint: endpoint.to_string(),
             token: token.to_string(),
         });
@@ -349,8 +443,23 @@ impl Builder {
 
     /// Use grabby's internal NoAuth manifest API for system DB manifests.
     /// Requests carry `database_id` as a query parameter instead of Bearer auth.
-    pub fn manifest_endpoint_internal(mut self, endpoint: &str, database_id: &str) -> Self {
+    pub fn manifest_endpoint_internal(self, endpoint: &str, database_id: &str) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
+        self.manifest_endpoint_internal_with_client(client, endpoint, database_id)
+    }
+
+    /// Use grabby's internal NoAuth manifest API with a caller-provided client.
+    pub fn manifest_endpoint_internal_with_client(
+        mut self,
+        client: reqwest::Client,
+        endpoint: &str,
+        database_id: &str,
+    ) -> Self {
         self.manifest_http = Some(CinchHttpConfig::Internal {
+            client,
             endpoint: endpoint.to_string(),
             database_id: database_id.to_string(),
         });
@@ -396,6 +505,11 @@ impl Builder {
     pub fn with_rollback_detection(mut self, database_id: &str, token: &str) -> Self {
         self.rollback_database_id = Some(database_id.to_string());
         self.rollback_token = Some(token.to_string());
+        self
+    }
+
+    pub fn with_rollback_detection_client(mut self, client: reqwest::Client) -> Self {
+        self.rollback_client = Some(client);
         self
     }
 
@@ -452,7 +566,11 @@ impl Builder {
                     anyhow::bail!("with_rollback_detection requires .turbolite_http() to be set")
                 }
             };
-            let detector = crate::RollbackDetector::new(&storage_url, token);
+            let detector = if let Some(client) = self.rollback_client.clone() {
+                crate::RollbackDetector::with_client(client, &storage_url, token)
+            } else {
+                crate::RollbackDetector::new(&storage_url, token)
+            };
             detector
                 .check_and_repair(database_id, &db_path)
                 .await
@@ -524,8 +642,9 @@ impl Builder {
                 );
                 let registration = get_or_register_auto_vfs(key, || {
                     let shared_fence = new_shared_fence();
-                    let storage: Arc<dyn hadb_storage::StorageBackend> =
-                        Arc::new(cfg.storage("pages").with_fence(shared_fence.0.clone()));
+                    let storage = cfg.storage("pages").with_fence(shared_fence.0.clone());
+                    let auth_token = storage.auth_token_handle();
+                    let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(storage);
                     let vfs = turbolite::tiered::TurboliteVfs::with_backend(
                         tl_config, storage, rt_handle,
                     )
@@ -533,8 +652,10 @@ impl Builder {
                     Ok((
                         turbolite::tiered::SharedTurboliteVfs::new(vfs),
                         Some(shared_fence),
+                        Some(auth_token),
                     ))
                 })?;
+                Self::refresh_registered_auth(&registration, cfg);
                 (
                     registration.shared_vfs,
                     registration.vfs_name,
@@ -556,7 +677,7 @@ impl Builder {
                         rt_handle,
                     )
                     .map_err(|e| anyhow::anyhow!("turbolite VFS (caller-supplied): {e}"))?;
-                    Ok((turbolite::tiered::SharedTurboliteVfs::new(vfs), None))
+                    Ok((turbolite::tiered::SharedTurboliteVfs::new(vfs), None, None))
                 })?;
                 (
                     registration.shared_vfs,

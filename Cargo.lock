@@ -1579,7 +1579,6 @@ dependencies = [
 [[package]]
 name = "hadb"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1600,7 +1599,6 @@ dependencies = [
 [[package]]
 name = "hadb-changeset"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1614,7 +1612,6 @@ dependencies = [
 [[package]]
 name = "hadb-cli"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1631,7 +1628,6 @@ dependencies = [
 [[package]]
 name = "hadb-io"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1653,7 +1649,6 @@ dependencies = [
 [[package]]
 name = "hadb-lease"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1666,7 +1661,6 @@ dependencies = [
 [[package]]
 name = "hadb-lease-cinch"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1683,7 +1677,6 @@ dependencies = [
 [[package]]
 name = "hadb-lease-mem"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1693,7 +1686,6 @@ dependencies = [
 [[package]]
 name = "hadb-lease-nats"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -1706,7 +1698,6 @@ dependencies = [
 [[package]]
 name = "hadb-lease-s3"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1725,7 +1716,6 @@ dependencies = [
 [[package]]
 name = "hadb-storage"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1735,7 +1725,6 @@ dependencies = [
 [[package]]
 name = "hadb-storage-cinch"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1752,7 +1741,6 @@ dependencies = [
 [[package]]
 name = "hadb-storage-local"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1764,7 +1752,6 @@ dependencies = [
 [[package]]
 name = "hadb-storage-s3"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4091,7 +4078,6 @@ dependencies = [
 [[package]]
 name = "turbodb"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4103,7 +4089,6 @@ dependencies = [
 [[package]]
 name = "turbodb-manifest-cinch"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4120,7 +4105,6 @@ dependencies = [
 [[package]]
 name = "turbodb-manifest-mem"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
