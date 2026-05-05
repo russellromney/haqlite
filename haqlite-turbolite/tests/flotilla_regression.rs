@@ -115,6 +115,11 @@ async fn build_walrust_dedicated(
         .expect("open walrust singlewriter")
 }
 
+#[cfg(unix)]
+fn open_fd_count() -> usize {
+    std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()
+}
+
 // ============================================================================
 // close_reopen_survives_writes
 // ============================================================================
@@ -209,6 +214,86 @@ async fn close_reopen_continuous_survives() {
         .unwrap();
     assert_eq!(val, "continuous");
     db2.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_continuous_open_close_releases_file_descriptors() {
+    assert_repeated_continuous_open_close_fd_bounds(3).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "Gate D stress audit; run explicitly when proving close/release behavior"]
+async fn stress_repeated_continuous_open_close_releases_file_descriptors() {
+    assert_repeated_continuous_open_close_fd_bounds(12).await;
+}
+
+#[cfg(unix)]
+async fn assert_repeated_continuous_open_close_fd_bounds(cycles: i64) {
+    let tmp = TempDir::new().unwrap();
+    let lease = Arc::new(InMemoryLeaseStore::new());
+    let manifest = Arc::new(MemManifestStore::new());
+    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> =
+        Arc::new(common::InMemoryStorage::new());
+
+    let config = TurboliteConfig {
+        cache_dir: tmp.path().join("cache"),
+        compression: CompressionConfig {
+            level: 1,
+            ..Default::default()
+        },
+        cache: CacheConfig {
+            pages_per_group: 4,
+            sub_pages_per_frame: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let shared_vfs = SharedTurboliteVfs::new(TurboliteVfs::new_local(config).expect("vfs"));
+    let vfs_name = format!("flotilla_fd_audit_{}", std::process::id());
+    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
+
+    let db_path = tmp.path().join("fd-audit.db");
+    let baseline = open_fd_count();
+    let mut peak = baseline;
+
+    for i in 0..cycles {
+        let mut db = Builder::new()
+            .prefix("test/")
+            .mode(HaMode::SingleWriter)
+            .durability(turbodb::Durability::default())
+            .lease_store(lease.clone())
+            .manifest_store(manifest.clone())
+            .walrust_storage(walrust_storage.clone())
+            .turbolite_vfs(shared_vfs.clone(), &vfs_name)
+            .instance_id("fd-audit-node")
+            .manifest_poll_interval(Duration::from_millis(50))
+            .open(db_path.to_str().expect("path"), SCHEMA)
+            .await
+            .expect("open continuous db");
+
+        db.execute_async(
+            "INSERT OR REPLACE INTO t (id, val) VALUES (?1, ?2)",
+            &[SqlValue::Integer(i), SqlValue::Text(format!("v{i}"))],
+        )
+        .await
+        .expect("write");
+        db.close().await.expect("close");
+
+        let current = open_fd_count();
+        peak = peak.max(current);
+    }
+
+    let final_count = open_fd_count();
+    assert!(
+        final_count <= baseline + 4,
+        "fd count grew after repeated open/write/close: baseline={baseline}, final={final_count}, peak={peak}"
+    );
+    assert!(
+        peak <= baseline + 8,
+        "fd peak too high during repeated open/write/close: baseline={baseline}, final={final_count}, peak={peak}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
