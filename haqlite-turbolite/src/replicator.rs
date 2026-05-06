@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -322,7 +322,6 @@ pub struct TurboliteWalReplicator {
     walrust_prefix: String,
     walrust_storage: Arc<dyn StorageBackend>,
     walrust: Arc<haqlite::ExternalSnapshotSqliteReplicator>,
-    replay_base_seq: Arc<AtomicU64>,
     replay_base_pending_publish: Arc<AtomicBool>,
     live_wal_path: Mutex<Option<std::path::PathBuf>>,
 }
@@ -338,7 +337,6 @@ impl TurboliteWalReplicator {
         walrust_prefix: String,
         walrust_storage: Arc<dyn StorageBackend>,
         walrust: Arc<haqlite::ExternalSnapshotSqliteReplicator>,
-        replay_base_seq: Arc<AtomicU64>,
         replay_base_pending_publish: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -349,7 +347,6 @@ impl TurboliteWalReplicator {
             walrust_prefix,
             walrust_storage,
             walrust,
-            replay_base_seq,
             replay_base_pending_publish,
             live_wal_path: Mutex::new(None),
         }
@@ -372,31 +369,7 @@ impl TurboliteWalReplicator {
         Ok(cache_dir.join(format!("{}-wal", db_name.to_string_lossy())))
     }
 
-    async fn current_walrust_seq(&self, name: &str) -> Result<u64> {
-        self.walrust
-            .inner()
-            .current_seq(name)
-            .await
-            .ok_or_else(|| anyhow!("walrust database '{}' is not registered", name))
-    }
-
-    async fn live_wal_has_frames(&self) -> bool {
-        let wal_path = self
-            .live_wal_path
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
-        let Some(wal_path) = wal_path else {
-            return false;
-        };
-        walrust::wal::get_wal_size(&wal_path)
-            .await
-            .map(|size| size > 32)
-            .unwrap_or(false)
-    }
-
-    async fn publish_current_manifest(&self, name: &str, has_new_wal_frames: bool) -> Result<()> {
-        let current_manifest = self.vfs.manifest();
+    async fn publish_current_manifest(&self, name: &str, _has_new_wal_frames: bool) -> Result<()> {
         if !should_publish_manifest(&self.vfs) {
             return Err(anyhow!(
                 "{} (turbolite manifest is still empty)",
@@ -404,43 +377,12 @@ impl TurboliteWalReplicator {
             ));
         }
 
-        // Resolve the cursor that the published manifest must
-        // carry. If the base manifest version has not advanced
-        // since a previous publish, we must keep the existing
-        // hybrid cursor: a follower replaying from this manifest
-        // expects WAL frames after that cursor, not after the
-        // latest in-memory walrust seq.
-        let current_walrust_seq = self.current_walrust_seq(name).await?;
-        let live_wal_has_frames = self.live_wal_has_frames().await;
-        let mut used_pending_replay_base = false;
-        let walrust_seq = if let Some(existing) = self.manifest_store.get(&self.manifest_key).await?
-        {
-            match turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&existing.payload) {
-                Ok((published_manifest, Some((published_seq, _))))
-                    if published_manifest.version == current_manifest.version =>
-                {
-                    published_seq
-                }
-                Ok(_) | Err(_) if self.replay_base_pending_publish.load(Ordering::Acquire) => {
-                    used_pending_replay_base = true;
-                    self.replay_base_seq.load(Ordering::Acquire)
-                }
-                Ok((_published_manifest, Some((published_seq, _))))
-                    if has_new_wal_frames
-                        || (live_wal_has_frames && current_walrust_seq > published_seq) =>
-                {
-                    published_seq
-                }
-                Ok(_) | Err(_) => current_walrust_seq,
-            }
-        } else {
-            current_walrust_seq
-        };
+        let used_pending_replay_base = self.replay_base_pending_publish.load(Ordering::Acquire);
 
         // Route through `publish_replayed_base`. For a leader that
         // checkpointed via the SQLite write path, pending replay
         // state is empty and this is equivalent to encoding the
-        // current hybrid manifest. For a freshly-promoted follower
+        // current pure base manifest. For a freshly-promoted follower
         // that has accumulated replay staging logs and dirty
         // groups, this flushes them to remote storage as fresh
         // page-group keys before encoding the hybrid manifest, so
@@ -449,7 +391,7 @@ impl TurboliteWalReplicator {
         // page-group keys.
         let payload = self
             .vfs
-            .publish_replayed_base(walrust_seq, &self.walrust_prefix)
+            .publish_replayed_base()
             .map_err(|e| anyhow!("turbolite publish_replayed_base failed: {}", e))?;
         publish_manifest(
             &self.manifest_store,
@@ -524,17 +466,10 @@ impl TurboliteWalReplicator {
 
         let payload_owned = manifest.payload.clone();
 
-        let (decoded_manifest, decoded_walrust) =
+        let decoded_manifest =
             turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&payload_owned)
                 .map_err(|e| anyhow!("turbolite decode_manifest_bytes failed: {}", e))?;
-
-        if decoded_walrust.is_none() {
-            return Err(anyhow!(
-                "continuous manifest for '{}' must carry walrust replay cursor",
-                name
-            ));
-        }
-        let (walrust_seq, _changeset_prefix) = decoded_walrust.expect("decoded_walrust was Some");
+        let walrust_seq = decoded_manifest.change_counter;
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut attempts = 0u32;
@@ -554,7 +489,6 @@ impl TurboliteWalReplicator {
             let payload_for_attempt = payload_owned.clone();
             let decoded_manifest_for_attempt = decoded_manifest.clone();
             let name_owned = name.to_string();
-            let replay_base_seq = self.replay_base_seq.clone();
             let replay_base_pending_publish = self.replay_base_pending_publish.clone();
             let attempt = tokio::task::spawn_blocking(move || -> Result<()> {
                 let _gate = loop {
@@ -575,6 +509,10 @@ impl TurboliteWalReplicator {
                 let page_count = vfs.manifest().page_count;
                 vfs.sync_after_external_restore(page_count);
 
+                let base_checksum = walrust::ltx::compute_checksum_from_file(&cache_path)
+                    .map_err(|e| anyhow!("walrust base checksum failed: {}", e))?;
+                prepared_replay.validate_base_checksum(base_checksum)?;
+
                 let handle = vfs
                     .begin_replay()
                     .map_err(|e| anyhow!("turbolite begin_replay failed: {}", e))?;
@@ -588,7 +526,6 @@ impl TurboliteWalReplicator {
                     final_seq
                 );
                 if final_seq > walrust_seq {
-                    replay_base_seq.store(final_seq, Ordering::Release);
                     replay_base_pending_publish.store(true, Ordering::Release);
                 }
 

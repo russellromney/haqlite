@@ -28,7 +28,6 @@ pub struct TurboliteFollowerBehavior {
     walrust_storage: Option<Arc<dyn StorageBackend>>,
     walrust_prefix: Option<String>,
     wakeup: Option<Arc<tokio::sync::Notify>>,
-    replay_base_seq: Option<Arc<AtomicU64>>,
     replay_base_pending_publish: Option<Arc<AtomicBool>>,
 }
 
@@ -41,7 +40,6 @@ impl TurboliteFollowerBehavior {
             walrust_storage: None,
             walrust_prefix: None,
             wakeup: None,
-            replay_base_seq: None,
             replay_base_pending_publish: None,
         }
     }
@@ -71,31 +69,26 @@ impl TurboliteFollowerBehavior {
         self
     }
 
-    pub fn with_replay_base_tracking(
-        mut self,
-        seq: Arc<AtomicU64>,
-        pending_publish: Arc<AtomicBool>,
-    ) -> Self {
-        self.replay_base_seq = Some(seq);
+    pub fn with_replay_base_tracking(mut self, pending_publish: Arc<AtomicBool>) -> Self {
         self.replay_base_pending_publish = Some(pending_publish);
         self
     }
 
-    fn requires_hybrid_payload(&self) -> bool {
+    fn requires_delta_replay(&self) -> bool {
         self.walrust_storage.is_some() || self.walrust_prefix.is_some()
     }
 
-    /// Apply a published hybrid manifest: materialize the base then
-    /// replay walrust delta pages on top. The whole sequence runs
+    /// Apply a published base manifest: materialize the Turbolite base,
+    /// then, for Continuous mode, list and replay walrust delta pages on top.
+    /// The whole sequence runs
     /// under one VFS replay-gate write so VFS-routed reads either
     /// complete before the gate is taken or block at xLock until
     /// apply finishes.
     ///
-    /// Skip the apply entirely when the manifest is a no-walrust
-    /// payload at the same or older version. The skip is gated on
-    /// `walrust.is_none()` because a continuous manifest can be
-    /// republished at the same version while new walrust frames
-    /// upload — skipping it would latch the follower stale.
+    /// In Continuous mode the follower position is a delta seq, not a
+    /// Turbolite manifest version. A same-base poll can still have new
+    /// delta objects, so Continuous never no-ops solely because the base
+    /// manifest version is unchanged.
     async fn apply_manifest_payload(
         &self,
         db_name: &str,
@@ -103,18 +96,11 @@ impl TurboliteFollowerBehavior {
         payload: &[u8],
         current_version: u64,
     ) -> Result<ApplyOutcome> {
-        let (decoded_manifest, decoded_walrust) =
-            turbolite::tiered::TurboliteVfs::decode_manifest_bytes(payload)
-                .map_err(|e| anyhow!("turbolite decode_manifest_bytes failed: {}", e))?;
-        if decoded_walrust.is_none() && decoded_manifest.version <= current_version {
+        let decoded_manifest = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(payload)
+            .map_err(|e| anyhow!("turbolite decode_manifest_bytes failed: {}", e))?;
+        let continuous = self.requires_delta_replay();
+        if !continuous && decoded_manifest.version <= current_version {
             return Ok(ApplyOutcome::Noop);
-        }
-
-        if self.requires_hybrid_payload() && decoded_walrust.is_none() {
-            return Err(anyhow!(
-                "continuous manifest for '{}' must carry walrust replay cursor",
-                db_name
-            ));
         }
 
         // A missing page-group during materialize is a transient
@@ -125,7 +111,6 @@ impl TurboliteFollowerBehavior {
         let gate = self.vfs.replay_gate();
         let payload_owned = payload.to_vec();
         let db_name_owned = db_name.to_string();
-        let replay_base_seq = self.replay_base_seq.clone();
         let replay_base_pending_publish = self.replay_base_pending_publish.clone();
 
         // Materialize before set_manifest_bytes: pre-flighting
@@ -137,43 +122,35 @@ impl TurboliteFollowerBehavior {
         // base manifest installed, a same-base poll should only pull
         // WAL objects after the caller's current seq; rematerializing
         // the old base every poll creates a base/replay churn window.
-        let materialize_base = match decoded_walrust.as_ref() {
-            Some((_base_seq, _)) => {
-                let local_manifest = self.vfs.manifest();
-                decoded_manifest.version > local_manifest.version
+        let local_manifest = self.vfs.manifest();
+        let materialize_base = decoded_manifest.version > local_manifest.version;
+        let replay_start_seq = if continuous {
+            if materialize_base {
+                decoded_manifest.change_counter
+            } else {
+                current_version.max(local_manifest.change_counter)
             }
-            None => true,
+        } else {
+            0
         };
-        let replay_start_seq = match decoded_walrust.as_ref() {
-            Some((base_seq, _)) if !materialize_base => current_version.max(*base_seq),
-            Some((base_seq, _)) => *base_seq,
-            None => 0,
-        };
-        let prepared_replay = match decoded_walrust.as_ref() {
-            Some((_base_seq, _changeset_prefix)) => {
-                let storage = self
-                    .walrust_storage
-                    .as_ref()
-                    .ok_or_else(|| {
-                        anyhow!("continuous follower '{}' missing walrust storage", db_name)
-                    })?
-                    .clone();
-                let prefix = self
-                    .walrust_prefix
-                    .as_ref()
-                    .ok_or_else(|| {
-                        anyhow!("continuous follower '{}' missing walrust prefix", db_name)
-                    })?
-                    .clone();
-                Some(
-                    prepare_page_replay(storage.as_ref(), &prefix, db_name, replay_start_seq)
-                        .await?,
-                )
-            }
-            None => None,
+        let prepared_replay = if continuous {
+            let storage = self
+                .walrust_storage
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow!("continuous follower '{}' missing walrust storage", db_name)
+                })?
+                .clone();
+            let prefix = self
+                .walrust_prefix
+                .as_ref()
+                .ok_or_else(|| anyhow!("continuous follower '{}' missing walrust prefix", db_name))?
+                .clone();
+            Some(prepare_page_replay(storage.as_ref(), &prefix, db_name, replay_start_seq).await?)
+        } else {
+            None
         };
         let decoded_manifest_for_materialize = decoded_manifest.clone();
-        let decoded_walrust_for_replay = decoded_walrust.clone();
 
         let result = tokio::task::spawn_blocking(move || -> Result<ApplyOutcome> {
             let _gate = loop {
@@ -207,7 +184,13 @@ impl TurboliteFollowerBehavior {
                 vfs.sync_after_external_restore(page_count);
             }
 
-            if let Some(_walrust) = decoded_walrust_for_replay {
+            if continuous {
+                let base_checksum = walrust::ltx::compute_checksum_from_file(&cache_path)
+                    .map_err(|e| anyhow!("walrust base checksum failed: {}", e))?;
+                prepared_replay
+                    .as_ref()
+                    .expect("decoded walrust requires prepared replay")
+                    .validate_base_checksum(base_checksum)?;
                 let handle = vfs
                     .begin_replay()
                     .map_err(|e| anyhow!("turbolite begin_replay failed: {}", e))?;
@@ -223,10 +206,7 @@ impl TurboliteFollowerBehavior {
                     final_seq,
                 );
                 if final_seq > replay_start_seq {
-                    if let (Some(seq), Some(pending)) =
-                        (replay_base_seq, replay_base_pending_publish)
-                    {
-                        seq.store(final_seq, Ordering::Release);
+                    if let Some(pending) = replay_base_pending_publish {
                         pending.store(true, Ordering::Release);
                     }
                 }

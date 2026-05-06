@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use common::InMemoryStorage;
 use hadb::Replicator;
+use hadb_storage::StorageBackend;
 use haqlite::SqliteReplicator;
 use tempfile::TempDir;
 
@@ -34,9 +35,24 @@ async fn plain_sqlite_replicator_add_still_uploads_initial_snapshot() {
         .expect("register database");
 
     let keys = storage.keys().await;
-    assert!(
-        keys.contains(&"plain/plain/0001/0000000000000001.hadbp".to_string()),
-        "expected initial snapshot upload, got keys: {:?}",
+    let snapshot_keys: Vec<_> = keys
+        .iter()
+        .filter(|key| key.starts_with("plain/plain/0001/") && key.ends_with(".hadbp"))
+        .collect();
+    assert_eq!(
+        snapshot_keys.len(),
+        1,
+        "expected exactly one initial snapshot upload, got keys: {:?}",
         keys
+    );
+
+    let snapshot_bytes = storage
+        .get(snapshot_keys[0])
+        .await
+        .expect("read uploaded snapshot")
+        .expect("snapshot key exists");
+    assert!(
+        snapshot_bytes.starts_with(b"HADBP"),
+        "snapshot should be encoded as HADBP"
     );
 }

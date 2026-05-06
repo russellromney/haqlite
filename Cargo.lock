@@ -4116,7 +4116,6 @@ dependencies = [
 [[package]]
 name = "turbolite"
 version = "0.4.1"
-source = "git+https://github.com/russellromney/turbolite.git?branch=benchmark%2Fs3-express-verify#dad1e7ed635d5795e4182984abd97aec276048bd"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4296,7 +4295,6 @@ dependencies = [
 [[package]]
 name = "walrust"
 version = "0.3.1"
-source = "git+https://github.com/russellromney/walrust.git?branch=hoist-public-deps#1bdbc26c896ccb53643e82e2b2cbe5b696aa75df"
 dependencies = [
  "anyhow",
  "async-trait",

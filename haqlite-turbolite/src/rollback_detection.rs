@@ -32,6 +32,16 @@ impl RollbackDetector {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("db_path has no parent: {}", db_path.display()))?;
         let cache_dir = parent.join(format!(".tl_cache_{}", database_id));
+        self.check_and_repair_with_cache_dir(database_id, db_path, &cache_dir)
+            .await
+    }
+
+    pub async fn check_and_repair_with_cache_dir(
+        &self,
+        database_id: &str,
+        db_path: &Path,
+        cache_dir: &Path,
+    ) -> Result<bool> {
         let local_manifest_path = cache_dir.join("manifest.msgpack");
 
         let local_epoch_opt = match std::fs::read(&local_manifest_path) {
@@ -78,11 +88,8 @@ impl RollbackDetector {
                 );
                 remove_path_if_exists(&cache_dir)
                     .with_context(|| format!("wipe cache dir {}", cache_dir.display()))?;
-                remove_path_if_exists(db_path)
-                    .with_context(|| format!("wipe SQLite stub {}", db_path.display()))?;
-                let shm_path = db_path.with_extension("db-shm");
-                remove_path_if_exists(&shm_path)
-                    .with_context(|| format!("wipe SQLite shm {}", shm_path.display()))?;
+                remove_sqlite_artifacts(db_path)
+                    .with_context(|| format!("wipe SQLite artifacts for {}", db_path.display()))?;
                 seed_remote_manifest(&cache_dir, &local_manifest_path, &remote_bytes)?;
                 tracing::info!(
                     database_id = %database_id,
@@ -98,11 +105,8 @@ impl RollbackDetector {
                     bytes = remote_bytes.len(),
                     "no local manifest; pre-seeding remote so turbolite opens aligned",
                 );
-                remove_path_if_exists(db_path)
-                    .with_context(|| format!("wipe SQLite stub {}", db_path.display()))?;
-                let shm_path = db_path.with_extension("db-shm");
-                remove_path_if_exists(&shm_path)
-                    .with_context(|| format!("wipe SQLite shm {}", shm_path.display()))?;
+                remove_sqlite_artifacts(db_path)
+                    .with_context(|| format!("wipe SQLite artifacts for {}", db_path.display()))?;
                 seed_remote_manifest(&cache_dir, &local_manifest_path, &remote_bytes)?;
                 Ok(true)
             }
@@ -158,10 +162,53 @@ fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
     }
 }
 
+fn remove_sqlite_artifacts(db_path: &Path) -> std::io::Result<()> {
+    remove_path_if_exists(db_path)?;
+    remove_path_if_exists(&db_path.with_extension("db-wal"))?;
+    remove_path_if_exists(&db_path.with_extension("db-shm"))?;
+
+    let lock_path = db_path.with_file_name(format!(
+        "{}-lock",
+        db_path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "haqlite.db".into())
+    ));
+    remove_path_if_exists(&lock_path)
+}
+
 fn seed_remote_manifest(cache_dir: &Path, manifest_path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("create cache dir {}", cache_dir.display()))?;
     std::fs::write(manifest_path, bytes)
         .with_context(|| format!("pre-seed remote manifest at {}", manifest_path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_sqlite_artifacts_removes_file_first_companions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("app.db");
+        let wal_path = db_path.with_extension("db-wal");
+        let shm_path = db_path.with_extension("db-shm");
+        let lock_path = dir.path().join("app.db-lock");
+
+        for path in [&db_path, &wal_path, &shm_path, &lock_path] {
+            std::fs::write(path, b"stale").expect("seed stale artifact");
+        }
+
+        remove_sqlite_artifacts(&db_path).expect("remove artifacts");
+
+        for path in [&db_path, &wal_path, &shm_path, &lock_path] {
+            assert!(
+                !path.exists(),
+                "rollback repair should remove {}",
+                path.display()
+            );
+        }
+    }
 }

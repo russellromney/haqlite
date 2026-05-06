@@ -84,10 +84,9 @@ async fn turbolite_manifest_bytes_round_trip_preserves_epoch_and_change_counter(
     let backend_b: Arc<dyn hadb_storage::StorageBackend> =
         Arc::new(hadb_storage_local::LocalStorage::new(&cache_b));
     let vfs_b = TurboliteVfs::with_backend(config_b, backend_b, rt_handle_b).expect("vfs b");
-    let walrust = vfs_b
+    vfs_b
         .set_manifest_bytes(&bytes)
         .expect("set_manifest_bytes");
-    assert!(walrust.is_none());
     let got = vfs_b.manifest();
     assert_eq!(got.epoch, 9, "epoch must survive manifest round-trip");
     assert_eq!(

@@ -320,8 +320,8 @@ async fn dump_replication_state(
             let decoded = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&m.payload)
                 .expect("decode manifest payload");
             format!(
-                "manifest.version={} change_counter={} walrust={:?} wal_keys={:?}",
-                decoded.0.version, decoded.0.change_counter, decoded.1, wal_keys
+                "manifest.version={} change_counter={} wal_keys={:?}",
+                decoded.version, decoded.change_counter, wal_keys
             )
         }
         None => format!("manifest=<none> wal_keys={:?}", wal_keys),
@@ -345,15 +345,14 @@ async fn dump_storage_backed_replication_state(
 
     let manifest_summary = match manifest {
         Ok(Some(m)) => match turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&m.payload) {
-            Ok((decoded, walrust)) => format!(
-                "envelope_version={} writer_id={} decoded_version={} page_count={} groups={} change_counter={} walrust={:?}",
+            Ok(decoded) => format!(
+                "envelope_version={} writer_id={} decoded_version={} page_count={} groups={} change_counter={}",
                 m.version,
                 m.writer_id,
                 decoded.version,
                 decoded.page_count,
                 decoded.page_group_keys.len(),
-                decoded.change_counter,
-                walrust
+                decoded.change_counter
             ),
             Err(e) => format!(
                 "envelope_version={} writer_id={} decode_error={e}",
@@ -391,14 +390,12 @@ async fn diagnose_plain_walrust_replay(
     }) else {
         return "manifest=<none>".to_string();
     };
-    let (decoded, Some((seq, prefix))) =
-        (match turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload) {
-            Ok(v) => v,
-            Err(e) => return format!("manifest_decode_error={e}"),
-        })
-    else {
-        return "manifest_has_no_walrust_cursor".to_string();
+    let decoded = match turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload) {
+        Ok(v) => v,
+        Err(e) => return format!("manifest_decode_error={e}"),
     };
+    let seq = decoded.change_counter;
+    let prefix = "test/";
 
     let tmp = match TempDir::new() {
         Ok(tmp) => tmp,
@@ -479,6 +476,36 @@ fn raw_cache_snapshot(cache_path: &Path) -> String {
     }
 }
 
+async fn materialized_manifest_count(
+    vfs: &SharedTurboliteVfs,
+    manifest: &turbolite::tiered::Manifest,
+    table: &str,
+) -> Result<i64> {
+    let tmp = TempDir::new().expect("manifest materialize tmp");
+    let db_path = tmp.path().join("manifest-check.db");
+    let shared = vfs.shared_state();
+    let manifest = manifest.clone();
+    let materialize_path = db_path.clone();
+    tokio::task::spawn_blocking(move || {
+        shared.materialize_manifest_to_file(&manifest, &materialize_path)
+    })
+    .await
+    .map_err(|e| anyhow!("manifest materialize task panicked: {e}"))?
+    .map_err(|e| anyhow!("manifest materialize failed: {e}"))?;
+
+    let table = table.to_string();
+    tokio::task::spawn_blocking(move || -> Result<i64> {
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| anyhow!("open materialized manifest db: {e}"))?;
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| anyhow!("query materialized manifest count: {e}"))
+    })
+    .await
+    .map_err(|e| anyhow!("manifest count task panicked: {e}"))?
+}
+
 #[cfg(feature = "s3")]
 fn raw_canonical_cache_snapshot(cache_path: &Path) -> String {
     match rusqlite::Connection::open_with_flags(
@@ -508,15 +535,14 @@ fn raw_canonical_cache_snapshot(cache_path: &Path) -> String {
 }
 
 /// Scan the follower tempdir for filenames that look like a temp
-/// SQLite restore artifact (`*restore*`, `*.sqlite`, `*.db`).
+/// SQLite restore artifact (`*restore*`, `*.sqlite`, unexpected `*.db`).
 ///
-/// Allows the turbolite layout: `data.cache` plus its SQLite shm/wal
-/// sidecars, and anything under a `locks/` subdirectory (turbolite's
-/// per-database file-guard markers are named `<db>.db` and would
-/// otherwise trip `*.db`).
-fn scan_for_restore_artifacts(dir: &Path) -> Vec<PathBuf> {
+/// Allows the current file-first turbolite layout: the named primary
+/// database artifact, `data.cache` compatibility fixtures, their SQLite
+/// shm/wal sidecars, and anything under a `locks/` subdirectory.
+fn scan_for_restore_artifacts(dir: &Path, primary_db_name: &str) -> Vec<PathBuf> {
     let mut hits = Vec::new();
-    fn walk(dir: &Path, in_locks: bool, hits: &mut Vec<PathBuf>) {
+    fn walk(dir: &Path, in_locks: bool, primary_db_name: &str, hits: &mut Vec<PathBuf>) {
         let entries = match std::fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(_) => return,
@@ -533,7 +559,7 @@ fn scan_for_restore_artifacts(dir: &Path) -> Vec<PathBuf> {
             };
             if ft.is_dir() {
                 let entered_locks = in_locks || name == "locks";
-                walk(&path, entered_locks, hits);
+                walk(&path, entered_locks, primary_db_name, hits);
                 continue;
             }
             // Anything under `locks/` is a turbolite file-guard
@@ -547,18 +573,25 @@ fn scan_for_restore_artifacts(dir: &Path) -> Vec<PathBuf> {
             if name.starts_with("data.cache") {
                 continue;
             }
+            if name == primary_db_name
+                || name == format!("{primary_db_name}-wal")
+                || name == format!("{primary_db_name}-shm")
+                || name == format!("{primary_db_name}-lock")
+            {
+                continue;
+            }
             let lower = name.to_ascii_lowercase();
             if lower.contains("restore") || lower.ends_with(".sqlite") || lower.ends_with(".db") {
                 hits.push(path);
             }
         }
     }
-    walk(dir, false, &mut hits);
+    walk(dir, false, primary_db_name, &mut hits);
     hits
 }
 
-fn assert_no_restore_artifacts(dir: &Path, label: &str) {
-    let hits = scan_for_restore_artifacts(dir);
+fn assert_no_restore_artifacts(dir: &Path, label: &str, primary_db_name: &str) {
+    let hits = scan_for_restore_artifacts(dir, primary_db_name);
     assert!(
         hits.is_empty(),
         "{}: found temp-restore-shaped artifact(s) in {}: {:?}",
@@ -777,7 +810,7 @@ async fn run_singlewriter_failover(durability: turbodb::Durability) -> Result<()
     }
 
     // Quiescent point #1 (post catch-up).
-    assert_no_restore_artifacts(follower_tmp.path(), "post-follower-catch-up");
+    assert_no_restore_artifacts(follower_tmp.path(), "post-follower-catch-up", "failover.db");
 
     leader
         .db
@@ -826,7 +859,7 @@ async fn run_singlewriter_failover(durability: turbodb::Durability) -> Result<()
     wait_for_value(&follower.db, 2, "after-promotion", Duration::from_secs(3)).await?;
 
     // Quiescent point #2 (post promotion + post-promotion write).
-    assert_no_restore_artifacts(follower_tmp.path(), "post-promotion");
+    assert_no_restore_artifacts(follower_tmp.path(), "post-promotion", "failover.db");
 
     Ok(())
 }
@@ -1509,11 +1542,12 @@ async fn follower_reads_remain_consistent_during_concurrent_materialize() {
         .expect("follower converges after concurrent torture");
 }
 
-/// After failover + a post-promotion write, a fresh third node
+/// After failover + post-promotion writes, a fresh third node
 /// joining from the published manifest must see both pre-promotion
-/// and post-promotion rows. Asserts the post-promotion manifest is
-/// actually a usable base (fresh page-group keys, advanced walrust
-/// cursor) before spinning the third node up.
+/// and post-promotion rows. The promotion itself must publish the
+/// accumulated pre-crash replay state as a usable page/base manifest;
+/// later SQL writes remain WAL/HADBP deltas until SQLite checkpoints
+/// them into the base.
 #[tokio::test(flavor = "multi_thread")]
 async fn singlewriter_promotion_publishes_usable_base() {
     let _guard = FAILOVER_TEST_LOCK.lock().await;
@@ -1521,8 +1555,9 @@ async fn singlewriter_promotion_publishes_usable_base() {
     let follower_tmp = TempDir::new().expect("follower tmp");
     let third_tmp = TempDir::new().expect("third tmp");
 
-    // Tight checkpoint thresholds so post-promotion writes embed
-    // into the base — defaults won't fire in a unit-test window.
+    // Tight intervals keep the proof quick. Continuous mode still
+    // ships post-promotion SQL through walrust until SQLite checkpoints
+    // the WAL into the Turbolite base.
     let durability = turbodb::Durability::Continuous {
         checkpoint: turbodb::CheckpointConfig {
             interval: Duration::from_millis(100),
@@ -1594,10 +1629,9 @@ async fn singlewriter_promotion_publishes_usable_base() {
         .expect("manifest_store get pre-promotion")
         .expect("pre-promotion manifest exists")
         .payload;
-    let (pre_manifest, pre_walrust) =
+    let pre_manifest =
         turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&pre_promotion_manifest_bytes)
             .expect("decode pre-promotion manifest");
-    let pre_walrust_cursor = pre_walrust.as_ref().map(|(seq, _)| *seq);
     let pre_keys: std::collections::HashSet<String> =
         pre_manifest.page_group_keys.iter().cloned().collect();
 
@@ -1615,8 +1649,8 @@ async fn singlewriter_promotion_publishes_usable_base() {
         .await
         .expect("promoted leader still sees before-crash");
 
-    // Multiple post-promotion writes give the checkpoint trigger
-    // room to embed WAL frames into the base.
+    // Multiple post-promotion writes should produce WAL/HADBP deltas
+    // after the promotion base.
     for i in 2..=6i64 {
         follower
             .db
@@ -1634,14 +1668,10 @@ async fn singlewriter_promotion_publishes_usable_base() {
         .await
         .expect("promoted leader sees all post-promotion rows");
 
-    // Drain the publish chain so the manifest_store reflects the
-    // post-promotion base. With commit_count=1, every commit
-    // triggers a turbolite checkpoint, so a generous sleep here
-    // is enough.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Wait for both the promotion publish AND the post-INSERT
-    // publish to land — version + cursor must both advance.
+    // Wait for the promotion publish to land: the pre-crash row
+    // must now be present in the pure page/base manifest. The later
+    // rows are expected to arrive through walrust deltas, not by
+    // forcing an immediate SQLite checkpoint.
     let deadline = Instant::now() + Duration::from_secs(8);
     let post_promotion_manifest_bytes = loop {
         let bytes = manifest_store
@@ -1650,31 +1680,31 @@ async fn singlewriter_promotion_publishes_usable_base() {
             .expect("manifest_store get post-promotion")
             .expect("post-promotion manifest exists")
             .payload;
-        let (m, walrust_now) = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
+        let m = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
             .expect("decode post-promotion manifest");
-        let cursor_now = walrust_now.as_ref().map(|(seq, _)| *seq);
-        let cursor_advanced = match (pre_walrust_cursor, cursor_now) {
-            (Some(pre), Some(now)) => now > pre,
-            _ => true,
-        };
-        if m.version > pre_manifest.version && cursor_advanced {
+        let published_count = materialized_manifest_count(&follower.vfs, &m, "t")
+            .await
+            .expect("materialize post-promotion manifest for count");
+        if m.version > pre_manifest.version && published_count >= 1 {
             break bytes;
         }
         if Instant::now() >= deadline {
             panic!(
-                "post-promotion manifest did not advance past pre-promotion v{} (cursor pre={:?} now={:?}) within timeout",
-                pre_manifest.version, pre_walrust_cursor, cursor_now
+                "promotion manifest did not publish the replayed pre-crash base past pre-promotion v{} within timeout; last version={}, last materialized count={}",
+                pre_manifest.version,
+                m.version,
+                published_count,
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    let (post_manifest, post_walrust) =
+    let post_manifest =
         turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&post_promotion_manifest_bytes)
             .expect("decode post-promotion manifest (final)");
 
     // The post-promotion manifest must be a real usable base:
     // version advanced, page coverage at least as wide, fresh
-    // page-group keys uploaded, walrust cursor advanced.
+    // page-group keys uploaded.
     assert!(
         post_manifest.version > pre_manifest.version,
         "post-promotion manifest version did not advance: {} -> {}",
@@ -1700,22 +1730,31 @@ async fn singlewriter_promotion_publishes_usable_base() {
         pre_keys,
         post_manifest.page_group_keys
     );
-    let post_walrust_cursor = post_walrust.as_ref().map(|(seq, _)| *seq);
-    assert!(
-        post_walrust_cursor.is_some(),
-        "post-promotion manifest dropped its walrust cursor"
-    );
-    if let (Some(pre), Some(post)) = (pre_walrust_cursor, post_walrust_cursor) {
-        assert!(
-            post > pre,
-            "post-promotion walrust cursor did not advance: {} -> {}",
-            pre,
-            post
-        );
-    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let walrust_keys = loop {
+        let mut keys = walrust_storage_impl.keys().await;
+        keys.sort();
+        let has_post_promotion_delta = keys.iter().any(|key| {
+            key.contains("/0000000000000004.hadbp")
+                || key.contains("/0000000000000005.hadbp")
+                || key.contains("/0000000000000006.hadbp")
+        });
+        if has_post_promotion_delta {
+            break keys;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "post-promotion writes did not publish walrust deltas beyond the promotion base; keys={:?}",
+                keys
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
 
     // Fresh third node sharing the same storage — joins as
-    // Follower and must catch up to both rows.
+    // Follower and must catch up from the promotion base plus
+    // post-promotion WAL/HADBP deltas.
     let third = build_singlewriter_node(
         third_tmp.path(),
         "failover",
@@ -1736,17 +1775,13 @@ async fn singlewriter_promotion_publishes_usable_base() {
         let third_vfs = vfs_snapshot(third_tmp.path(), "failover", &third.vfs_name);
         let third_raw = raw_cache_snapshot(&third_tmp.path().join("data.cache"));
         let promoted_local = local_vfs_state(&follower.vfs);
-        let walrust_keys = walrust_storage_impl.keys().await;
         panic!(
             "third node count: {}; \
-             pre_walrust_cursor={:?} post_walrust_cursor={:?} \
              pre_keys={:?} post_keys={:?} \
              walrust_keys={:?} \
              promoted_leader: {}; \
              third: {}; {}; {}; {}",
             e,
-            pre_walrust_cursor,
-            post_walrust_cursor,
             pre_keys,
             post_manifest.page_group_keys,
             walrust_keys,
@@ -1767,7 +1802,7 @@ async fn singlewriter_promotion_publishes_usable_base() {
         .await
         .expect("third node sees last after-promotion row");
 
-    assert_no_restore_artifacts(third_tmp.path(), "third-fresh-follower");
+    assert_no_restore_artifacts(third_tmp.path(), "third-fresh-follower", "failover.db");
 }
 
 /// Failover when the follower has already replayed every walrust
@@ -1865,10 +1900,9 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
         .expect("manifest_store get pre-promotion")
         .expect("pre-promotion manifest exists")
         .payload;
-    let (pre_manifest, pre_walrust) =
+    let pre_manifest =
         turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&pre_promotion_manifest_bytes)
             .expect("decode pre-promotion manifest");
-    let pre_walrust_cursor = pre_walrust.as_ref().map(|(seq, _)| *seq);
     let pre_keys: std::collections::HashSet<String> =
         pre_manifest.page_group_keys.iter().cloned().collect();
     let pre_envelope_version = manifest_store
@@ -1905,7 +1939,7 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
             .expect("manifest_store get post-promotion")
             .expect("manifest exists post-promotion")
             .payload;
-        let (m, _) = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
+        let m = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
             .expect("decode post-promotion manifest");
         let post_keys: std::collections::HashSet<&String> = m.page_group_keys.iter().collect();
         let has_new_key = post_keys
@@ -1932,10 +1966,9 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
     };
 
     // Manifest-inspection assertions (pre vs post).
-    let (post_manifest, post_walrust) =
+    let post_manifest =
         turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&post_promotion_manifest_bytes)
             .expect("decode post-promotion manifest (final)");
-    let post_walrust_cursor = post_walrust.as_ref().map(|(seq, _)| *seq);
     let new_keys: Vec<&String> = post_manifest
         .page_group_keys
         .iter()
@@ -1947,10 +1980,6 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
          (the flush of accumulated replay state). pre_keys={:?} post_keys={:?}",
         pre_keys,
         post_manifest.page_group_keys
-    );
-    assert!(
-        post_walrust_cursor.is_some(),
-        "post-promotion manifest dropped its walrust cursor"
     );
 
     // Empty walrust storage for the third: if `before-crash`
@@ -1980,15 +2009,8 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
             panic!(
                 "third node did not see row 1 from materialize alone: {}; \
                  pre_keys={:?} post_keys={:?} new_keys_in_post={:?} \
-                 pre_walrust_cursor={:?} post_walrust_cursor={:?} \
                  third_walrust_keys={:?}",
-                e,
-                pre_keys,
-                post_manifest.page_group_keys,
-                new_keys,
-                pre_walrust_cursor,
-                post_walrust_cursor,
-                third_walrust_keys,
+                e, pre_keys, post_manifest.page_group_keys, new_keys, third_walrust_keys,
             )
         });
 
@@ -2000,7 +2022,7 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
         third_walrust_keys
     );
 
-    assert_no_restore_artifacts(third_tmp.path(), "third-already-caught-up");
+    assert_no_restore_artifacts(third_tmp.path(), "third-already-caught-up", "failover.db");
 }
 
 /// Run a future to completion from sync code inside an async test.

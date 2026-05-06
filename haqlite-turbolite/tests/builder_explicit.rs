@@ -21,7 +21,7 @@ mod common;
 
 use common::InMemoryStorage;
 use hadb::InMemoryLeaseStore;
-use haqlite_turbolite::{Builder, HaMode};
+use haqlite_turbolite::{Builder, HaMode, Role};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -54,6 +54,172 @@ fn dummy_turbolite_vfs(tmp: &TempDir) -> (SharedTurboliteVfs, String) {
     let name = format!("test_{}", uuid::Uuid::new_v4());
     turbolite::tiered::register_shared(&name, shared_vfs.clone()).expect("register");
     (shared_vfs, name)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn turbolite_local_paths_make_db_path_primary_artifact() {
+    unset_env();
+    let tmp = TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("app.db");
+    let sidecar_dir = tmp.path().join("app.db-state");
+    let storage = Arc::new(InMemoryStorage::new());
+
+    let db = Builder::new()
+        .prefix("layout/")
+        .mode(HaMode::SingleWriter)
+        .role(Role::Leader)
+        .durability(turbodb::Durability::Cloud)
+        .lease_store(Arc::new(InMemoryLeaseStore::new()))
+        .manifest_store(Arc::new(MemManifestStore::new()))
+        .turbolite_storage(storage)
+        .turbolite_local_paths(&sidecar_dir, &db_path)
+        .instance_id("layout-node")
+        .open(
+            db_path.to_str().expect("path"),
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)",
+        )
+        .await
+        .expect("file-first open");
+
+    db.execute("INSERT INTO t (id) VALUES (1)", &[])
+        .expect("insert through file-first layout");
+
+    assert!(db_path.exists(), "main artifact should be caller db path");
+    assert!(
+        sidecar_dir.exists(),
+        "sidecar should be derived implementation state"
+    );
+    assert!(
+        sidecar_dir.join("local_state.msgpack").exists(),
+        "unified local state should live under sidecar"
+    );
+    assert!(
+        tmp.path().join("app.db-lock").exists(),
+        "lock anchor should sit beside the db path"
+    );
+    assert!(
+        !tmp.path().join(".tl_cache_app").exists(),
+        "file-first product layout must not create the legacy cache path"
+    );
+    assert!(
+        !sidecar_dir.join("locks").exists(),
+        "file-first product layout must not create a locks directory"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn default_turbolite_layout_is_file_first() {
+    unset_env();
+    let tmp = TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("app.db");
+    let sidecar_dir = tmp.path().join("app.db-turbolite");
+    let storage = Arc::new(InMemoryStorage::new());
+
+    let db = Builder::new()
+        .prefix("default-layout/")
+        .mode(HaMode::SingleWriter)
+        .role(Role::Leader)
+        .durability(turbodb::Durability::Cloud)
+        .lease_store(Arc::new(InMemoryLeaseStore::new()))
+        .manifest_store(Arc::new(MemManifestStore::new()))
+        .turbolite_storage(storage)
+        .instance_id("default-layout-node")
+        .open(
+            db_path.to_str().expect("path"),
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)",
+        )
+        .await
+        .expect("default file-first open");
+
+    db.execute("INSERT INTO t (id) VALUES (7)", &[])
+        .expect("insert through default layout");
+
+    assert!(db_path.exists(), "main artifact should be caller db path");
+    assert!(
+        sidecar_dir.join("local_state.msgpack").exists(),
+        "default sidecar should live beside the db path"
+    );
+    assert!(
+        tmp.path().join("app.db-lock").exists(),
+        "lock anchor should sit beside the db path"
+    );
+    assert!(
+        !tmp.path().join(".tl_cache_app").exists(),
+        "default layout must not create the legacy cache path"
+    );
+    assert!(
+        !sidecar_dir.join("locks").exists(),
+        "default layout must not create a locks directory"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn default_file_first_rebuilds_after_hidden_state_delete() {
+    unset_env();
+    let tmp = TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("recover.db");
+    let sidecar_dir = tmp.path().join("recover.db-turbolite");
+    let storage = Arc::new(InMemoryStorage::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+
+    let mut writer = Builder::new()
+        .prefix("recover-layout/")
+        .mode(HaMode::SingleWriter)
+        .role(Role::Leader)
+        .durability(turbodb::Durability::Cloud)
+        .lease_store(lease_store.clone())
+        .manifest_store(manifest_store.clone())
+        .turbolite_storage(storage.clone())
+        .instance_id("recover-layout-writer")
+        .open(
+            db_path.to_str().expect("path"),
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT)",
+        )
+        .await
+        .expect("open writer");
+
+    writer
+        .execute("INSERT INTO t (id, val) VALUES (1, 'remote-survives')", &[])
+        .expect("insert");
+    writer.close().await.expect("close writer");
+
+    std::fs::remove_dir_all(&sidecar_dir).expect("delete hidden state");
+    assert!(
+        !sidecar_dir.exists(),
+        "test must start reopen without hidden state"
+    );
+
+    let mut reopened = Builder::new()
+        .prefix("recover-layout/")
+        .mode(HaMode::SingleWriter)
+        .role(Role::Leader)
+        .durability(turbodb::Durability::Cloud)
+        .lease_store(lease_store)
+        .manifest_store(manifest_store)
+        .turbolite_storage(storage)
+        .instance_id("recover-layout-reader")
+        .open(
+            db_path.to_str().expect("path"),
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT)",
+        )
+        .await
+        .expect("reopen after hidden-state deletion");
+
+    let rows = reopened
+        .query_values_local("SELECT val FROM t WHERE id = 1", &[])
+        .expect("query recovered row");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].len(), 1);
+    match &rows[0][0] {
+        haqlite_turbolite::SqlValue::Text(value) => assert_eq!(value, "remote-survives"),
+        other => panic!("expected recovered text row, got {other:?}"),
+    }
+    assert!(
+        sidecar_dir.exists(),
+        "reopen should recreate the hidden state workspace from the remote substrate"
+    );
+    reopened.close().await.expect("close reopened");
 }
 
 #[tokio::test]

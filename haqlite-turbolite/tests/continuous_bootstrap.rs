@@ -202,9 +202,8 @@ async fn assert_manifest_page_groups_exist(
     manifest: &Manifest,
     storage: &InMemoryStorage,
 ) {
-    let _walrust = vfs
-        .set_manifest_bytes(&manifest.payload)
-        .expect("decode hybrid payload");
+    vfs.set_manifest_bytes(&manifest.payload)
+        .expect("decode pure base payload");
     let decoded = vfs.manifest();
     let keys = storage.keys().await;
 
@@ -284,14 +283,13 @@ async fn continuous_fresh_writer_replays_raw_connection_writes() {
         .await
         .expect("fetch manifest after writer B")
         .expect("manifest after writer B");
-    let (_base, walrust) =
-        turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
-            .expect("decode manifest after writer B");
-    let (base_cursor, _) = walrust.expect("continuous manifest has cursor");
+    let base = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
+        .expect("decode manifest after writer B");
     let max_seq = max_physical_wal_seq(&walrust_storage_impl.keys().await);
     assert!(
-        base_cursor < max_seq,
-        "raw connection WAL must remain ahead of the published base cursor; cursor={base_cursor}, max_seq={max_seq}"
+        base.change_counter < max_seq,
+        "raw connection WAL must remain ahead of the published base change counter; base={}, max_seq={max_seq}",
+        base.change_counter
     );
 
     let mut writer_c = open_continuous_remote(
@@ -341,7 +339,7 @@ async fn continuous_fresh_writer_replays_raw_connection_writes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn continuous_open_publishes_hybrid_manifest_for_fresh_database() {
+async fn continuous_open_publishes_pure_base_manifest_for_fresh_database() {
     let tmp = TempDir::new().expect("temp dir");
     let db_path = tmp.path().join("bootstrap.db");
 
@@ -377,11 +375,8 @@ async fn continuous_open_publishes_hybrid_manifest_for_fresh_database() {
     assert_eq!(manifest.version, 1);
     assert_eq!(manifest.writer_id, "writer-1");
 
-    let walrust = vfs
-        .set_manifest_bytes(&manifest.payload)
-        .expect("decode hybrid payload")
-        .expect("continuous payload must include walrust cursor");
-    assert_eq!(walrust, (0, "test/".to_string()));
+    vfs.set_manifest_bytes(&manifest.payload)
+        .expect("decode pure base payload");
     assert_manifest_page_groups_exist(&vfs, &manifest, &tiered_storage_impl).await;
     db.close().await.expect("close haqlite");
 }
@@ -421,11 +416,8 @@ async fn continuous_open_retries_first_manifest_create_race() {
         .expect("bootstrap retry should still publish manifest");
     assert_eq!(manifest.version, 2);
 
-    let walrust = vfs
-        .set_manifest_bytes(&manifest.payload)
-        .expect("decode hybrid payload")
-        .expect("continuous payload must include walrust cursor");
-    assert_eq!(walrust, (0, "test/".to_string()));
+    vfs.set_manifest_bytes(&manifest.payload)
+        .expect("decode pure base payload");
     db.close().await.expect("close haqlite");
 }
 
@@ -464,11 +456,8 @@ async fn continuous_open_accepts_same_writer_manifest_when_meta_lags() {
         .expect("same-writer winner should leave a manifest behind");
     assert_eq!(manifest.version, 1);
 
-    let walrust = vfs
-        .set_manifest_bytes(&manifest.payload)
-        .expect("decode hybrid payload")
-        .expect("continuous payload must include walrust cursor");
-    assert_eq!(walrust, (0, "test/".to_string()));
+    vfs.set_manifest_bytes(&manifest.payload)
+        .expect("decode pure base payload");
     db.close().await.expect("close haqlite");
 }
 
@@ -490,7 +479,7 @@ async fn continuous_open_accepts_same_writer_manifest_when_meta_lags() {
 /// valid SQLite at the local path before import so the import has a
 /// real header to read.
 #[tokio::test(flavor = "multi_thread")]
-async fn continuous_open_publishes_hybrid_manifest_for_fresh_database_with_empty_schema() {
+async fn continuous_open_publishes_pure_base_manifest_for_fresh_database_with_empty_schema() {
     let tmp = TempDir::new().expect("temp dir");
     let db_path = tmp.path().join("empty_schema_bootstrap.db");
 
@@ -530,11 +519,8 @@ async fn continuous_open_publishes_hybrid_manifest_for_fresh_database_with_empty
     );
     assert_eq!(manifest.writer_id, "writer-empty-schema");
 
-    let walrust = vfs
-        .set_manifest_bytes(&manifest.payload)
-        .expect("decode hybrid payload")
-        .expect("continuous payload must include walrust cursor");
-    assert_eq!(walrust, (0, "test/".to_string()));
+    vfs.set_manifest_bytes(&manifest.payload)
+        .expect("decode pure base payload");
     assert_manifest_page_groups_exist(&vfs, &manifest, &tiered_storage_impl).await;
     db.close().await.expect("close haqlite");
 }
@@ -591,31 +577,23 @@ async fn continuous_first_write_publishes_manifest_that_only_references_existing
             .await
             .expect("fetch manifest during first-write poll");
         if let Some(manifest) = manifest {
-            let walrust = vfs
-                .set_manifest_bytes(&manifest.payload)
-                .expect("decode hybrid payload during first-write poll")
-                .expect("continuous payload must carry walrust cursor during first-write poll");
-            if manifest.version > 1 || walrust.0 > 0 {
+            let base = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
+                .expect("decode pure base payload during first-write poll");
+            let max_seq = max_physical_wal_seq(&walrust_storage_impl.keys().await);
+            if manifest.version > 1 || max_seq > base.change_counter {
                 break manifest;
             }
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "first write should publish a fresh hybrid manifest envelope"
+            "first write should publish a fresh base manifest or walrust delta object"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert_manifest_page_groups_exist(&vfs, &manifest, &tiered_storage_impl).await;
 
-    let walrust = vfs
-        .set_manifest_bytes(&manifest.payload)
-        .expect("decode hybrid payload after first write")
-        .expect("continuous payload must carry walrust cursor after first write");
-    assert_eq!(
-        walrust,
-        (0, "test/".to_string()),
-        "first write must not move the base cursor until Turbolite checkpoints the base"
-    );
+    vfs.set_manifest_bytes(&manifest.payload)
+        .expect("decode pure base payload after first write");
 
     let walrust_keys = walrust_storage_impl.keys().await;
     assert!(
