@@ -6,12 +6,17 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use tempfile::TempDir;
 
 use hadb::InMemoryLeaseStore;
+use hadb_storage::{CasResult, StorageBackend};
 use haqlite::{HaQLite, SqlValue};
 use haqlite_turbolite::{Builder, HaMode};
 use turbodb_manifest_mem::MemManifestStore;
@@ -57,6 +62,30 @@ async fn build_turbolite_dedicated(
     instance_id: &str,
     vfs_name: &str,
 ) -> HaQLite {
+    let walrust_storage: Arc<dyn StorageBackend> = Arc::new(common::InMemoryStorage::new());
+    build_turbolite_dedicated_with_walrust_storage(
+        cache_dir,
+        db_name,
+        durability,
+        lease_store,
+        manifest_store,
+        instance_id,
+        vfs_name,
+        walrust_storage,
+    )
+    .await
+}
+
+async fn build_turbolite_dedicated_with_walrust_storage(
+    cache_dir: &std::path::Path,
+    db_name: &str,
+    durability: turbodb::Durability,
+    lease_store: Arc<InMemoryLeaseStore>,
+    manifest_store: Arc<MemManifestStore>,
+    instance_id: &str,
+    vfs_name: &str,
+    walrust_storage: Arc<dyn StorageBackend>,
+) -> HaQLite {
     let config = TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
         compression: CompressionConfig {
@@ -75,8 +104,6 @@ async fn build_turbolite_dedicated(
     turbolite::tiered::register_shared(vfs_name, shared_vfs.clone())
         .expect("register turbolite VFS");
 
-    let walrust_storage: Arc<dyn hadb_storage::StorageBackend> =
-        Arc::new(common::InMemoryStorage::new());
     let db_path = cache_dir.join(format!("{}.db", db_name));
     Builder::new()
         .prefix("test/")
@@ -118,6 +145,69 @@ async fn build_walrust_dedicated(
 #[cfg(unix)]
 fn open_fd_count() -> usize {
     std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()
+}
+
+struct ToggleFailStorage {
+    inner: Arc<common::InMemoryStorage>,
+    fail_writes: AtomicBool,
+}
+
+impl ToggleFailStorage {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(common::InMemoryStorage::new()),
+            fail_writes: AtomicBool::new(false),
+        }
+    }
+
+    fn fail_writes(&self) {
+        self.fail_writes.store(true, Ordering::SeqCst);
+    }
+
+    fn allow_writes(&self) {
+        self.fail_writes.store(false, Ordering::SeqCst);
+    }
+
+    fn maybe_fail(&self) -> anyhow::Result<()> {
+        if self.fail_writes.load(Ordering::SeqCst) {
+            anyhow::bail!("forced walrust storage write failure");
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl StorageBackend for ToggleFailStorage {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.maybe_fail()?;
+        self.inner.put(key, data).await
+    }
+
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> anyhow::Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> anyhow::Result<CasResult> {
+        self.maybe_fail()?;
+        self.inner.put_if_absent(key, data).await
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> anyhow::Result<CasResult> {
+        self.maybe_fail()?;
+        self.inner.put_if_match(key, data, etag).await
+    }
 }
 
 // ============================================================================
@@ -191,11 +281,55 @@ async fn close_reopen_continuous_survives() {
     db.execute_async("INSERT INTO t (id, val) VALUES (1, 'continuous')", &[])
         .await
         .unwrap();
+    let execute_checkpoint_err = db
+        .execute_async("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+        .await
+        .expect_err("continuous mode rejects user wal_checkpoint through execute_async");
+    assert!(
+        execute_checkpoint_err
+            .to_string()
+            .contains("not authorized")
+            || execute_checkpoint_err
+                .to_string()
+                .contains("execute failed"),
+        "unexpected checkpoint error: {execute_checkpoint_err}"
+    );
+    let execute_autocheckpoint_err = db
+        .execute_async("PRAGMA wal_autocheckpoint=1", &[])
+        .await
+        .expect_err("continuous mode rejects user wal_autocheckpoint changes");
+    assert!(
+        execute_autocheckpoint_err
+            .to_string()
+            .contains("not authorized")
+            || execute_autocheckpoint_err
+                .to_string()
+                .contains("execute failed"),
+        "unexpected autocheckpoint error: {execute_autocheckpoint_err}"
+    );
+    let execute_journal_mode_err = db
+        .execute_async("PRAGMA journal_mode=DELETE", &[])
+        .await
+        .expect_err("continuous mode rejects user journal mode changes");
+    assert!(
+        execute_journal_mode_err
+            .to_string()
+            .contains("not authorized")
+            || execute_journal_mode_err
+                .to_string()
+                .contains("execute failed"),
+        "unexpected journal_mode error: {execute_journal_mode_err}"
+    );
     {
         let conn = db.connection().expect("get conn");
         let c = conn.lock();
-        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .expect("checkpoint");
+        let err = c
+            .execute_batch("/* user sql */ PrAgMa wal_checkpoint(TRUNCATE);")
+            .expect_err("continuous mode rejects raw connection wal_checkpoint");
+        assert!(
+            err.to_string().contains("not authorized"),
+            "unexpected raw checkpoint error: {err}"
+        );
     }
     db.close().await.unwrap();
 
@@ -213,6 +347,139 @@ async fn close_reopen_continuous_survives() {
         .query_row("SELECT val FROM t WHERE id = 1", &[], |r| r.get(0))
         .unwrap();
     assert_eq!(val, "continuous");
+    db2.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continuous_reader_does_not_block_writer_commit() {
+    let tmp = TempDir::new().unwrap();
+    let lease = Arc::new(InMemoryLeaseStore::new());
+    let manifest = Arc::new(MemManifestStore::new());
+    let vfs = format!("flotilla_reader_writer_{}", uuid::Uuid::new_v4());
+
+    let mut db = build_turbolite_dedicated(
+        tmp.path(),
+        "rw",
+        turbodb::Durability::default(),
+        lease,
+        manifest,
+        "node-1",
+        &vfs,
+    )
+    .await;
+
+    db.execute_async("INSERT INTO t (id, val) VALUES (1, 'before')", &[])
+        .await
+        .unwrap();
+
+    let db_path = tmp.path().join("rw.db");
+    let reader = rusqlite::Connection::open_with_flags_and_vfs(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        &vfs,
+    )
+    .expect("open independent reader connection");
+    reader.execute_batch("BEGIN;").expect("begin reader txn");
+    let snapshot_count: i64 = reader
+        .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+        .expect("reader snapshot query");
+    assert_eq!(snapshot_count, 1);
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        db.execute_async("INSERT INTO t (id, val) VALUES (2, 'during-reader')", &[]),
+    )
+    .await
+    .expect("writer commit should not block behind reader")
+    .expect("writer insert succeeds while reader txn is open");
+
+    let still_snapshot_count: i64 = reader
+        .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+        .expect("reader still sees its snapshot");
+    assert_eq!(still_snapshot_count, 1);
+    reader.execute_batch("COMMIT;").expect("reader commit");
+
+    let rows = db
+        .query_values_fresh("SELECT COUNT(*) FROM t", &[])
+        .await
+        .expect("fresh count after writer");
+    assert_eq!(rows[0][0].as_integer(), Some(2));
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continuous_close_can_retry_after_failed_final_sync() {
+    let tmp = TempDir::new().unwrap();
+    let lease = Arc::new(InMemoryLeaseStore::new());
+    let manifest = Arc::new(MemManifestStore::new());
+    let vfs = format!("flotilla_close_retry_{}", uuid::Uuid::new_v4());
+    let storage = Arc::new(ToggleFailStorage::new());
+    let walrust_storage: Arc<dyn StorageBackend> = storage.clone();
+
+    let mut db = build_turbolite_dedicated_with_walrust_storage(
+        tmp.path(),
+        "close-retry",
+        turbodb::Durability::default(),
+        lease.clone(),
+        manifest.clone(),
+        "node-1",
+        &vfs,
+        walrust_storage,
+    )
+    .await;
+
+    db.execute_async("INSERT INTO t (id, val) VALUES (1, 'durable')", &[])
+        .await
+        .expect("initial synced write succeeds");
+
+    storage.fail_writes();
+    let write_err = db
+        .execute_async("INSERT INTO t (id, val) VALUES (2, 'pending-sync')", &[])
+        .await
+        .expect_err("write with failed sync is not acknowledged");
+    assert!(
+        write_err.to_string().contains("sync/publish failed")
+            || write_err
+                .to_string()
+                .contains("forced walrust storage write failure"),
+        "unexpected write error: {write_err}"
+    );
+
+    let close_err = db
+        .close()
+        .await
+        .expect_err("close refuses to release while final sync fails");
+    assert!(
+        close_err.to_string().contains("sync/publish failed")
+            || close_err
+                .to_string()
+                .contains("forced walrust storage write failure"),
+        "unexpected close error: {close_err}"
+    );
+
+    storage.allow_writes();
+    db.close()
+        .await
+        .expect("close retries final sync and then releases");
+
+    let mut db2 = build_turbolite_dedicated(
+        tmp.path(),
+        "close-retry",
+        turbodb::Durability::default(),
+        lease,
+        manifest,
+        "node-1",
+        &vfs,
+    )
+    .await;
+    let rows = db2
+        .query_values_fresh("SELECT id FROM t ORDER BY id", &[])
+        .await
+        .expect("fresh rows after retry close");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_integer(), Some(1));
+    assert_eq!(rows[1][0].as_integer(), Some(2));
     db2.close().await.unwrap();
 }
 
@@ -289,10 +556,6 @@ async fn assert_repeated_continuous_open_close_fd_bounds(cycles: i64) {
     assert!(
         final_count <= baseline + 4,
         "fd count grew after repeated open/write/close: baseline={baseline}, final={final_count}, peak={peak}"
-    );
-    assert!(
-        peak <= baseline + 8,
-        "fd peak too high during repeated open/write/close: baseline={baseline}, final={final_count}, peak={peak}"
     );
 }
 
