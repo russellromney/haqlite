@@ -476,6 +476,36 @@ fn raw_cache_snapshot(cache_path: &Path) -> String {
     }
 }
 
+async fn materialized_manifest_count(
+    vfs: &SharedTurboliteVfs,
+    manifest: &turbolite::tiered::Manifest,
+    table: &str,
+) -> Result<i64> {
+    let tmp = TempDir::new().expect("manifest materialize tmp");
+    let db_path = tmp.path().join("manifest-check.db");
+    let shared = vfs.shared_state();
+    let manifest = manifest.clone();
+    let materialize_path = db_path.clone();
+    tokio::task::spawn_blocking(move || {
+        shared.materialize_manifest_to_file(&manifest, &materialize_path)
+    })
+    .await
+    .map_err(|e| anyhow!("manifest materialize task panicked: {e}"))?
+    .map_err(|e| anyhow!("manifest materialize failed: {e}"))?;
+
+    let table = table.to_string();
+    tokio::task::spawn_blocking(move || -> Result<i64> {
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| anyhow!("open materialized manifest db: {e}"))?;
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| anyhow!("query materialized manifest count: {e}"))
+    })
+    .await
+    .map_err(|e| anyhow!("manifest count task panicked: {e}"))?
+}
+
 #[cfg(feature = "s3")]
 fn raw_canonical_cache_snapshot(cache_path: &Path) -> String {
     match rusqlite::Connection::open_with_flags(
@@ -1512,11 +1542,12 @@ async fn follower_reads_remain_consistent_during_concurrent_materialize() {
         .expect("follower converges after concurrent torture");
 }
 
-/// After failover + a post-promotion write, a fresh third node
+/// After failover + post-promotion writes, a fresh third node
 /// joining from the published manifest must see both pre-promotion
-/// and post-promotion rows. Asserts the post-promotion manifest is
-/// actually a usable base (fresh page-group keys, advanced walrust
-/// cursor) before spinning the third node up.
+/// and post-promotion rows. The promotion itself must publish the
+/// accumulated pre-crash replay state as a usable page/base manifest;
+/// later SQL writes remain WAL/HADBP deltas until SQLite checkpoints
+/// them into the base.
 #[tokio::test(flavor = "multi_thread")]
 async fn singlewriter_promotion_publishes_usable_base() {
     let _guard = FAILOVER_TEST_LOCK.lock().await;
@@ -1524,8 +1555,9 @@ async fn singlewriter_promotion_publishes_usable_base() {
     let follower_tmp = TempDir::new().expect("follower tmp");
     let third_tmp = TempDir::new().expect("third tmp");
 
-    // Tight checkpoint thresholds so post-promotion writes embed
-    // into the base — defaults won't fire in a unit-test window.
+    // Tight intervals keep the proof quick. Continuous mode still
+    // ships post-promotion SQL through walrust until SQLite checkpoints
+    // the WAL into the Turbolite base.
     let durability = turbodb::Durability::Continuous {
         checkpoint: turbodb::CheckpointConfig {
             interval: Duration::from_millis(100),
@@ -1617,8 +1649,8 @@ async fn singlewriter_promotion_publishes_usable_base() {
         .await
         .expect("promoted leader still sees before-crash");
 
-    // Multiple post-promotion writes give the checkpoint trigger
-    // room to embed WAL frames into the base.
+    // Multiple post-promotion writes should produce WAL/HADBP deltas
+    // after the promotion base.
     for i in 2..=6i64 {
         follower
             .db
@@ -1636,14 +1668,10 @@ async fn singlewriter_promotion_publishes_usable_base() {
         .await
         .expect("promoted leader sees all post-promotion rows");
 
-    // Drain the publish chain so the manifest_store reflects the
-    // post-promotion base. With commit_count=1, every commit
-    // triggers a turbolite checkpoint, so a generous sleep here
-    // is enough.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Wait for both the promotion publish AND the post-INSERT
-    // publish to land — the pure base manifest version must advance.
+    // Wait for the promotion publish to land: the pre-crash row
+    // must now be present in the pure page/base manifest. The later
+    // rows are expected to arrive through walrust deltas, not by
+    // forcing an immediate SQLite checkpoint.
     let deadline = Instant::now() + Duration::from_secs(8);
     let post_promotion_manifest_bytes = loop {
         let bytes = manifest_store
@@ -1654,13 +1682,18 @@ async fn singlewriter_promotion_publishes_usable_base() {
             .payload;
         let m = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
             .expect("decode post-promotion manifest");
-        if m.version > pre_manifest.version {
+        let published_count = materialized_manifest_count(&follower.vfs, &m, "t")
+            .await
+            .expect("materialize post-promotion manifest for count");
+        if m.version > pre_manifest.version && published_count >= 1 {
             break bytes;
         }
         if Instant::now() >= deadline {
             panic!(
-                "post-promotion manifest did not advance past pre-promotion v{} within timeout",
-                pre_manifest.version
+                "promotion manifest did not publish the replayed pre-crash base past pre-promotion v{} within timeout; last version={}, last materialized count={}",
+                pre_manifest.version,
+                m.version,
+                published_count,
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1697,8 +1730,31 @@ async fn singlewriter_promotion_publishes_usable_base() {
         pre_keys,
         post_manifest.page_group_keys
     );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let walrust_keys = loop {
+        let mut keys = walrust_storage_impl.keys().await;
+        keys.sort();
+        let has_post_promotion_delta = keys.iter().any(|key| {
+            key.contains("/0000000000000004.hadbp")
+                || key.contains("/0000000000000005.hadbp")
+                || key.contains("/0000000000000006.hadbp")
+        });
+        if has_post_promotion_delta {
+            break keys;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "post-promotion writes did not publish walrust deltas beyond the promotion base; keys={:?}",
+                keys
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
     // Fresh third node sharing the same storage — joins as
-    // Follower and must catch up to both rows.
+    // Follower and must catch up from the promotion base plus
+    // post-promotion WAL/HADBP deltas.
     let third = build_singlewriter_node(
         third_tmp.path(),
         "failover",
@@ -1719,7 +1775,6 @@ async fn singlewriter_promotion_publishes_usable_base() {
         let third_vfs = vfs_snapshot(third_tmp.path(), "failover", &third.vfs_name);
         let third_raw = raw_cache_snapshot(&third_tmp.path().join("data.cache"));
         let promoted_local = local_vfs_state(&follower.vfs);
-        let walrust_keys = walrust_storage_impl.keys().await;
         panic!(
             "third node count: {}; \
              pre_keys={:?} post_keys={:?} \

@@ -25,10 +25,14 @@ pub(crate) struct PreparedPageReplay {
     current_seq: u64,
     changesets: Vec<(u64, physical::PhysicalChangeset)>,
     target_page_count: Option<u64>,
+    base_file_checksum_required: bool,
 }
 
 impl PreparedPageReplay {
     pub(crate) fn validate_base_checksum(&self, expected_prev_checksum: u64) -> Result<()> {
+        if !self.base_file_checksum_required {
+            return Ok(());
+        }
         let Some((seq, changeset)) = self.changesets.first() else {
             return Ok(());
         };
@@ -60,7 +64,27 @@ pub(crate) async fn prepare_page_replay(
     .await?;
     let mut changesets = Vec::with_capacity(files.len());
     let mut expected_seq = current_seq + 1;
-    let mut expected_prev_checksum: Option<u64> = None;
+    let previous_key = (current_seq > 0).then(|| {
+        cs_storage::format_key(
+            prefix,
+            db_name,
+            cs_storage::GENERATION_INCREMENTAL,
+            current_seq,
+            ChangesetKind::Physical,
+        )
+    });
+    let mut expected_prev_checksum: Option<u64> = match previous_key {
+        Some(key) => match storage.get(&key).await? {
+            Some(data) => Some(
+                physical::decode(&data)
+                    .map_err(|e| anyhow!("failed to decode previous changeset at {}: {}", key, e))?
+                    .checksum,
+            ),
+            None => None,
+        },
+        None => None,
+    };
+    let base_file_checksum_required = expected_prev_checksum.is_none();
     let mut target_page_count = None;
     for file in files {
         let data = storage
@@ -111,6 +135,7 @@ pub(crate) async fn prepare_page_replay(
         current_seq,
         changesets,
         target_page_count,
+        base_file_checksum_required,
     })
 }
 
@@ -433,5 +458,37 @@ mod tests {
         assert!(err
             .to_string()
             .contains("first changeset checksum chain break"));
+    }
+
+    #[tokio::test]
+    async fn prepared_page_replay_uses_previous_changeset_checksum_after_base() {
+        let storage = MemoryStorage::default();
+        let c3 = changeset(3, 0xAA55, 1, 0x33);
+        let c4 = changeset(4, c3.checksum, 2, 0x44);
+        put_changeset(&storage, 3, &c3);
+        put_changeset(&storage, 4, &c4);
+
+        let prepared = prepare_page_replay(&storage, "prefix/", "db", 3)
+            .await
+            .expect("valid replay prepares from previous changeset");
+
+        prepared
+            .validate_base_checksum(0x55AA)
+            .expect("whole-file checksum is not used after a previous changeset exists");
+    }
+
+    #[tokio::test]
+    async fn prepare_page_replay_rejects_previous_changeset_chain_break() {
+        let storage = MemoryStorage::default();
+        let c3 = changeset(3, 0xAA55, 1, 0x33);
+        let c4 = changeset(4, c3.checksum.wrapping_add(1), 2, 0x44);
+        put_changeset(&storage, 3, &c3);
+        put_changeset(&storage, 4, &c4);
+
+        let err = prepare_page_replay(&storage, "prefix/", "db", 3)
+            .await
+            .expect_err("wrong-chain seq 4 must fail closed");
+
+        assert!(err.to_string().contains("changeset checksum chain break"));
     }
 }

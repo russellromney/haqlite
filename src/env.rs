@@ -150,6 +150,16 @@ fn parse_url_params(url: &str) -> ParsedUrl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    static LEASE_ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    async fn lease_env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        LEASE_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
 
     fn unset_lease() {
         std::env::remove_var("HAQLITE_LEASE_URL");
@@ -166,6 +176,7 @@ mod tests {
 
     #[tokio::test]
     async fn lease_store_unset_returns_clear_error() {
+        let _guard = lease_env_guard().await;
         unset_lease();
         let err = err_msg(lease_store_from_env("b", None).await);
         assert!(err.contains("HAQLITE_LEASE_URL not set"), "got: {err}");
@@ -174,6 +185,7 @@ mod tests {
 
     #[tokio::test]
     async fn lease_store_unsupported_scheme_errors() {
+        let _guard = lease_env_guard().await;
         std::env::set_var("HAQLITE_LEASE_URL", "ftp://nope");
         let err = err_msg(lease_store_from_env("b", None).await);
         assert!(
