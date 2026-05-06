@@ -513,6 +513,10 @@ impl TurboliteWalReplicator {
                 let page_count = vfs.manifest().page_count;
                 vfs.sync_after_external_restore(page_count);
 
+                let base_checksum = walrust::ltx::compute_checksum_from_file(&cache_path)
+                    .map_err(|e| anyhow!("walrust base checksum failed: {}", e))?;
+                prepared_replay.validate_base_checksum(base_checksum)?;
+
                 let handle = vfs
                     .begin_replay()
                     .map_err(|e| anyhow!("turbolite begin_replay failed: {}", e))?;

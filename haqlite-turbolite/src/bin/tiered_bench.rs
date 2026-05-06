@@ -328,16 +328,14 @@ impl Cli {
                     cli.follower_poll_ms = take_arg(&mut args, "--follower-poll-ms")?.parse()?
                 }
                 "--latency-batch-rows" => {
-                    cli.latency_batch_rows =
-                        take_arg(&mut args, "--latency-batch-rows")?.parse()?
+                    cli.latency_batch_rows = take_arg(&mut args, "--latency-batch-rows")?.parse()?
                 }
                 "--latency-payload-bytes" => {
                     cli.latency_payload_bytes =
                         take_arg(&mut args, "--latency-payload-bytes")?.parse()?
                 }
                 "--latency-timeout-ms" => {
-                    cli.latency_timeout_ms =
-                        take_arg(&mut args, "--latency-timeout-ms")?.parse()?
+                    cli.latency_timeout_ms = take_arg(&mut args, "--latency-timeout-ms")?.parse()?
                 }
                 "--help" | "-h" => {
                     print_help();
@@ -848,7 +846,10 @@ async fn build_latency_node(
         .manifest_poll_interval(min_nonzero_ms(cli.manifest_poll_ms))
         .follower_pull_interval(min_nonzero_ms(cli.follower_poll_ms))
         .disable_forwarding()
-        .open(db_path.to_str().expect("utf8 latency db path"), LATENCY_SCHEMA)
+        .open(
+            db_path.to_str().expect("utf8 latency db path"),
+            LATENCY_SCHEMA,
+        )
         .await
         .map_err(|e| anyhow!("open latency node {instance_id}: {e}"))
 }
@@ -1005,7 +1006,13 @@ async fn run_replication_latency(cli: &Cli) -> Result<()> {
 
     // Seed the base so a follower can open against a real manifest before
     // measured continuous WAL batches start.
-    insert_latency_batch(&leader, 0, cli.latency_batch_rows, cli.latency_payload_bytes).await?;
+    insert_latency_batch(
+        &leader,
+        0,
+        cli.latency_batch_rows,
+        cli.latency_payload_bytes,
+    )
+    .await?;
 
     let mut follower = build_latency_node(
         &follower_cache,
@@ -1076,14 +1083,21 @@ async fn run_replication_latency(cli: &Cli) -> Result<()> {
         )
         .await?;
         let txn_body = write.commit_start.saturating_duration_since(write.start);
-        let commit_elapsed = write.commit_done.saturating_duration_since(write.commit_start);
+        let commit_elapsed = write
+            .commit_done
+            .saturating_duration_since(write.commit_start);
         let begin_to_manifest = manifest_event.at.saturating_duration_since(write.start);
-        let commit_to_manifest = manifest_event.at.saturating_duration_since(write.commit_done);
-        let manifest_to_commit_ack = write.commit_done.saturating_duration_since(manifest_event.at);
+        let commit_to_manifest = manifest_event
+            .at
+            .saturating_duration_since(write.commit_done);
+        let manifest_to_commit_ack = write
+            .commit_done
+            .saturating_duration_since(manifest_event.at);
         let manifest_to_first_get = first_manifest_get
             .at
             .saturating_duration_since(manifest_event.at);
-        let first_get_to_follower = follower_visible.saturating_duration_since(first_manifest_get.at);
+        let first_get_to_follower =
+            follower_visible.saturating_duration_since(first_manifest_get.at);
         let visible_after_commit = follower_visible.saturating_duration_since(write.commit_done);
         let end_to_end = follower_visible.saturating_duration_since(write.start);
         let manifest_to_follower = follower_visible.saturating_duration_since(manifest_event.at);
@@ -1306,7 +1320,10 @@ async fn run_size(size: usize, cli: &Cli) -> Result<()> {
         if !mode_filter.iter().any(|m| m == mode) {
             continue;
         }
-        println!("\n=== HAQLITE-TURBOLITE CACHE LEVEL: {} ===", mode.to_uppercase());
+        println!(
+            "\n=== HAQLITE-TURBOLITE CACHE LEVEL: {} ===",
+            mode.to_uppercase()
+        );
         print_header();
         for query in &queries {
             let result = bench_mode(
@@ -1346,8 +1363,14 @@ fn main() -> Result<()> {
         "Reader config: page_size hint={} bytes, pages/group={}",
         cli.page_size, cli.ppg
     );
-    println!("Iterations:   {} measured + {} warmup", cli.iterations, cli.warmup);
-    println!("Plan-aware:   {}", if cli.plan_aware { "on" } else { "off" });
+    println!(
+        "Iterations:   {} measured + {} warmup",
+        cli.iterations, cli.warmup
+    );
+    println!(
+        "Plan-aware:   {}",
+        if cli.plan_aware { "on" } else { "off" }
+    );
 
     runtime.block_on(async {
         if cli.replication_latency {

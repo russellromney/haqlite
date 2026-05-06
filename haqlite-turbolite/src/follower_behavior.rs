@@ -193,6 +193,12 @@ impl TurboliteFollowerBehavior {
             }
 
             if continuous {
+                let base_checksum = walrust::ltx::compute_checksum_from_file(&cache_path)
+                    .map_err(|e| anyhow!("walrust base checksum failed: {}", e))?;
+                prepared_replay
+                    .as_ref()
+                    .expect("decoded walrust requires prepared replay")
+                    .validate_base_checksum(base_checksum)?;
                 let handle = vfs
                     .begin_replay()
                     .map_err(|e| anyhow!("turbolite begin_replay failed: {}", e))?;

@@ -251,7 +251,7 @@ async fn assert_repeated_continuous_open_close_fd_bounds(cycles: i64) {
         ..Default::default()
     };
     let shared_vfs = SharedTurboliteVfs::new(TurboliteVfs::new_local(config).expect("vfs"));
-    let vfs_name = format!("flotilla_fd_audit_{}", std::process::id());
+    let vfs_name = format!("flotilla_fd_audit_{}_{}", cycles, uuid::Uuid::new_v4());
     turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
 
     let db_path = tmp.path().join("fd-audit.db");
