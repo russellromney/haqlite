@@ -505,15 +505,14 @@ fn raw_canonical_cache_snapshot(cache_path: &Path) -> String {
 }
 
 /// Scan the follower tempdir for filenames that look like a temp
-/// SQLite restore artifact (`*restore*`, `*.sqlite`, `*.db`).
+/// SQLite restore artifact (`*restore*`, `*.sqlite`, unexpected `*.db`).
 ///
-/// Allows the turbolite layout: `data.cache` plus its SQLite shm/wal
-/// sidecars, and anything under a `locks/` subdirectory (turbolite's
-/// per-database file-guard markers are named `<db>.db` and would
-/// otherwise trip `*.db`).
-fn scan_for_restore_artifacts(dir: &Path) -> Vec<PathBuf> {
+/// Allows the current file-first turbolite layout: the named primary
+/// database artifact, `data.cache` compatibility fixtures, their SQLite
+/// shm/wal sidecars, and anything under a `locks/` subdirectory.
+fn scan_for_restore_artifacts(dir: &Path, primary_db_name: &str) -> Vec<PathBuf> {
     let mut hits = Vec::new();
-    fn walk(dir: &Path, in_locks: bool, hits: &mut Vec<PathBuf>) {
+    fn walk(dir: &Path, in_locks: bool, primary_db_name: &str, hits: &mut Vec<PathBuf>) {
         let entries = match std::fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(_) => return,
@@ -530,7 +529,7 @@ fn scan_for_restore_artifacts(dir: &Path) -> Vec<PathBuf> {
             };
             if ft.is_dir() {
                 let entered_locks = in_locks || name == "locks";
-                walk(&path, entered_locks, hits);
+                walk(&path, entered_locks, primary_db_name, hits);
                 continue;
             }
             // Anything under `locks/` is a turbolite file-guard
@@ -544,18 +543,25 @@ fn scan_for_restore_artifacts(dir: &Path) -> Vec<PathBuf> {
             if name.starts_with("data.cache") {
                 continue;
             }
+            if name == primary_db_name
+                || name == format!("{primary_db_name}-wal")
+                || name == format!("{primary_db_name}-shm")
+                || name == format!("{primary_db_name}-lock")
+            {
+                continue;
+            }
             let lower = name.to_ascii_lowercase();
             if lower.contains("restore") || lower.ends_with(".sqlite") || lower.ends_with(".db") {
                 hits.push(path);
             }
         }
     }
-    walk(dir, false, &mut hits);
+    walk(dir, false, primary_db_name, &mut hits);
     hits
 }
 
-fn assert_no_restore_artifacts(dir: &Path, label: &str) {
-    let hits = scan_for_restore_artifacts(dir);
+fn assert_no_restore_artifacts(dir: &Path, label: &str, primary_db_name: &str) {
+    let hits = scan_for_restore_artifacts(dir, primary_db_name);
     assert!(
         hits.is_empty(),
         "{}: found temp-restore-shaped artifact(s) in {}: {:?}",
@@ -774,7 +780,7 @@ async fn run_singlewriter_failover(durability: turbodb::Durability) -> Result<()
     }
 
     // Quiescent point #1 (post catch-up).
-    assert_no_restore_artifacts(follower_tmp.path(), "post-follower-catch-up");
+    assert_no_restore_artifacts(follower_tmp.path(), "post-follower-catch-up", "failover.db");
 
     leader
         .db
@@ -823,7 +829,7 @@ async fn run_singlewriter_failover(durability: turbodb::Durability) -> Result<()
     wait_for_value(&follower.db, 2, "after-promotion", Duration::from_secs(3)).await?;
 
     // Quiescent point #2 (post promotion + post-promotion write).
-    assert_no_restore_artifacts(follower_tmp.path(), "post-promotion");
+    assert_no_restore_artifacts(follower_tmp.path(), "post-promotion", "failover.db");
 
     Ok(())
 }
@@ -1741,7 +1747,7 @@ async fn singlewriter_promotion_publishes_usable_base() {
         .await
         .expect("third node sees last after-promotion row");
 
-    assert_no_restore_artifacts(third_tmp.path(), "third-fresh-follower");
+    assert_no_restore_artifacts(third_tmp.path(), "third-fresh-follower", "failover.db");
 }
 
 /// Failover when the follower has already replayed every walrust
@@ -1961,7 +1967,7 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
         third_walrust_keys
     );
 
-    assert_no_restore_artifacts(third_tmp.path(), "third-already-caught-up");
+    assert_no_restore_artifacts(third_tmp.path(), "third-already-caught-up", "failover.db");
 }
 
 /// Run a future to completion from sync code inside an async test.

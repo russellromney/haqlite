@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -121,6 +121,7 @@ fn new_shared_fence() -> SharedFence {
 
 fn auto_vfs_key(
     cache_dir: &std::path::Path,
+    local_data_path: &std::path::Path,
     db_filename: &str,
     prefix: &str,
     instance_id: &str,
@@ -128,8 +129,9 @@ fn auto_vfs_key(
     durability: &turbodb::Durability,
 ) -> String {
     format!(
-        "cache={}|db={}|prefix={}|instance={}|storage={}|durability={:?}",
+        "cache={}|data={}|db={}|prefix={}|instance={}|storage={}|durability={:?}",
         cache_dir.display(),
+        local_data_path.display(),
         db_filename,
         prefix,
         instance_id,
@@ -190,6 +192,8 @@ pub struct Builder {
     manifest_http: Option<CinchHttpConfig>,
     turbolite_storage: Option<Arc<dyn hadb_storage::StorageBackend>>,
     turbolite_vfs: Option<(SharedTurboliteVfs, String)>,
+    turbolite_cache_dir: Option<std::path::PathBuf>,
+    turbolite_data_path: Option<std::path::PathBuf>,
     manifest_store: Option<Arc<dyn ManifestStore>>,
     /// Optional replicator override. When `None`, the open path picks a
     /// default based on `turbolite_durability`: walrust-backed
@@ -220,6 +224,8 @@ impl Builder {
             manifest_http: None,
             turbolite_storage: None,
             turbolite_vfs: None,
+            turbolite_cache_dir: None,
+            turbolite_data_path: None,
             manifest_store: None,
             replicator: None,
             rollback_database_id: None,
@@ -411,6 +417,22 @@ impl Builder {
         self
     }
 
+    /// Override Turbolite's local layout.
+    ///
+    /// `data_path` is the local main database image; `cache_dir` holds
+    /// derived metadata and staging state. Product embedders use this to make
+    /// the caller-supplied database path the primary artifact while keeping
+    /// implementation metadata out of the public open contract.
+    pub fn turbolite_local_paths(
+        mut self,
+        cache_dir: impl Into<std::path::PathBuf>,
+        data_path: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        self.turbolite_cache_dir = Some(cache_dir.into());
+        self.turbolite_data_path = Some(data_path.into());
+        self
+    }
+
     pub fn manifest_store(mut self, store: Arc<dyn ManifestStore>) -> Self {
         self.manifest_http = None;
         self.manifest_store = Some(store);
@@ -497,9 +519,10 @@ impl Builder {
     /// Enable Phase Strata rollback detection. Before turbolite VFS opens,
     /// the builder GETs the remote turbolite manifest from the storage URL
     /// (taken from `.turbolite_http()`), compares its `epoch` to the local
-    /// cached manifest, and wipes the local cache + SQLite stub on mismatch.
-    /// `database_id` is used to compute the cache directory path
-    /// (`<db_path.parent>/.tl_cache_<database_id>/`).
+    /// cached manifest, and wipes the local sidecar + SQLite stub on mismatch.
+    /// By default the local sidecar is derived from the database file path
+    /// (`<db_path file name>-turbolite/`). Product embedders can override the
+    /// local layout with [`Builder::turbolite_local_paths`].
     ///
     /// Requires `.turbolite_http(endpoint, _)` to also be set.
     pub fn with_rollback_detection(mut self, database_id: &str, token: &str) -> Self {
@@ -551,6 +574,21 @@ impl Builder {
             .and_then(|s| s.to_str())
             .unwrap_or("db")
             .to_string();
+        let derived_cache_dir = || {
+            let file_name = db_path
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_else(|| "haqlite.db".into());
+            db_path.with_file_name(format!("{file_name}-turbolite"))
+        };
+        let cache_dir = self
+            .turbolite_cache_dir
+            .clone()
+            .unwrap_or_else(derived_cache_dir);
+        let local_data_path = self
+            .turbolite_data_path
+            .clone()
+            .unwrap_or_else(|| db_path.clone());
 
         // Phase Strata: detect manifest epoch mismatch (fork/rollback) and wipe
         // the local cache + SQLite stub before turbolite opens. Requires
@@ -572,7 +610,7 @@ impl Builder {
                 crate::RollbackDetector::new(&storage_url, token)
             };
             detector
-                .check_and_repair(database_id, &db_path)
+                .check_and_repair_with_cache_dir(database_id, &db_path, &cache_dir)
                 .await
                 .map_err(|e| anyhow::anyhow!("rollback detection: {e}"))?;
         }
@@ -613,16 +651,12 @@ impl Builder {
             let shared_fence = self.turbolite_http.as_ref().map(|_| new_shared_fence());
             (vfs.clone(), name.clone(), shared_fence)
         } else {
-            let cache_dir = db_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("/tmp"))
-                .join(format!(".tl_cache_{}", db_name));
             std::fs::create_dir_all(&cache_dir)?;
             let db_filename = db_path
                 .file_name()
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_else(|| db_name.clone());
-            let tl_config = turbolite::tiered::TurboliteConfig {
+            let mut tl_config = turbolite::tiered::TurboliteConfig {
                 cache_dir: cache_dir.clone(),
                 cache: turbolite::tiered::CacheConfig {
                     gc_enabled: false,
@@ -630,10 +664,12 @@ impl Builder {
                 },
                 ..Default::default()
             };
+            tl_config.local_data_path = Some(local_data_path.clone());
             let rt_handle = tokio::runtime::Handle::current();
             if let Some(ref cfg) = self.turbolite_http {
                 let key = auto_vfs_key(
                     &cache_dir,
+                    &local_data_path,
                     &db_filename,
                     self.inner.get_prefix(),
                     &instance_id,
@@ -664,6 +700,7 @@ impl Builder {
             } else if let Some(ref storage) = self.turbolite_storage {
                 let key = auto_vfs_key(
                     &cache_dir,
+                    &local_data_path,
                     &db_filename,
                     self.inner.get_prefix(),
                     &instance_id,
@@ -734,7 +771,6 @@ impl Builder {
                 self.inner.get_prefix()
             };
 
-        let replay_base_seq = Arc::new(AtomicU64::new(0));
         let replay_base_pending_publish = Arc::new(AtomicBool::new(false));
 
         // Pick replicator. Three sources, in priority order:
@@ -794,7 +830,6 @@ impl Builder {
                             .expect("continuous durability validated walrust storage")
                             .clone(),
                         delta_replicator,
-                        replay_base_seq.clone(),
                         replay_base_pending_publish.clone(),
                     ))
                 }
@@ -826,10 +861,7 @@ impl Builder {
                                 .clone(),
                             walrust_prefix.to_string(),
                         )
-                        .with_replay_base_tracking(
-                            replay_base_seq.clone(),
-                            replay_base_pending_publish.clone(),
-                        );
+                        .with_replay_base_tracking(replay_base_pending_publish.clone());
                 }
             }
             Arc::new(behavior)
@@ -878,11 +910,7 @@ impl Builder {
         // Build connection opener for turbolite VFS.
         let vfs_name_for_opener = vfs_name.clone();
         let db_name_for_opener = db_name.clone();
-        let db_filename = db_path
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_else(|| db_name.clone());
-        let db_filename_for_opener = db_filename.clone();
+        let db_path_for_opener = local_data_path.clone();
         let is_cloud = self.turbolite_durability.is_cloud();
         let is_continuous = matches!(
             self.turbolite_durability,
@@ -891,15 +919,11 @@ impl Builder {
         let connection_opener: Arc<
             dyn Fn() -> Result<rusqlite::Connection, haqlite::HaQLiteError> + Send + Sync,
         > = Arc::new(move || {
-            let vfs_uri = format!(
-                "file:{}?vfs={}",
-                db_filename_for_opener, vfs_name_for_opener
-            );
-            let conn = rusqlite::Connection::open_with_flags(
-                &vfs_uri,
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                &db_path_for_opener,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                &vfs_name_for_opener,
             )
             .map_err(|e| {
                 haqlite::HaQLiteError::DatabaseError(format!(
@@ -926,20 +950,16 @@ impl Builder {
         // the replay gate, blocking torn reads against an in-flight
         // materialize.
         let vfs_name_for_follower = vfs_name.clone();
-        let db_filename_for_follower = db_filename.clone();
+        let db_path_for_follower = local_data_path.clone();
         let db_name_for_follower = db_name.clone();
         let follower_read_connection_opener: Arc<
             dyn Fn() -> Result<rusqlite::Connection, haqlite::HaQLiteError> + Send + Sync,
         > = Arc::new(move || {
-            let vfs_uri = format!(
-                "file:{}?vfs={}",
-                db_filename_for_follower, vfs_name_for_follower
-            );
-            rusqlite::Connection::open_with_flags(
-                &vfs_uri,
+            rusqlite::Connection::open_with_flags_and_vfs(
+                &db_path_for_follower,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                &vfs_name_for_follower,
             )
             .map_err(|e| {
                 haqlite::HaQLiteError::DatabaseError(format!(

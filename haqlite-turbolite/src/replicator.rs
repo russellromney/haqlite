@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -322,7 +322,6 @@ pub struct TurboliteWalReplicator {
     walrust_prefix: String,
     walrust_storage: Arc<dyn StorageBackend>,
     walrust: Arc<haqlite::ExternalSnapshotSqliteReplicator>,
-    replay_base_seq: Arc<AtomicU64>,
     replay_base_pending_publish: Arc<AtomicBool>,
     live_wal_path: Mutex<Option<std::path::PathBuf>>,
 }
@@ -338,7 +337,6 @@ impl TurboliteWalReplicator {
         walrust_prefix: String,
         walrust_storage: Arc<dyn StorageBackend>,
         walrust: Arc<haqlite::ExternalSnapshotSqliteReplicator>,
-        replay_base_seq: Arc<AtomicU64>,
         replay_base_pending_publish: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -349,7 +347,6 @@ impl TurboliteWalReplicator {
             walrust_prefix,
             walrust_storage,
             walrust,
-            replay_base_seq,
             replay_base_pending_publish,
             live_wal_path: Mutex::new(None),
         }
@@ -492,7 +489,6 @@ impl TurboliteWalReplicator {
             let payload_for_attempt = payload_owned.clone();
             let decoded_manifest_for_attempt = decoded_manifest.clone();
             let name_owned = name.to_string();
-            let replay_base_seq = self.replay_base_seq.clone();
             let replay_base_pending_publish = self.replay_base_pending_publish.clone();
             let attempt = tokio::task::spawn_blocking(move || -> Result<()> {
                 let _gate = loop {
@@ -530,7 +526,6 @@ impl TurboliteWalReplicator {
                     final_seq
                 );
                 if final_seq > walrust_seq {
-                    replay_base_seq.store(final_seq, Ordering::Release);
                     replay_base_pending_publish.store(true, Ordering::Release);
                 }
 
