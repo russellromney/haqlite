@@ -582,8 +582,20 @@ impl Drop for HaQLite {
         if !self.closed {
             // Abort background tasks so they don't leak.
             // Note: this does NOT cleanly release the lease. Call close().await for that.
-            // Forwarding server is managed by inner (stopped via stop_forwarding_server).
             self._role_handle.abort();
+            // Forwarding server JoinHandle lives behind a `tokio::sync::Mutex`
+            // on `inner`. `close()` aborts it and awaits via the async path;
+            // `Drop` is sync, so we use `try_lock` and skip if contended.
+            // Contention here would mean another task is already touching
+            // `fwd_handle` while the last `Arc<HaQLite>` is being dropped,
+            // which is essentially impossible because nothing else can hold
+            // an `&HaQLite` at this point — but try_lock keeps Drop infallible
+            // even in that pathological case.
+            if let Ok(mut guard) = self.inner.fwd_handle.try_lock() {
+                if let Some(h) = guard.take() {
+                    h.abort();
+                }
+            }
             self.inner.read_semaphore.close();
             tracing::warn!(
                 "HaQLite dropped without close() for '{}'. Background tasks aborted, lease not cleanly released. \
