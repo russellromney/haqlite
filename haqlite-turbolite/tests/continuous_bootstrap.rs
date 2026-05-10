@@ -299,9 +299,11 @@ async fn continuous_fresh_writer_replays_raw_connection_writes() {
     let base = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
         .expect("decode manifest after writer B");
     let max_seq = max_physical_wal_seq(&walrust_storage_impl.keys().await);
-    assert_eq!(
-        base.change_counter, max_seq,
-        "published base must cover flushed raw-connection WAL through the chain head"
+    assert!(
+        max_seq > base.change_counter,
+        "raw-connection WAL must remain replayable when the published base is behind the chain head; base cursor={}, wal head={}",
+        base.change_counter,
+        max_seq
     );
 
     let mut writer_c = open_continuous_remote(

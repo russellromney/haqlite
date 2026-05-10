@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -816,6 +816,7 @@ impl Builder {
             };
 
         let replay_base_pending_publish = Arc::new(AtomicBool::new(false));
+        let replay_base_seq = Arc::new(AtomicU64::new(0));
 
         // Pick replicator. Three sources, in priority order:
         // 1. Caller-supplied via `.replicator(...)` (test harnesses, alt WAL shippers).
@@ -875,6 +876,7 @@ impl Builder {
                             .clone(),
                         delta_replicator,
                         replay_base_pending_publish.clone(),
+                        replay_base_seq.clone(),
                     ))
                 }
             }
@@ -905,7 +907,10 @@ impl Builder {
                                 .clone(),
                             walrust_prefix.to_string(),
                         )
-                        .with_replay_base_tracking(replay_base_pending_publish.clone());
+                        .with_replay_base_tracking(
+                            replay_base_pending_publish.clone(),
+                            replay_base_seq.clone(),
+                        );
                 }
             }
             Arc::new(behavior)
