@@ -10,7 +10,7 @@ use common::InMemoryStorage;
 use hadb::InMemoryLeaseStore;
 use hadb_storage::CasResult;
 use hadb_storage::StorageBackend;
-use haqlite_turbolite::{Builder, HaMode};
+use haqlite_turbolite::{Builder, HaMode, Role};
 use std::sync::Mutex;
 use tempfile::TempDir;
 use turbodb::{Manifest, ManifestMeta, ManifestStore};
@@ -147,6 +147,7 @@ fn make_remote_vfs(
         TurboliteConfig {
             cache_dir: cache_dir.to_path_buf(),
             cache: CacheConfig {
+                gc_enabled: false,
                 pages_per_group: 4,
                 sub_pages_per_frame: 2,
                 ..Default::default()
@@ -775,6 +776,119 @@ async fn continuous_default_vfs_first_delta_chains_from_manifest_base() {
         );
     }
     db.close().await.expect("close haqlite");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continuous_live_client_replays_first_delta_from_manifest_base() {
+    let tmp = TempDir::new().expect("temp dir");
+    let walrust_storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
+    let tiered_storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
+    let manifest_store = Arc::new(MemManifestStore::new()) as Arc<dyn ManifestStore>;
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+
+    let leader_dir = tmp.path().join("leader");
+    let client_dir = tmp.path().join("client");
+    let next_leader_dir = tmp.path().join("next-leader");
+    let leader_path = leader_dir.join("live_client.db");
+    let client_path = client_dir.join("live_client.db");
+    let next_leader_path = next_leader_dir.join("live_client.db");
+
+    let (leader_vfs, leader_vfs_name) = make_remote_vfs(&leader_dir, tiered_storage.clone());
+    let mut leader = Builder::new()
+        .prefix("test/")
+        .mode(HaMode::SingleWriter)
+        .role(Role::Leader)
+        .durability(turbodb::Durability::Continuous {
+            checkpoint: Default::default(),
+            replication_interval: Duration::from_millis(50),
+        })
+        .lease_store(lease_store.clone())
+        .manifest_store(manifest_store.clone())
+        .walrust_storage(walrust_storage.clone())
+        .turbolite_vfs(leader_vfs, &leader_vfs_name)
+        .instance_id("live-client-leader")
+        .forwarding_port(19315)
+        .open(leader_path.to_str().expect("path"), SCHEMA)
+        .await
+        .expect("open leader");
+
+    let (client_vfs, client_vfs_name) = make_remote_vfs(&client_dir, tiered_storage.clone());
+    let mut client = Builder::new()
+        .prefix("test/")
+        .mode(HaMode::SingleWriter)
+        .role(Role::Client)
+        .durability(turbodb::Durability::Continuous {
+            checkpoint: Default::default(),
+            replication_interval: Duration::from_millis(50),
+        })
+        .lease_store(lease_store.clone())
+        .manifest_store(manifest_store.clone())
+        .walrust_storage(walrust_storage.clone())
+        .turbolite_vfs(client_vfs, &client_vfs_name)
+        .instance_id("live-client-reader")
+        .forwarding_port(19316)
+        .open(client_path.to_str().expect("path"), SCHEMA)
+        .await
+        .expect("open client");
+
+    for id in 1..=8 {
+        leader
+            .execute_async(
+                "INSERT INTO bootstrap_test (id, value) VALUES (?1, ?2)",
+                &[
+                    haqlite::SqlValue::Integer(id),
+                    haqlite::SqlValue::Text(format!("client-visible-{id}")),
+                ],
+            )
+            .await
+            .expect("leader insert");
+    }
+    leader.flush_turbolite().expect("leader flush");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let seen = client.query_row("SELECT value FROM bootstrap_test WHERE id = 8", &[], |r| {
+            r.get::<_, String>(0)
+        });
+        if matches!(seen.as_deref(), Ok("client-visible-8")) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "client did not replay the first WAL delta from the published manifest base: {seen:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    client.close().await.expect("close client");
+    leader.close().await.expect("close leader");
+
+    let (next_leader_vfs, next_leader_vfs_name) = make_remote_vfs(&next_leader_dir, tiered_storage);
+    let mut next_leader = Builder::new()
+        .prefix("test/")
+        .mode(HaMode::SingleWriter)
+        .role(Role::Leader)
+        .durability(turbodb::Durability::Continuous {
+            checkpoint: Default::default(),
+            replication_interval: Duration::from_millis(50),
+        })
+        .lease_store(lease_store)
+        .manifest_store(manifest_store)
+        .walrust_storage(walrust_storage)
+        .turbolite_vfs(next_leader_vfs, &next_leader_vfs_name)
+        .instance_id("live-client-next-leader")
+        .forwarding_port(19317)
+        .open(next_leader_path.to_str().expect("path"), SCHEMA)
+        .await
+        .expect("open next leader");
+    let seen = next_leader.query_row("SELECT value FROM bootstrap_test WHERE id = 8", &[], |r| {
+        r.get::<_, String>(0)
+    });
+    assert!(
+        matches!(seen.as_deref(), Ok("client-visible-8")),
+        "new leader must replay WAL deltas after materializing the published base: {seen:?}"
+    );
+    next_leader.close().await.expect("close next leader");
 }
 
 #[tokio::test(flavor = "multi_thread")]

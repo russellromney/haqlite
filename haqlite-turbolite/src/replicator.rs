@@ -377,7 +377,7 @@ impl TurboliteWalReplicator {
     async fn publish_current_manifest(
         &self,
         name: &str,
-        covered_wal_seq: Option<u64>,
+        _covered_wal_seq: Option<u64>,
     ) -> Result<()> {
         if !should_publish_manifest(&self.vfs) {
             return Err(anyhow!(
@@ -399,7 +399,12 @@ impl TurboliteWalReplicator {
         } else {
             None
         };
-        let exact_replay_cursor = replay_base_seq.or(covered_wal_seq);
+        // A WAL changeset being durable through seq N is not the same thing as
+        // the Turbolite page base containing seq N. Only replayed page bases
+        // that are being published now may advance the manifest replay cursor;
+        // otherwise new openers must materialize the base and replay the WAL
+        // delta chain after it.
+        let exact_replay_cursor = replay_base_seq;
 
         // Route through `publish_replayed_base`. For a leader that
         // checkpointed via the SQLite write path, pending replay
@@ -426,35 +431,28 @@ impl TurboliteWalReplicator {
             payload
         };
 
-        let mut exact_base_cursor = None;
-        if let Some(seq) = exact_replay_cursor {
-            let decoded = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&payload)
-                .map_err(|e| anyhow!("turbolite decode exact-cursor base failed: {}", e))?;
-            let cache_path = self.vfs.cache_file_path();
-            let vfs = self.vfs.clone();
-            let payload_for_local = payload.clone();
-            let checksum = tokio::task::spawn_blocking(move || -> Result<u64> {
-                let gate = vfs.replay_gate();
-                let _gate = loop {
-                    if let Some(guard) = gate.try_write() {
-                        break guard;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                };
-                vfs.shared_state()
-                    .materialize_manifest_to_file(&decoded, &cache_path)
-                    .context("turbolite materialize exact-cursor base failed")?;
-                vfs.set_manifest_bytes(&payload_for_local)
-                    .map_err(|e| anyhow!("turbolite install exact-cursor base failed: {}", e))?;
-                vfs.sync_after_external_restore(decoded.page_count);
-                walrust::ltx::compute_checksum_from_file(&cache_path)
-                    .map_err(|e| anyhow!("walrust exact-cursor base checksum failed: {}", e))
-            })
-            .await
-            .map_err(|e| anyhow!("turbolite exact-cursor materialize task panicked: {}", e))??;
-
-            exact_base_cursor = Some(walrust::ExternalBaseCursor { seq, checksum });
-        }
+        let decoded = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&payload)
+            .map_err(|e| anyhow!("turbolite decode published base failed: {}", e))?;
+        self.vfs
+            .set_manifest_bytes(&payload)
+            .map_err(|e| anyhow!("turbolite install published base manifest failed: {}", e))?;
+        let published_base_seq = decoded.change_counter;
+        let cache_path = self.vfs.cache_file_path();
+        let temp_path =
+            cache_path.with_extension(format!("published-base-{}.tmp", uuid::Uuid::new_v4()));
+        let vfs = self.vfs.clone();
+        let decoded_for_checksum = decoded.clone();
+        let published_base_checksum = tokio::task::spawn_blocking(move || -> Result<u64> {
+            vfs.shared_state()
+                .materialize_manifest_to_file(&decoded_for_checksum, &temp_path)
+                .context("turbolite materialize published base for checksum failed")?;
+            let checksum = walrust::ltx::compute_checksum_from_file(&temp_path)
+                .map_err(|e| anyhow!("walrust published base checksum failed: {}", e))?;
+            let _ = std::fs::remove_file(&temp_path);
+            Ok(checksum)
+        })
+        .await
+        .map_err(|e| anyhow!("turbolite published-base checksum task panicked: {}", e))??;
 
         publish_manifest(
             &self.manifest_store,
@@ -464,10 +462,11 @@ impl TurboliteWalReplicator {
         )
         .await?;
 
-        if let Some(cursor) = exact_base_cursor {
-            if let Ok(mut guard) = self.last_published_base_cursor.lock() {
-                *guard = Some(cursor);
-            }
+        if let Ok(mut guard) = self.last_published_base_cursor.lock() {
+            *guard = Some(walrust::ExternalBaseCursor {
+                seq: published_base_seq,
+                checksum: published_base_checksum,
+            });
         }
 
         if used_pending_replay_base {
@@ -481,25 +480,9 @@ impl TurboliteWalReplicator {
 
     async fn ensure_base_manifest(&self, name: &str, path: &Path) -> Result<()> {
         if let Some(manifest) = self.manifest_store.get(&self.manifest_key).await? {
-            let decoded = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
+            turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
                 .map_err(|e| anyhow!("turbolite decode manifest for '{}' failed: {}", name, e))?;
-            if self.vfs.remote_manifest_exists().map_err(|e| {
-                anyhow!(
-                    "turbolite remote manifest_exists failed for '{}': {}",
-                    name,
-                    e
-                )
-            })? {
-                let vfs = self.vfs.clone();
-                tokio::task::spawn_blocking(move || vfs.fetch_and_apply_remote_manifest())
-                    .await
-                    .map_err(|e| anyhow!("turbolite fetch manifest task panicked: {}", e))?
-                    .map_err(|e| anyhow!("turbolite fetch remote manifest failed: {}", e))?;
-            }
-            let local = self.vfs.manifest();
-            if decoded.version > local.version || decoded.change_counter > local.change_counter {
-                self.restore_from_manifest(name, path).await?;
-            }
+            self.restore_from_manifest(name, path).await?;
             return Ok(());
         }
 
@@ -655,7 +638,7 @@ impl TurboliteWalReplicator {
                 prepared_replay.validate_base_checksum(base_checksum)?;
 
                 let handle = vfs
-                    .begin_replay()
+                    .begin_replay_after(walrust_seq)
                     .map_err(|e| anyhow!("turbolite begin_replay failed: {}", e))?;
                 let mut sink = HaqliteTurboliteReplaySink::new_under_external_write(handle);
                 let final_seq = apply_prepared_page_replay(&mut sink, prepared_replay)?;

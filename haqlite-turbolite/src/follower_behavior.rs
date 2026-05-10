@@ -205,7 +205,7 @@ impl TurboliteFollowerBehavior {
                     .expect("decoded walrust requires prepared replay")
                     .validate_base_checksum(base_checksum)?;
                 let handle = vfs
-                    .begin_replay()
+                    .begin_replay_after(replay_start_seq)
                     .map_err(|e| anyhow!("turbolite begin_replay failed: {}", e))?;
                 let mut sink = HaqliteTurboliteReplaySink::new_under_external_write(handle);
                 let final_seq = apply_prepared_page_replay(
