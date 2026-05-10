@@ -369,7 +369,11 @@ impl TurboliteWalReplicator {
         Ok(cache_dir.join(format!("{}-wal", db_name.to_string_lossy())))
     }
 
-    async fn publish_current_manifest(&self, name: &str, _has_new_wal_frames: bool) -> Result<()> {
+    async fn publish_current_manifest(
+        &self,
+        name: &str,
+        covered_wal_seq: Option<u64>,
+    ) -> Result<()> {
         if !should_publish_manifest(&self.vfs) {
             return Err(anyhow!(
                 "{} (turbolite manifest is still empty)",
@@ -393,6 +397,29 @@ impl TurboliteWalReplicator {
             .vfs
             .publish_replayed_base()
             .map_err(|e| anyhow!("turbolite publish_replayed_base failed: {}", e))?;
+        let payload = if let Some(seq) = covered_wal_seq {
+            let decoded = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&payload)
+                .map_err(|e| anyhow!("turbolite decode published base failed: {}", e))?;
+            if decoded.change_counter < seq {
+                if self.vfs.remote_manifest_exists().unwrap_or(false) {
+                    let vfs = self.vfs.clone();
+                    tokio::task::spawn_blocking(move || vfs.fetch_and_apply_remote_manifest())
+                        .await
+                        .map_err(|e| anyhow!("turbolite fetch manifest task panicked: {}", e))?
+                        .map_err(|e| anyhow!("turbolite fetch remote manifest failed: {}", e))?;
+                }
+                self.vfs
+                    .set_manifest_bytes(&payload)
+                    .map_err(|e| anyhow!("turbolite adopt published base failed: {}", e))?;
+                self.vfs
+                    .manifest_bytes_with_replay_cursor_at_least(seq)
+                    .map_err(|e| anyhow!("turbolite encode covered WAL cursor failed: {}", e))?
+            } else {
+                payload
+            }
+        } else {
+            payload
+        };
         publish_manifest(
             &self.manifest_store,
             &self.manifest_key,
@@ -410,7 +437,26 @@ impl TurboliteWalReplicator {
     }
 
     async fn ensure_base_manifest(&self, name: &str, path: &Path) -> Result<()> {
-        if self.manifest_store.get(&self.manifest_key).await?.is_some() {
+        if let Some(manifest) = self.manifest_store.get(&self.manifest_key).await? {
+            let decoded = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
+                .map_err(|e| anyhow!("turbolite decode manifest for '{}' failed: {}", name, e))?;
+            if self.vfs.remote_manifest_exists().map_err(|e| {
+                anyhow!(
+                    "turbolite remote manifest_exists failed for '{}': {}",
+                    name,
+                    e
+                )
+            })? {
+                let vfs = self.vfs.clone();
+                tokio::task::spawn_blocking(move || vfs.fetch_and_apply_remote_manifest())
+                    .await
+                    .map_err(|e| anyhow!("turbolite fetch manifest task panicked: {}", e))?
+                    .map_err(|e| anyhow!("turbolite fetch remote manifest failed: {}", e))?;
+            }
+            let local = self.vfs.manifest();
+            if decoded.version > local.version || decoded.change_counter > local.change_counter {
+                self.restore_from_manifest(name, path).await?;
+            }
             return Ok(());
         }
 
@@ -456,7 +502,17 @@ impl TurboliteWalReplicator {
                 .map_err(|e| anyhow!("turbolite import failed: {}", e))?;
         }
 
-        self.publish_current_manifest(name, false).await
+        self.publish_current_manifest(name, None).await
+    }
+
+    fn external_base_cursor(&self, cache_path: &Path) -> Result<walrust::ExternalBaseCursor> {
+        let manifest = self.vfs.manifest();
+        let checksum = walrust::ltx::compute_checksum_from_file(cache_path)
+            .map_err(|e| anyhow!("walrust external base checksum failed: {}", e))?;
+        Ok(walrust::ExternalBaseCursor {
+            seq: manifest.change_counter,
+            checksum,
+        })
     }
 
     async fn restore_from_manifest(&self, name: &str, _path: &Path) -> Result<()> {
@@ -559,10 +615,11 @@ impl Replicator for TurboliteWalReplicator {
         if let Ok(mut guard) = self.live_wal_path.lock() {
             *guard = Some(wal_path.clone());
         }
+        self.ensure_base_manifest(name, path).await?;
+        let base = self.external_base_cursor(&cache_path)?;
         self.walrust
-            .add_with_wal_path(name, &cache_path, &wal_path)
-            .await?;
-        self.ensure_base_manifest(name, path).await
+            .add_external_base_with_wal_path(name, &cache_path, &wal_path, base)
+            .await
     }
 
     async fn add_continuing(&self, name: &str, path: &Path) -> Result<()> {
@@ -571,16 +628,18 @@ impl Replicator for TurboliteWalReplicator {
         if let Ok(mut guard) = self.live_wal_path.lock() {
             *guard = Some(wal_path.clone());
         }
-        self.walrust
-            .add_without_snapshot_with_wal_path(name, &cache_path, &wal_path)
-            .await?;
 
         // Promotion publish: hadb calls `add_continuing` right
         // after a follower wins the lease. Flush the accumulated
         // replay state now so a fresh follower joining before the
         // next commit still sees the replayed pages in the
         // published base.
-        self.publish_current_manifest(name, false).await
+        self.publish_current_manifest(name, None).await?;
+        let base = self.external_base_cursor(&cache_path)?;
+
+        self.walrust
+            .add_external_base_with_wal_path(name, &cache_path, &wal_path, base)
+            .await
     }
 
     async fn pull(&self, name: &str, path: &Path) -> Result<()> {
@@ -596,7 +655,8 @@ impl Replicator for TurboliteWalReplicator {
                 frames,
             );
         }
-        self.publish_current_manifest(name, frames > 0).await?;
+        let covered_wal_seq = self.walrust.inner().current_seq(name).await;
+        self.publish_current_manifest(name, covered_wal_seq).await?;
         self.walrust.remove(name).await
     }
 
@@ -609,6 +669,7 @@ impl Replicator for TurboliteWalReplicator {
                 frames,
             );
         }
-        self.publish_current_manifest(name, frames > 0).await
+        let covered_wal_seq = self.walrust.inner().current_seq(name).await;
+        self.publish_current_manifest(name, covered_wal_seq).await
     }
 }

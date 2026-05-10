@@ -78,6 +78,18 @@ impl SqliteReplicator {
             .add_without_snapshot_with_wal_path(name, path, wal_path)
             .await
     }
+
+    pub async fn add_external_base_with_wal_path(
+        &self,
+        name: &str,
+        path: &Path,
+        wal_path: &Path,
+        base: walrust::ExternalBaseCursor,
+    ) -> Result<()> {
+        self.inner
+            .add_external_base_with_wal_path(name, path, wal_path, base)
+            .await
+    }
 }
 
 /// SQLite replicator for external-base-state mode.
@@ -130,6 +142,18 @@ impl ExternalSnapshotSqliteReplicator {
     ) -> Result<()> {
         self.inner
             .add_without_snapshot_with_wal_path(name, path, wal_path)
+            .await
+    }
+
+    pub async fn add_external_base_with_wal_path(
+        &self,
+        name: &str,
+        path: &Path,
+        wal_path: &Path,
+        base: walrust::ExternalBaseCursor,
+    ) -> Result<()> {
+        self.inner
+            .add_external_base_with_wal_path(name, path, wal_path, base)
             .await
     }
 }

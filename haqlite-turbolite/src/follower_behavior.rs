@@ -123,7 +123,12 @@ impl TurboliteFollowerBehavior {
         // WAL objects after the caller's current seq; rematerializing
         // the old base every poll creates a base/replay churn window.
         let local_manifest = self.vfs.manifest();
-        let materialize_base = decoded_manifest.version > local_manifest.version;
+        // Continuous readers use `change_counter` as the durable delta
+        // replay floor. A same-version base with a higher cursor still
+        // covers more committed deltas, so adopt it before listing WAL
+        // objects or the follower can chase an already-checkpointed seq.
+        let materialize_base = decoded_manifest.version > local_manifest.version
+            || (continuous && decoded_manifest.change_counter > local_manifest.change_counter);
         let replay_start_seq = if continuous {
             if materialize_base {
                 decoded_manifest.change_counter

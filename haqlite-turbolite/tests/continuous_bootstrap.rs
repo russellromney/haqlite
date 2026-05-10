@@ -140,15 +140,29 @@ fn make_remote_vfs(
 ) -> (SharedTurboliteVfs, String) {
     let n = VFS_COUNTER.fetch_add(1, Ordering::SeqCst);
     let vfs_name = format!("continuous_bootstrap_{}", n);
-    let config = TurboliteConfig {
-        cache_dir: cache_dir.to_path_buf(),
-        cache: CacheConfig {
-            pages_per_group: 4,
-            sub_pages_per_frame: 2,
+    make_remote_vfs_with_config(
+        cache_dir,
+        storage,
+        vfs_name,
+        TurboliteConfig {
+            cache_dir: cache_dir.to_path_buf(),
+            cache: CacheConfig {
+                pages_per_group: 4,
+                sub_pages_per_frame: 2,
+                ..Default::default()
+            },
             ..Default::default()
         },
-        ..Default::default()
-    };
+    )
+}
+
+fn make_remote_vfs_with_config(
+    _cache_dir: &std::path::Path,
+    storage: Arc<dyn StorageBackend>,
+    vfs_name: String,
+    config: TurboliteConfig,
+) -> (SharedTurboliteVfs, String) {
+    let config = TurboliteConfig { ..config };
     let vfs = TurboliteVfs::with_backend(config, storage, tokio::runtime::Handle::current())
         .expect("create VFS");
     let shared_vfs = SharedTurboliteVfs::new(vfs);
@@ -249,7 +263,6 @@ async fn continuous_fresh_writer_replays_raw_connection_writes() {
         .await
         .expect("writer A insert");
     writer_a.close().await.expect("close writer A");
-
     let mut writer_b = open_continuous_remote(
         &tmp.path().join("b"),
         "direct.db",
@@ -286,10 +299,9 @@ async fn continuous_fresh_writer_replays_raw_connection_writes() {
     let base = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
         .expect("decode manifest after writer B");
     let max_seq = max_physical_wal_seq(&walrust_storage_impl.keys().await);
-    assert!(
-        base.change_counter < max_seq,
-        "raw connection WAL must remain ahead of the published base change counter; base={}, max_seq={max_seq}",
-        base.change_counter
+    assert_eq!(
+        base.change_counter, max_seq,
+        "published base must cover flushed raw-connection WAL through the chain head"
     );
 
     let mut writer_c = open_continuous_remote(
@@ -601,5 +613,421 @@ async fn continuous_first_write_publishes_manifest_that_only_references_existing
         "first write should also publish walrust state; keys = {:?}",
         walrust_keys
     );
+
+    let base = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
+        .expect("decode base manifest");
+    let base_path = tmp.path().join("first_write_base.db");
+    vfs.shared_state()
+        .materialize_manifest_to_file(&base, &base_path)
+        .expect("materialize published base");
+    let base_checksum =
+        walrust::ltx::compute_checksum_from_file(&base_path).expect("base checksum");
+
+    let first_delta_key = walrust_keys
+        .iter()
+        .filter_map(|key| {
+            let name = key.rsplit('/').next()?;
+            let hex = name.strip_suffix(".hadbp")?;
+            let seq = u64::from_str_radix(hex, 16).ok()?;
+            (seq > base.change_counter).then_some((seq, key))
+        })
+        .min_by_key(|(seq, _)| *seq)
+        .map(|(_, key)| key.clone());
+    if let Some(first_delta_key) = first_delta_key {
+        let first_delta = walrust_storage_impl
+            .get(&first_delta_key)
+            .await
+            .expect("get first delta")
+            .expect("first delta object");
+        let decoded_delta = walrust::ltx::decode_to_db(
+            &first_delta,
+            &tmp.path().join("first_write_delta_decode.db"),
+        )
+        .expect("decode first delta");
+        assert_eq!(
+            decoded_delta.header.prev_checksum, base_checksum,
+            "first WAL delta after manifest base must chain from the published base checksum; key={first_delta_key}"
+        );
+    } else {
+        assert_eq!(
+            base.change_counter,
+            max_physical_wal_seq(&walrust_keys),
+            "published base must either be followed by a delta or cover the WAL chain head"
+        );
+    }
+    db.close().await.expect("close haqlite");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continuous_default_vfs_first_delta_chains_from_manifest_base() {
+    let tmp = TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("default_first_write.db");
+
+    let walrust_storage_impl = Arc::new(InMemoryStorage::new());
+    let walrust_storage: Arc<dyn StorageBackend> = walrust_storage_impl.clone();
+    let tiered_storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+
+    let vfs_name = format!(
+        "continuous_bootstrap_default_{}",
+        VFS_COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
+    let (vfs, vfs_name) = make_remote_vfs_with_config(
+        tmp.path(),
+        tiered_storage,
+        vfs_name,
+        TurboliteConfig {
+            cache_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        },
+    );
+    let mut db = Builder::new()
+        .prefix("test/")
+        .mode(HaMode::SingleWriter)
+        .durability(turbodb::Durability::Continuous {
+            checkpoint: Default::default(),
+            replication_interval: Duration::from_millis(50),
+        })
+        .lease_store(lease_store)
+        .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
+        .walrust_storage(walrust_storage)
+        .turbolite_vfs(vfs.clone(), &vfs_name)
+        .instance_id("writer-default-first-write")
+        .forwarding_port(19312)
+        .open(db_path.to_str().expect("path"), SCHEMA)
+        .await
+        .expect("open continuous mode");
+
+    db.execute_async(
+        "INSERT INTO bootstrap_test (id, value) VALUES (?1, ?2)",
+        &[
+            haqlite::SqlValue::Integer(1),
+            haqlite::SqlValue::Text("default-first-write".to_string()),
+        ],
+    )
+    .await
+    .expect("first write");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let (manifest, walrust_keys) = loop {
+        let manifest = manifest_store
+            .get("test/default_first_write/_manifest")
+            .await
+            .expect("fetch manifest during first-write poll");
+        if let Some(manifest) = manifest {
+            let base = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
+                .expect("decode pure base payload during first-write poll");
+            let keys = walrust_storage_impl.keys().await;
+            let max_seq = max_physical_wal_seq(&keys);
+            if max_seq > 0 && max_seq >= base.change_counter {
+                break (manifest, keys);
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "first write should publish a walrust delta object"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let base = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
+        .expect("decode base manifest");
+    let base_path = tmp.path().join("default_first_write_base.db");
+    vfs.shared_state()
+        .materialize_manifest_to_file(&base, &base_path)
+        .expect("materialize published base");
+    let base_checksum =
+        walrust::ltx::compute_checksum_from_file(&base_path).expect("base checksum");
+
+    let first_delta_key = walrust_keys
+        .iter()
+        .filter_map(|key| {
+            let name = key.rsplit('/').next()?;
+            let hex = name.strip_suffix(".hadbp")?;
+            let seq = u64::from_str_radix(hex, 16).ok()?;
+            (seq > base.change_counter).then_some((seq, key))
+        })
+        .min_by_key(|(seq, _)| *seq)
+        .map(|(_, key)| key.clone());
+    if let Some(first_delta_key) = first_delta_key {
+        let first_delta = walrust_storage_impl
+            .get(&first_delta_key)
+            .await
+            .expect("get first delta")
+            .expect("first delta object");
+        let decoded_delta = walrust::ltx::decode_to_db(
+            &first_delta,
+            &tmp.path().join("default_first_write_delta_decode.db"),
+        )
+        .expect("decode first delta");
+        assert_eq!(
+            decoded_delta.header.prev_checksum, base_checksum,
+            "first WAL delta after default manifest base must chain from published base checksum; key={first_delta_key}"
+        );
+    } else {
+        assert_eq!(
+            base.change_counter,
+            max_physical_wal_seq(&walrust_keys),
+            "published base must either be followed by a delta or cover the WAL chain head"
+        );
+    }
+    db.close().await.expect("close haqlite");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continuous_stale_walrust_state_does_not_poison_first_delta_chain() {
+    let tmp = TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("stale_state.db");
+
+    let walrust_storage_impl = Arc::new(InMemoryStorage::new());
+    walrust_storage_impl
+        .put(
+            "test/stale_state/state.json",
+            br#"{
+                "wal_offset": 999999,
+                "wal_generation": 7,
+                "current_seq": 4455,
+                "current_txid": 4455,
+                "db_checksum": 9375440988564496056,
+                "last_snapshot": null
+            }"#,
+        )
+        .await
+        .expect("seed stale walrust state");
+    let walrust_storage: Arc<dyn StorageBackend> = walrust_storage_impl.clone();
+    let tiered_storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+
+    let vfs_name = format!(
+        "continuous_bootstrap_stale_state_{}",
+        VFS_COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
+    let (vfs, vfs_name) = make_remote_vfs_with_config(
+        tmp.path(),
+        tiered_storage,
+        vfs_name,
+        TurboliteConfig {
+            cache_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        },
+    );
+    let mut db = Builder::new()
+        .prefix("test/")
+        .mode(HaMode::SingleWriter)
+        .durability(turbodb::Durability::Continuous {
+            checkpoint: Default::default(),
+            replication_interval: Duration::from_millis(50),
+        })
+        .lease_store(lease_store)
+        .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
+        .walrust_storage(walrust_storage)
+        .turbolite_vfs(vfs.clone(), &vfs_name)
+        .instance_id("writer-stale-state")
+        .forwarding_port(19314)
+        .open(db_path.to_str().expect("path"), SCHEMA)
+        .await
+        .expect("open continuous mode");
+
+    db.execute_async(
+        "INSERT INTO bootstrap_test (id, value) VALUES (?1, ?2)",
+        &[
+            haqlite::SqlValue::Integer(1),
+            haqlite::SqlValue::Text("after-stale-state".to_string()),
+        ],
+    )
+    .await
+    .expect("first write after stale state");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let (manifest, walrust_keys) = loop {
+        let manifest = manifest_store
+            .get("test/stale_state/_manifest")
+            .await
+            .expect("fetch manifest during stale-state poll");
+        if let Some(manifest) = manifest {
+            let base = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
+                .expect("decode pure base payload during stale-state poll");
+            let keys = walrust_storage_impl.keys().await;
+            let max_seq = max_physical_wal_seq(&keys);
+            if max_seq > 0 && max_seq >= base.change_counter {
+                break (manifest, keys);
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "first write after stale state should publish a fresh walrust delta object"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let base = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
+        .expect("decode base manifest");
+    let base_path = tmp.path().join("stale_state_base.db");
+    vfs.shared_state()
+        .materialize_manifest_to_file(&base, &base_path)
+        .expect("materialize published base");
+    let base_checksum =
+        walrust::ltx::compute_checksum_from_file(&base_path).expect("base checksum");
+
+    let first_delta_key = walrust_keys
+        .iter()
+        .filter_map(|key| {
+            let name = key.rsplit('/').next()?;
+            let hex = name.strip_suffix(".hadbp")?;
+            let seq = u64::from_str_radix(hex, 16).ok()?;
+            (seq > base.change_counter).then_some((seq, key))
+        })
+        .min_by_key(|(seq, _)| *seq)
+        .map(|(_, key)| key.clone());
+    if let Some(first_delta_key) = first_delta_key {
+        let first_delta = walrust_storage_impl
+            .get(&first_delta_key)
+            .await
+            .expect("get first delta")
+            .expect("first delta object");
+        let decoded_delta = walrust::ltx::decode_to_db(
+            &first_delta,
+            &tmp.path().join("stale_state_delta_decode.db"),
+        )
+        .expect("decode first delta");
+        assert_eq!(
+            decoded_delta.header.seq,
+            base.change_counter + 1,
+            "stale walrust state must not make the first fresh delta skip ahead; key={first_delta_key}"
+        );
+        assert_eq!(
+            decoded_delta.header.prev_checksum, base_checksum,
+            "first WAL delta after stale walrust state must chain from the published base checksum; key={first_delta_key}"
+        );
+    } else {
+        assert_eq!(
+            base.change_counter,
+            max_physical_wal_seq(&walrust_keys),
+            "published base must either be followed by a delta or cover the WAL chain head"
+        );
+    }
+    db.close().await.expect("close haqlite");
+}
+
+#[cfg(feature = "s3")]
+#[tokio::test(flavor = "multi_thread")]
+async fn continuous_object_store_first_delta_chains_from_manifest_base() {
+    if !common::s3_env_available() {
+        eprintln!("skipping continuous object-store chain test: TIERED_TEST_BUCKET is not set");
+        return;
+    }
+
+    let tmp = TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("object_first_write.db");
+    let prefix = format!(
+        "test/continuous-bootstrap/object-first-delta/{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    );
+
+    let walrust_storage = common::s3_backend(&format!("{prefix}/wal")).await;
+    let tiered_storage = common::s3_backend(&format!("{prefix}/pages")).await;
+    let manifest_store = Arc::new(MemManifestStore::new());
+    let lease_store = Arc::new(InMemoryLeaseStore::new());
+    let (vfs, vfs_name) = make_remote_vfs(tmp.path(), tiered_storage);
+
+    let mut db = Builder::new()
+        .prefix("test/")
+        .mode(HaMode::SingleWriter)
+        .durability(turbodb::Durability::Continuous {
+            checkpoint: Default::default(),
+            replication_interval: Duration::from_millis(50),
+        })
+        .lease_store(lease_store)
+        .manifest_store(manifest_store.clone() as Arc<dyn ManifestStore>)
+        .walrust_storage(walrust_storage.clone())
+        .turbolite_vfs(vfs.clone(), &vfs_name)
+        .instance_id("writer-object-first-write")
+        .forwarding_port(19313)
+        .open(db_path.to_str().expect("path"), SCHEMA)
+        .await
+        .expect("open continuous mode");
+
+    db.execute_async(
+        "INSERT INTO bootstrap_test (id, value) VALUES (?1, ?2)",
+        &[
+            haqlite::SqlValue::Integer(1),
+            haqlite::SqlValue::Text("object-first-write".to_string()),
+        ],
+    )
+    .await
+    .expect("first write");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (manifest, walrust_keys) = loop {
+        let manifest = manifest_store
+            .get("test/object_first_write/_manifest")
+            .await
+            .expect("fetch manifest during first-write poll");
+        if let Some(manifest) = manifest {
+            let base = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
+                .expect("decode pure base payload during first-write poll");
+            let keys = walrust_storage
+                .list("test/object_first_write/", None)
+                .await
+                .expect("list walrust object-store keys");
+            let max_seq = max_physical_wal_seq(&keys);
+            if max_seq > 0 && max_seq >= base.change_counter {
+                break (manifest, keys);
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "object-store first write should publish a WAL chain head"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let base = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
+        .expect("decode base manifest");
+    let base_path = tmp.path().join("object_first_write_base.db");
+    vfs.shared_state()
+        .materialize_manifest_to_file(&base, &base_path)
+        .expect("materialize published base");
+    let base_checksum =
+        walrust::ltx::compute_checksum_from_file(&base_path).expect("base checksum");
+
+    let first_delta_key = walrust_keys
+        .iter()
+        .filter_map(|key| {
+            let name = key.rsplit('/').next()?;
+            let hex = name.strip_suffix(".hadbp")?;
+            let seq = u64::from_str_radix(hex, 16).ok()?;
+            (seq > base.change_counter).then_some((seq, key))
+        })
+        .min_by_key(|(seq, _)| *seq)
+        .map(|(_, key)| key.clone());
+    if let Some(first_delta_key) = first_delta_key {
+        let first_delta = walrust_storage
+            .get(&first_delta_key)
+            .await
+            .expect("get first delta")
+            .expect("first delta object");
+        let decoded_delta = walrust::ltx::decode_to_db(
+            &first_delta,
+            &tmp.path().join("object_first_write_delta_decode.db"),
+        )
+        .expect("decode first delta");
+        assert_eq!(
+            decoded_delta.header.prev_checksum, base_checksum,
+            "first object-store WAL delta after manifest base must chain from published base checksum; key={first_delta_key}"
+        );
+    } else {
+        assert_eq!(
+            base.change_counter,
+            max_physical_wal_seq(&walrust_keys),
+            "published object-store base must either be followed by a delta or cover the WAL chain head"
+        );
+    }
+
     db.close().await.expect("close haqlite");
 }
