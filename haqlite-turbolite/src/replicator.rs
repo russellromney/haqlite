@@ -401,7 +401,13 @@ impl TurboliteWalReplicator {
             let decoded = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&payload)
                 .map_err(|e| anyhow!("turbolite decode published base failed: {}", e))?;
             if decoded.change_counter < seq {
-                if self.vfs.remote_manifest_exists().unwrap_or(false) {
+                if self.vfs.remote_manifest_exists().map_err(|e| {
+                    anyhow!(
+                        "turbolite remote manifest_exists failed for '{}': {}",
+                        name,
+                        e
+                    )
+                })? {
                     let vfs = self.vfs.clone();
                     tokio::task::spawn_blocking(move || vfs.fetch_and_apply_remote_manifest())
                         .await
