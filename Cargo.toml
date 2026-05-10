@@ -23,6 +23,11 @@ turbodb-manifest-mem = { path = "../hadb/turbodb-manifest-mem" }
 [patch."https://github.com/russellromney/walrust.git"]
 walrust = { path = "../walrust/crates/walrust-core" }
 
+[patch.crates-io]
+hadb-storage = { path = "../hadb/hadb-storage" }
+hadb-storage-local = { path = "../hadb/hadb-storage-local" }
+hadb-storage-s3 = { path = "../hadb/hadb-storage-s3" }
+
 [patch."https://github.com/russellromney/turbolite.git"]
 turbolite = { path = "../turbolite" }
 

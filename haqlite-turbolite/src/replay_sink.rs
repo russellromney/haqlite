@@ -63,6 +63,14 @@ pub(crate) async fn prepare_page_replay(
     )
     .await?;
     let mut changesets = Vec::with_capacity(files.len());
+    if files.is_empty() {
+        return Ok(PreparedPageReplay {
+            current_seq,
+            changesets,
+            target_page_count: None,
+            base_file_checksum_required: false,
+        });
+    }
     let mut expected_seq = current_seq + 1;
     let previous_key = (current_seq > 0).then(|| {
         cs_storage::format_key(

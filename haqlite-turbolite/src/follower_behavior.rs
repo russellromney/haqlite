@@ -29,6 +29,7 @@ pub struct TurboliteFollowerBehavior {
     walrust_prefix: Option<String>,
     wakeup: Option<Arc<tokio::sync::Notify>>,
     replay_base_pending_publish: Option<Arc<AtomicBool>>,
+    replay_base_seq: Option<Arc<AtomicU64>>,
 }
 
 impl TurboliteFollowerBehavior {
@@ -41,6 +42,7 @@ impl TurboliteFollowerBehavior {
             walrust_prefix: None,
             wakeup: None,
             replay_base_pending_publish: None,
+            replay_base_seq: None,
         }
     }
 
@@ -69,8 +71,13 @@ impl TurboliteFollowerBehavior {
         self
     }
 
-    pub fn with_replay_base_tracking(mut self, pending_publish: Arc<AtomicBool>) -> Self {
+    pub fn with_replay_base_tracking(
+        mut self,
+        pending_publish: Arc<AtomicBool>,
+        replay_seq: Arc<AtomicU64>,
+    ) -> Self {
         self.replay_base_pending_publish = Some(pending_publish);
+        self.replay_base_seq = Some(replay_seq);
         self
     }
 
@@ -112,6 +119,7 @@ impl TurboliteFollowerBehavior {
         let payload_owned = payload.to_vec();
         let db_name_owned = db_name.to_string();
         let replay_base_pending_publish = self.replay_base_pending_publish.clone();
+        let replay_base_seq = self.replay_base_seq.clone();
 
         // Materialize before set_manifest_bytes: pre-flighting
         // fetches BEFORE the only-mutation step keeps a missing-group
@@ -123,7 +131,12 @@ impl TurboliteFollowerBehavior {
         // WAL objects after the caller's current seq; rematerializing
         // the old base every poll creates a base/replay churn window.
         let local_manifest = self.vfs.manifest();
-        let materialize_base = decoded_manifest.version > local_manifest.version;
+        // Continuous readers use `change_counter` as the durable delta
+        // replay floor. A same-version base with a higher cursor still
+        // covers more committed deltas, so adopt it before listing WAL
+        // objects or the follower can chase an already-checkpointed seq.
+        let materialize_base = decoded_manifest.version > local_manifest.version
+            || (continuous && decoded_manifest.change_counter > local_manifest.change_counter);
         let replay_start_seq = if continuous {
             if materialize_base {
                 decoded_manifest.change_counter
@@ -208,6 +221,9 @@ impl TurboliteFollowerBehavior {
                 if final_seq > replay_start_seq {
                     if let Some(pending) = replay_base_pending_publish {
                         pending.store(true, Ordering::Release);
+                    }
+                    if let Some(seq) = replay_base_seq {
+                        seq.fetch_max(final_seq, Ordering::AcqRel);
                     }
                 }
                 return Ok(ApplyOutcome::Applied(final_seq));

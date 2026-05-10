@@ -1474,7 +1474,6 @@ impl HaQLite {
         if self.closed {
             return Ok(());
         }
-        self.closed = true;
 
         // 1. Close read semaphore -- new reads get EngineClosed immediately.
         self.inner.read_semaphore.close();
@@ -1519,6 +1518,7 @@ impl HaQLite {
         role_handle.abort();
         let _ = role_handle.await;
 
+        self.closed = true;
         Ok(())
     }
 

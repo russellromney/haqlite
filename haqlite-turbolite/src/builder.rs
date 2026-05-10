@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
 
 use hadb::{HaMode, LeaseStore, NoOpReplicator, Replicator, Role};
-use haqlite::{ForwardingMode, HaQLite, HaQLiteBuilder};
+use haqlite::{AuthorizerFactory, ForwardingMode, HaQLite, HaQLiteBuilder};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use turbodb::ManifestStore;
 use turbolite::tiered::SharedTurboliteVfs;
 
@@ -117,6 +118,49 @@ fn stable_vfs_name(key: &str) -> String {
 fn new_shared_fence() -> SharedFence {
     let (fence, writer) = haqlite::AtomicFence::new();
     (Arc::new(fence), Arc::new(writer))
+}
+
+fn is_continuous_forbidden_pragma(ctx: &AuthContext<'_>) -> bool {
+    match ctx.action {
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value,
+        } => {
+            pragma_name.eq_ignore_ascii_case("wal_checkpoint")
+                || pragma_name.eq_ignore_ascii_case("wal_autocheckpoint")
+                || (pragma_name.eq_ignore_ascii_case("journal_mode") && pragma_value.is_some())
+        }
+        _ => false,
+    }
+}
+
+fn read_only_authorization(ctx: AuthContext<'_>) -> Authorization {
+    match ctx.action {
+        AuthAction::Select
+        | AuthAction::Read { .. }
+        | AuthAction::Function { .. }
+        | AuthAction::Recursive => Authorization::Allow,
+        _ => Authorization::Deny,
+    }
+}
+
+fn continuous_authorizer(base: Option<AuthorizerFactory>) -> AuthorizerFactory {
+    Arc::new(move |fenced| {
+        let mut base_auth = base.as_ref().map(|factory| factory(fenced));
+        Box::new(move |ctx: AuthContext<'_>| {
+            if is_continuous_forbidden_pragma(&ctx) {
+                return Authorization::Deny;
+            }
+
+            if let Some(auth) = base_auth.as_mut() {
+                auth(ctx)
+            } else if fenced {
+                read_only_authorization(ctx)
+            } else {
+                Authorization::Allow
+            }
+        })
+    })
 }
 
 fn auto_vfs_key(
@@ -772,6 +816,7 @@ impl Builder {
             };
 
         let replay_base_pending_publish = Arc::new(AtomicBool::new(false));
+        let replay_base_seq = Arc::new(AtomicU64::new(0));
 
         // Pick replicator. Three sources, in priority order:
         // 1. Caller-supplied via `.replicator(...)` (test harnesses, alt WAL shippers).
@@ -831,6 +876,7 @@ impl Builder {
                             .clone(),
                         delta_replicator,
                         replay_base_pending_publish.clone(),
+                        replay_base_seq.clone(),
                     ))
                 }
             }
@@ -861,7 +907,10 @@ impl Builder {
                                 .clone(),
                             walrust_prefix.to_string(),
                         )
-                        .with_replay_base_tracking(replay_base_pending_publish.clone());
+                        .with_replay_base_tracking(
+                            replay_base_pending_publish.clone(),
+                            replay_base_seq.clone(),
+                        );
                 }
             }
             Arc::new(behavior)
@@ -1000,6 +1049,12 @@ impl Builder {
             Ok(())
         }));
 
+        let authorizer = if is_continuous {
+            Some(continuous_authorizer(self.inner.get_authorizer().cloned()))
+        } else {
+            self.inner.get_authorizer().cloned()
+        };
+
         let coordinator = haqlite::Coordinator::new(
             replicator,
             None,
@@ -1019,7 +1074,7 @@ impl Builder {
             self.inner.get_forward_timeout(),
             self.inner.get_secret().map(|s| s.to_string()),
             self.inner.get_read_concurrency(),
-            self.inner.get_authorizer().cloned(),
+            authorizer,
             Some(connection_opener),
             Some(follower_read_connection_opener),
             on_flush,
@@ -1042,6 +1097,85 @@ fn detect_address(instance_id: &str, forwarding_port: u16) -> String {
 mod tests {
     use super::*;
     use hadb_storage::StorageBackend;
+
+    fn pragma_ctx(name: &'static str, value: Option<&'static str>) -> AuthContext<'static> {
+        AuthContext {
+            action: AuthAction::Pragma {
+                pragma_name: name,
+                pragma_value: value,
+            },
+            database_name: Some("main"),
+            accessor: None,
+        }
+    }
+
+    #[test]
+    fn continuous_authorizer_rejects_checkpoint_boundary_pragmas() {
+        let factory = continuous_authorizer(None);
+        let mut auth = factory(false);
+
+        for ctx in [
+            pragma_ctx("wal_checkpoint", None),
+            pragma_ctx("WAL_CHECKPOINT", Some("TRUNCATE")),
+            pragma_ctx("Wal_Checkpoint", Some("PASSIVE")),
+            pragma_ctx("wal_autocheckpoint", None),
+            pragma_ctx("WAL_AUTOCHECKPOINT", Some("1")),
+            pragma_ctx("journal_mode", Some("DELETE")),
+        ] {
+            assert_eq!(auth(ctx), Authorization::Deny);
+        }
+    }
+
+    #[test]
+    fn continuous_authorizer_preserves_custom_policy() {
+        let custom: AuthorizerFactory = Arc::new(|_| {
+            Box::new(|ctx| match ctx.action {
+                AuthAction::Pragma { pragma_name, .. }
+                    if pragma_name.eq_ignore_ascii_case("user_version") =>
+                {
+                    Authorization::Deny
+                }
+                _ => Authorization::Allow,
+            })
+        });
+
+        let factory = continuous_authorizer(Some(custom));
+        let mut auth = factory(false);
+
+        assert_eq!(
+            auth(pragma_ctx("wal_checkpoint", None)),
+            Authorization::Deny
+        );
+        assert_eq!(
+            auth(pragma_ctx("wal_autocheckpoint", Some("1"))),
+            Authorization::Deny
+        );
+        assert_eq!(auth(pragma_ctx("user_version", None)), Authorization::Deny);
+        assert_eq!(auth(pragma_ctx("journal_mode", None)), Authorization::Allow);
+    }
+
+    #[test]
+    fn continuous_authorizer_keeps_fenced_connections_read_only() {
+        let factory = continuous_authorizer(None);
+        let mut auth = factory(true);
+
+        assert_eq!(
+            auth(AuthContext {
+                action: AuthAction::Select,
+                database_name: None,
+                accessor: None,
+            }),
+            Authorization::Allow
+        );
+        assert_eq!(
+            auth(AuthContext {
+                action: AuthAction::Insert { table_name: "t" },
+                database_name: Some("main"),
+                accessor: None,
+            }),
+            Authorization::Deny
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn auto_vfs_registration_skips_preflight_failures() {
