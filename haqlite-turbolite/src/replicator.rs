@@ -192,12 +192,12 @@ async fn publish_manifest(
     key: &str,
     writer_id: &str,
     payload: Vec<u8>,
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     let manifest = manifest_envelope(writer_id, payload);
     let expected = store.meta(key).await?.map(|m| m.version);
     let cas = store.put(key, &manifest, expected).await?;
     if cas.success {
-        return Ok(());
+        return Ok(manifest.payload);
     }
 
     // Fresh bootstrap can race with another first publisher for the same
@@ -213,7 +213,7 @@ async fn publish_manifest(
             if let Some(retry_expected) = store.meta(key).await?.map(|m| m.version) {
                 let retry = store.put(key, &manifest, Some(retry_expected)).await?;
                 if retry.success {
-                    return Ok(());
+                    return Ok(manifest.payload);
                 }
             }
 
@@ -225,7 +225,7 @@ async fn publish_manifest(
                         writer_id = %current.writer_id,
                         "manifest create lost race to same writer; treating existing manifest as authoritative"
                     );
-                    return Ok(());
+                    return Ok(current.payload);
                 }
 
                 return Err(anyhow!(
@@ -280,13 +280,17 @@ impl TurboliteReplicator {
             .vfs
             .manifest_bytes()
             .map_err(|e| anyhow!("turbolite manifest_bytes failed: {}", e))?;
-        publish_manifest(
+        let actual_payload = publish_manifest(
             &self.manifest_store,
             &self.manifest_key,
             &self.writer_id,
             payload,
         )
-        .await
+        .await?;
+        self.vfs
+            .set_manifest_bytes(&actual_payload)
+            .map_err(|e| anyhow!("turbolite adopt authoritative manifest failed: {}", e))?;
+        Ok(())
     }
 }
 
@@ -431,11 +435,21 @@ impl TurboliteWalReplicator {
             payload
         };
 
-        let decoded = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&payload)
-            .map_err(|e| anyhow!("turbolite decode published base failed: {}", e))?;
-        self.vfs
-            .set_manifest_bytes(&payload)
-            .map_err(|e| anyhow!("turbolite install published base manifest failed: {}", e))?;
+        let actual_payload = publish_manifest(
+            &self.manifest_store,
+            &self.manifest_key,
+            &self.writer_id,
+            payload,
+        )
+        .await?;
+        let decoded = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&actual_payload)
+            .map_err(|e| anyhow!("turbolite decode authoritative base failed: {}", e))?;
+        self.vfs.set_manifest_bytes(&actual_payload).map_err(|e| {
+            anyhow!(
+                "turbolite install authoritative base manifest failed: {}",
+                e
+            )
+        })?;
         let published_base_seq = decoded.change_counter;
         let cache_path = self.vfs.cache_file_path();
         let temp_path =
@@ -453,14 +467,6 @@ impl TurboliteWalReplicator {
         })
         .await
         .map_err(|e| anyhow!("turbolite published-base checksum task panicked: {}", e))??;
-
-        publish_manifest(
-            &self.manifest_store,
-            &self.manifest_key,
-            &self.writer_id,
-            payload,
-        )
-        .await?;
 
         if let Ok(mut guard) = self.last_published_base_cursor.lock() {
             *guard = Some(walrust::ExternalBaseCursor {
@@ -540,8 +546,15 @@ impl TurboliteWalReplicator {
                 }
             }
         }
-        let checksum = walrust::ltx::compute_checksum_from_file(cache_path)
+        let temp_path =
+            cache_path.with_extension(format!("external-base-{}.tmp", uuid::Uuid::new_v4()));
+        self.vfs
+            .shared_state()
+            .materialize_manifest_to_file(&manifest, &temp_path)
+            .context("turbolite materialize external base for checksum failed")?;
+        let checksum = walrust::ltx::compute_checksum_from_file(&temp_path)
             .map_err(|e| anyhow!("walrust external base checksum failed: {}", e))?;
+        let _ = std::fs::remove_file(&temp_path);
         Ok(walrust::ExternalBaseCursor {
             seq: manifest.change_counter,
             checksum,
@@ -740,5 +753,71 @@ impl Replicator for TurboliteWalReplicator {
             self.publish_current_manifest(name, None).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use hadb_storage::CasResult;
+    use std::sync::Mutex;
+    use turbodb::{Manifest, ManifestMeta};
+
+    #[derive(Default)]
+    struct SameWriterCreateConflictStore {
+        current: Mutex<Option<Manifest>>,
+    }
+
+    #[async_trait]
+    impl ManifestStore for SameWriterCreateConflictStore {
+        async fn get(&self, _key: &str) -> Result<Option<Manifest>> {
+            Ok(self.current.lock().expect("lock").clone())
+        }
+
+        async fn put(
+            &self,
+            _key: &str,
+            manifest: &Manifest,
+            expected_version: Option<u64>,
+        ) -> Result<CasResult> {
+            let mut current = self.current.lock().expect("lock");
+            if expected_version.is_none() && current.is_some() {
+                return Ok(CasResult {
+                    success: false,
+                    etag: None,
+                });
+            }
+
+            let mut stored = manifest.clone();
+            stored.version = expected_version.unwrap_or(0) + 1;
+            *current = Some(stored);
+            Ok(CasResult {
+                success: true,
+                etag: None,
+            })
+        }
+
+        async fn meta(&self, _key: &str) -> Result<Option<ManifestMeta>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_manifest_returns_authoritative_same_writer_payload_on_create_conflict() {
+        let store = Arc::new(SameWriterCreateConflictStore::default());
+        let existing = manifest_envelope("writer-a", b"already-published".to_vec());
+        *store.current.lock().expect("lock") = Some(existing);
+
+        let actual = publish_manifest(
+            &(store as Arc<dyn ManifestStore>),
+            "db/_manifest",
+            "writer-a",
+            b"candidate".to_vec(),
+        )
+        .await
+        .expect("same-writer conflict should be accepted");
+
+        assert_eq!(actual, b"already-published");
     }
 }
