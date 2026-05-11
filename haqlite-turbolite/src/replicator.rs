@@ -39,17 +39,35 @@ fn manifest_key(prefix: &str, db_name: &str) -> String {
 ///
 /// Public so callers and tests can exercise the seed step directly.
 pub fn seed_local_sqlite_for_import(path: &Path) -> std::io::Result<()> {
-    if path.exists() {
+    if existing_file_is_sqlite(path)? {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let conn = rusqlite::Connection::open(path).map_err(io_err)?;
+    let temp_path = path.with_extension(format!("seed-{}.tmp", uuid::Uuid::new_v4()));
+    let conn = rusqlite::Connection::open(&temp_path).map_err(io_err)?;
     conn.execute_batch("PRAGMA user_version = 1; PRAGMA user_version = 0;")
         .map_err(io_err)?;
     drop(conn);
+    std::fs::rename(temp_path, path)?;
     Ok(())
+}
+
+fn existing_file_is_sqlite(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let mut header = [0u8; 16];
+    match file.read_exact(&mut header) {
+        Ok(()) => Ok(&header == b"SQLite format 3\0"),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
@@ -141,6 +159,39 @@ mod seed_tests {
             len_before, len_after,
             "seed must not truncate or rewrite an existing file"
         );
+    }
+
+    /// The file-first VFS may create a zero-byte primary artifact
+    /// before fresh bootstrap gets to import it. That stub is not a
+    /// database and must be repaired, or import_sqlite_file dies while
+    /// reading the SQLite header.
+    #[test]
+    fn seed_repairs_empty_stub() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = tmp.path().join("seed.db");
+        std::fs::write(&path, []).expect("empty stub");
+
+        seed_local_sqlite_for_import(&path).expect("seed repairs stub");
+
+        let mut header = [0u8; 16];
+        {
+            use std::io::Read;
+            let mut f = std::fs::File::open(&path).expect("open");
+            f.read_exact(&mut header).expect("read sqlite magic");
+        }
+        assert_eq!(&header, b"SQLite format 3\0");
+    }
+
+    #[test]
+    fn seed_repairs_non_sqlite_stub() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = tmp.path().join("seed.db");
+        std::fs::write(&path, b"not sqlite").expect("stub");
+
+        seed_local_sqlite_for_import(&path).expect("seed repairs stub");
+
+        let conn = rusqlite::Connection::open(&path).expect("reopen repaired db");
+        conn.query_row("SELECT 1", [], |_| Ok(())).expect("query");
     }
 
     /// The seeded file must round-trip through `import_sqlite_file`
@@ -381,7 +432,7 @@ impl TurboliteWalReplicator {
     async fn publish_current_manifest(
         &self,
         name: &str,
-        _covered_wal_seq: Option<u64>,
+        covered_wal_seq: Option<u64>,
     ) -> Result<()> {
         if !should_publish_manifest(&self.vfs) {
             return Err(anyhow!(
@@ -468,11 +519,24 @@ impl TurboliteWalReplicator {
         .await
         .map_err(|e| anyhow!("turbolite published-base checksum task panicked: {}", e))??;
 
+        let published_base = walrust::ExternalBaseCursor {
+            seq: published_base_seq,
+            checksum: published_base_checksum,
+        };
+
         if let Ok(mut guard) = self.last_published_base_cursor.lock() {
-            *guard = Some(walrust::ExternalBaseCursor {
-                seq: published_base_seq,
-                checksum: published_base_checksum,
-            });
+            *guard = Some(published_base);
+        }
+
+        if covered_wal_seq
+            .map(|seq| published_base.seq >= seq)
+            .unwrap_or(false)
+        {
+            self.walrust
+                .inner()
+                .adopt_external_base_cursor(name, published_base)
+                .await
+                .map_err(|e| anyhow!("walrust adopt external base cursor failed: {e}"))?;
         }
 
         if used_pending_replay_base {
@@ -482,6 +546,33 @@ impl TurboliteWalReplicator {
         }
 
         Ok(())
+    }
+
+    async fn publish_current_manifest_if_base_advanced(
+        &self,
+        name: &str,
+        covered_wal_seq: Option<u64>,
+    ) -> Result<()> {
+        let Some(covered_wal_seq) = covered_wal_seq else {
+            return Ok(());
+        };
+
+        let manifest = self.vfs.manifest();
+        let last_published_seq = self
+            .last_published_base_cursor
+            .lock()
+            .ok()
+            .and_then(|guard| guard.map(|cursor| cursor.seq))
+            .unwrap_or(0);
+
+        if manifest.change_counter <= last_published_seq
+            || manifest.change_counter < covered_wal_seq
+        {
+            return Ok(());
+        }
+
+        self.publish_current_manifest(name, Some(covered_wal_seq))
+            .await
     }
 
     async fn ensure_base_manifest(&self, name: &str, path: &Path) -> Result<()> {
@@ -742,6 +833,7 @@ impl Replicator for TurboliteWalReplicator {
 
     async fn sync(&self, name: &str) -> Result<()> {
         let frames = self.walrust.inner().flush(name).await?;
+        let covered_wal_seq = self.walrust.inner().current_seq(name).await;
         if frames > 0 {
             tracing::info!(
                 "TurboliteWalReplicator::sync('{}') flushed {} frames",
@@ -749,8 +841,12 @@ impl Replicator for TurboliteWalReplicator {
                 frames,
             );
         }
+        if frames > 0 {
+            self.publish_current_manifest_if_base_advanced(name, covered_wal_seq)
+                .await?;
+        }
         if self.replay_base_pending_publish.load(Ordering::Acquire) {
-            self.publish_current_manifest(name, None).await?;
+            self.publish_current_manifest(name, covered_wal_seq).await?;
         }
         Ok(())
     }

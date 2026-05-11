@@ -1037,17 +1037,21 @@ impl Builder {
                 .map_err(|e| anyhow::anyhow!("haqlite-turbolite sync/publish failed: {e}"))
             }));
 
-        let schema_for_leader_setup = schema.to_string();
-        let opener_for_leader_setup = connection_opener.clone();
-        config.before_leader_add = Some(Arc::new(move || {
-            let conn = opener_for_leader_setup()
-                .map_err(|e| anyhow::anyhow!("turbolite leader setup open failed: {e}"))?;
-            if !schema_for_leader_setup.trim().is_empty() {
-                conn.execute_batch(&schema_for_leader_setup)
-                    .map_err(|e| anyhow::anyhow!("turbolite leader setup schema failed: {e}"))?;
-            }
-            Ok(())
-        }));
+        let schema_already_applied_after_join = !is_continuous;
+        if schema_already_applied_after_join {
+            let schema_for_leader_setup = schema.to_string();
+            let opener_for_leader_setup = connection_opener.clone();
+            config.before_leader_add = Some(Arc::new(move || {
+                let conn = opener_for_leader_setup()
+                    .map_err(|e| anyhow::anyhow!("turbolite leader setup open failed: {e}"))?;
+                if !schema_for_leader_setup.trim().is_empty() {
+                    conn.execute_batch(&schema_for_leader_setup).map_err(|e| {
+                        anyhow::anyhow!("turbolite leader setup schema failed: {e}")
+                    })?;
+                }
+                Ok(())
+            }));
+        }
 
         let authorizer = if is_continuous {
             Some(continuous_authorizer(self.inner.get_authorizer().cloned()))
@@ -1078,7 +1082,7 @@ impl Builder {
             Some(connection_opener),
             Some(follower_read_connection_opener),
             on_flush,
-            true,
+            schema_already_applied_after_join,
         )
         .await
         .map_err(|e| e.into())
