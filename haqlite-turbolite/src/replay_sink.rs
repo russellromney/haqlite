@@ -92,7 +92,7 @@ pub(crate) async fn prepare_page_replay(
         },
         None => None,
     };
-    let base_file_checksum_required = expected_prev_checksum.is_none();
+    let mut base_file_checksum_required = expected_prev_checksum.is_none();
     let mut target_page_count = None;
     for file in files {
         let data = storage
@@ -120,12 +120,16 @@ pub(crate) async fn prepare_page_replay(
         }
         if let Some(expected_prev) = expected_prev_checksum {
             if changeset.header.prev_checksum != expected_prev {
-                return Err(anyhow!(
-                    "changeset checksum chain break at {}: expected prev {:016x}, found {:016x}",
-                    file.key,
-                    expected_prev,
-                    changeset.header.prev_checksum
-                ));
+                if file.seq == current_seq + 1 {
+                    base_file_checksum_required = true;
+                } else {
+                    return Err(anyhow!(
+                        "changeset checksum chain break at {}: expected prev {:016x}, found {:016x}",
+                        file.key,
+                        expected_prev,
+                        changeset.header.prev_checksum
+                    ));
+                }
             }
         }
         for page in &changeset.pages {
@@ -486,17 +490,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_page_replay_rejects_previous_changeset_chain_break() {
+    async fn prepare_page_replay_falls_back_to_base_checksum_when_previous_checksum_misses() {
         let storage = MemoryStorage::default();
         let c3 = changeset(3, 0xAA55, 1, 0x33);
-        let c4 = changeset(4, c3.checksum.wrapping_add(1), 2, 0x44);
+        let base_checksum = 0xBB66;
+        let c4 = changeset(4, base_checksum, 2, 0x44);
         put_changeset(&storage, 3, &c3);
         put_changeset(&storage, 4, &c4);
 
-        let err = prepare_page_replay(&storage, "prefix/", "db", 3)
+        let prepared = prepare_page_replay(&storage, "prefix/", "db", 3)
             .await
-            .expect_err("wrong-chain seq 4 must fail closed");
+            .expect("first post-base delta may chain from the materialized base");
 
-        assert!(err.to_string().contains("changeset checksum chain break"));
+        prepared
+            .validate_base_checksum(base_checksum)
+            .expect("matching materialized base checksum validates");
+        let err = prepared
+            .validate_base_checksum(base_checksum.wrapping_add(1))
+            .expect_err("wrong materialized base checksum still fails closed");
+        assert!(err
+            .to_string()
+            .contains("first changeset checksum chain break"));
     }
 }
