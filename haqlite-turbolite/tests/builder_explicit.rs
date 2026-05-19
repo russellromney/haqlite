@@ -108,6 +108,56 @@ async fn turbolite_local_paths_make_db_path_primary_artifact() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn database_name_controls_remote_wal_lane_not_local_file_stem() {
+    unset_env();
+    let tmp = TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("customer-file.db");
+    let page_storage = Arc::new(InMemoryStorage::new());
+    let walrust_storage = Arc::new(InMemoryStorage::new());
+    let manifest_store = Arc::new(MemManifestStore::new());
+
+    let mut db = Builder::new()
+        .prefix("tenant/")
+        .database_name("control-plane-db")
+        .mode(HaMode::SingleWriter)
+        .role(Role::Leader)
+        .lease_store(Arc::new(InMemoryLeaseStore::new()))
+        .manifest_store(manifest_store)
+        .turbolite_storage(page_storage)
+        .walrust_storage(walrust_storage.clone())
+        .instance_id("customer-compute")
+        .disable_forwarding()
+        .open(
+            db_path.to_str().expect("path"),
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, body TEXT)",
+        )
+        .await
+        .expect("open with logical database name");
+
+    db.execute(
+        "INSERT INTO t (id, body) VALUES (1, 'local file stem ignored')",
+        &[],
+    )
+    .expect("insert");
+    db.flush_turbolite().expect("flush");
+
+    let keys = walrust_storage.keys().await;
+    assert!(
+        keys.iter()
+            .any(|key| key.starts_with("tenant/control-plane-db/0000/")),
+        "WAL changesets should use the logical database identity; keys={keys:?}"
+    );
+    assert!(
+        !keys
+            .iter()
+            .any(|key| key.starts_with("tenant/customer-file/0000/")),
+        "local filename must not become the remote WAL lane; keys={keys:?}"
+    );
+
+    db.close().await.expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn default_turbolite_layout_is_file_first() {
     unset_env();
     let tmp = TempDir::new().expect("temp dir");

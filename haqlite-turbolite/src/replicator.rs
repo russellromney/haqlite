@@ -548,33 +548,6 @@ impl TurboliteWalReplicator {
         Ok(())
     }
 
-    async fn publish_current_manifest_if_base_advanced(
-        &self,
-        name: &str,
-        covered_wal_seq: Option<u64>,
-    ) -> Result<()> {
-        let Some(covered_wal_seq) = covered_wal_seq else {
-            return Ok(());
-        };
-
-        let manifest = self.vfs.manifest();
-        let last_published_seq = self
-            .last_published_base_cursor
-            .lock()
-            .ok()
-            .and_then(|guard| guard.map(|cursor| cursor.seq))
-            .unwrap_or(0);
-
-        if manifest.change_counter <= last_published_seq
-            || manifest.change_counter < covered_wal_seq
-        {
-            return Ok(());
-        }
-
-        self.publish_current_manifest(name, Some(covered_wal_seq))
-            .await
-    }
-
     async fn ensure_base_manifest(&self, name: &str, path: &Path) -> Result<()> {
         if let Some(manifest) = self.manifest_store.get(&self.manifest_key).await? {
             turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&manifest.payload)
@@ -789,6 +762,9 @@ impl Replicator for TurboliteWalReplicator {
             *guard = Some(wal_path.clone());
         }
         self.ensure_base_manifest(name, path).await?;
+        if self.replay_base_pending_publish.load(Ordering::Acquire) {
+            self.publish_current_manifest(name, None).await?;
+        }
         let base = self.external_base_cursor(&cache_path)?;
         self.add_external_base_with_retry(name, &cache_path, &wal_path, base)
             .await
@@ -827,7 +803,9 @@ impl Replicator for TurboliteWalReplicator {
             );
         }
         let covered_wal_seq = self.walrust.inner().current_seq(name).await;
-        self.publish_current_manifest(name, covered_wal_seq).await?;
+        if self.replay_base_pending_publish.load(Ordering::Acquire) {
+            self.publish_current_manifest(name, covered_wal_seq).await?;
+        }
         self.walrust.remove(name).await
     }
 
@@ -840,10 +818,6 @@ impl Replicator for TurboliteWalReplicator {
                 name,
                 frames,
             );
-        }
-        if frames > 0 {
-            self.publish_current_manifest_if_base_advanced(name, covered_wal_seq)
-                .await?;
         }
         if self.replay_base_pending_publish.load(Ordering::Acquire) {
             self.publish_current_manifest(name, covered_wal_seq).await?;

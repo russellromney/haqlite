@@ -238,6 +238,7 @@ pub struct Builder {
     turbolite_vfs: Option<(SharedTurboliteVfs, String)>,
     turbolite_cache_dir: Option<std::path::PathBuf>,
     turbolite_data_path: Option<std::path::PathBuf>,
+    database_name: Option<String>,
     manifest_store: Option<Arc<dyn ManifestStore>>,
     /// Optional replicator override. When `None`, the open path picks a
     /// default based on `turbolite_durability`: walrust-backed
@@ -270,6 +271,7 @@ impl Builder {
             turbolite_vfs: None,
             turbolite_cache_dir: None,
             turbolite_data_path: None,
+            database_name: None,
             manifest_store: None,
             replicator: None,
             rollback_database_id: None,
@@ -291,6 +293,14 @@ impl Builder {
 
     pub fn instance_id(mut self, id: &str) -> Self {
         self.inner = self.inner.instance_id(id);
+        self
+    }
+
+    /// Set the logical replicated database name independently from the local
+    /// SQLite path. This keeps customer-compute files like `app.db` from
+    /// becoming part of the remote WAL/manifest identity.
+    pub fn database_name(mut self, name: &str) -> Self {
+        self.database_name = Some(name.to_string());
         self
     }
 
@@ -613,11 +623,13 @@ impl Builder {
 
     async fn open_writer(self, db_path: &str, schema: &str) -> Result<HaQLite> {
         let db_path = std::path::PathBuf::from(db_path);
-        let db_name = db_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("db")
-            .to_string();
+        let db_name = self.database_name.clone().unwrap_or_else(|| {
+            db_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("db")
+                .to_string()
+        });
         let derived_cache_dir = || {
             let file_name = db_path
                 .file_name()
@@ -1019,7 +1031,6 @@ impl Builder {
         });
 
         let db_name_for_flush = db_name.clone();
-        let flush_runtime = tokio::runtime::Handle::current();
         let flush_mutex = Arc::new(Mutex::new(()));
         let on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>> =
             Some(Arc::new(move || {
@@ -1028,9 +1039,14 @@ impl Builder {
                 })?;
                 let replicator = replicator_for_flush.clone();
                 let db_name = db_name_for_flush.clone();
-                let handle = flush_runtime.clone();
                 std::thread::spawn(move || {
-                    handle.block_on(async move { replicator.sync(&db_name).await })
+                    let runtime = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .thread_name("haqlite-turbolite-flush")
+                        .enable_all()
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("build sync/publish runtime: {e}"))?;
+                    runtime.block_on(async move { replicator.sync(&db_name).await })
                 })
                 .join()
                 .map_err(|_| anyhow::anyhow!("haqlite-turbolite sync/publish thread panicked"))?

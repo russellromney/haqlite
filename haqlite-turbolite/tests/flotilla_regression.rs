@@ -19,6 +19,7 @@ use hadb::InMemoryLeaseStore;
 use hadb_storage::{CasResult, StorageBackend};
 use haqlite::{HaQLite, SqlValue};
 use haqlite_turbolite::{Builder, HaMode};
+use turbodb::ManifestStore;
 use turbodb_manifest_mem::MemManifestStore;
 use turbolite::tiered::{
     CacheConfig, CompressionConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs,
@@ -113,6 +114,35 @@ async fn build_turbolite_dedicated_with_walrust_storage(
         .manifest_store(manifest_store)
         .walrust_storage(walrust_storage)
         .turbolite_vfs(shared_vfs, vfs_name)
+        .instance_id(instance_id)
+        .manifest_poll_interval(Duration::from_millis(50))
+        .open(db_path.to_str().expect("valid path"), SCHEMA)
+        .await
+        .expect("open turbolite singlewriter")
+}
+
+async fn build_turbolite_dedicated_with_page_and_walrust_storage(
+    cache_dir: &std::path::Path,
+    db_name: &str,
+    durability: turbodb::Durability,
+    lease_store: Arc<InMemoryLeaseStore>,
+    manifest_store: Arc<MemManifestStore>,
+    instance_id: &str,
+    page_storage: Arc<dyn StorageBackend>,
+    walrust_storage: Arc<dyn StorageBackend>,
+) -> HaQLite {
+    let db_path = cache_dir.join(format!("{}.db", db_name));
+    let sidecar_dir = cache_dir.join(format!("{}.db-turbolite", db_name));
+    Builder::new()
+        .prefix("test/")
+        .database_name(db_name)
+        .mode(HaMode::SingleWriter)
+        .durability(durability)
+        .lease_store(lease_store)
+        .manifest_store(manifest_store)
+        .turbolite_storage(page_storage)
+        .walrust_storage(walrust_storage)
+        .turbolite_local_paths(&sidecar_dir, &db_path)
         .instance_id(instance_id)
         .manifest_poll_interval(Duration::from_millis(50))
         .open(db_path.to_str().expect("valid path"), SCHEMA)
@@ -265,16 +295,18 @@ async fn close_reopen_continuous_survives() {
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(InMemoryLeaseStore::new());
     let manifest = Arc::new(MemManifestStore::new());
-    let vfs = format!("flotilla_cont_{}", std::process::id());
+    let page_storage: Arc<dyn StorageBackend> = Arc::new(common::InMemoryStorage::new());
+    let walrust_storage: Arc<dyn StorageBackend> = Arc::new(common::InMemoryStorage::new());
 
-    let mut db = build_turbolite_dedicated(
-        tmp.path(),
+    let mut db = build_turbolite_dedicated_with_page_and_walrust_storage(
+        &tmp.path().join("node1"),
         "cont",
         turbodb::Durability::default(),
         lease.clone(),
         manifest.clone(),
         "node-1",
-        &vfs,
+        page_storage.clone(),
+        walrust_storage.clone(),
     )
     .await;
 
@@ -333,14 +365,15 @@ async fn close_reopen_continuous_survives() {
     }
     db.close().await.unwrap();
 
-    let mut db2 = build_turbolite_dedicated(
-        tmp.path(),
+    let mut db2 = build_turbolite_dedicated_with_page_and_walrust_storage(
+        &tmp.path().join("node2"),
         "cont",
         turbodb::Durability::default(),
         lease,
         manifest,
         "node-1",
-        &vfs,
+        page_storage,
+        walrust_storage,
     )
     .await;
     let val: String = db2
@@ -413,18 +446,18 @@ async fn continuous_close_can_retry_after_failed_final_sync() {
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(InMemoryLeaseStore::new());
     let manifest = Arc::new(MemManifestStore::new());
-    let vfs = format!("flotilla_close_retry_{}", uuid::Uuid::new_v4());
+    let page_storage: Arc<dyn StorageBackend> = Arc::new(common::InMemoryStorage::new());
     let storage = Arc::new(ToggleFailStorage::new());
     let walrust_storage: Arc<dyn StorageBackend> = storage.clone();
 
-    let mut db = build_turbolite_dedicated_with_walrust_storage(
-        tmp.path(),
+    let mut db = build_turbolite_dedicated_with_page_and_walrust_storage(
+        &tmp.path().join("node1"),
         "close-retry",
         turbodb::Durability::default(),
         lease.clone(),
         manifest.clone(),
         "node-1",
-        &vfs,
+        page_storage.clone(),
         walrust_storage,
     )
     .await;
@@ -463,14 +496,15 @@ async fn continuous_close_can_retry_after_failed_final_sync() {
         .await
         .expect("close retries final sync and then releases");
 
-    let mut db2 = build_turbolite_dedicated(
-        tmp.path(),
+    let mut db2 = build_turbolite_dedicated_with_page_and_walrust_storage(
+        &tmp.path().join("node2"),
         "close-retry",
         turbodb::Durability::default(),
         lease,
         manifest,
         "node-1",
-        &vfs,
+        page_storage,
+        storage,
     )
     .await;
     let rows = db2
@@ -501,44 +535,25 @@ async fn assert_repeated_continuous_open_close_fd_bounds(cycles: i64) {
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(InMemoryLeaseStore::new());
     let manifest = Arc::new(MemManifestStore::new());
+    let page_storage: Arc<dyn hadb_storage::StorageBackend> =
+        Arc::new(common::InMemoryStorage::new());
     let walrust_storage: Arc<dyn hadb_storage::StorageBackend> =
         Arc::new(common::InMemoryStorage::new());
-
-    let config = TurboliteConfig {
-        cache_dir: tmp.path().join("cache"),
-        compression: CompressionConfig {
-            level: 1,
-            ..Default::default()
-        },
-        cache: CacheConfig {
-            pages_per_group: 4,
-            sub_pages_per_frame: 2,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let shared_vfs = SharedTurboliteVfs::new(TurboliteVfs::new_local(config).expect("vfs"));
-    let vfs_name = format!("flotilla_fd_audit_{}_{}", cycles, uuid::Uuid::new_v4());
-    turbolite::tiered::register_shared(&vfs_name, shared_vfs.clone()).expect("register VFS");
-
-    let db_path = tmp.path().join("fd-audit.db");
     let baseline = open_fd_count();
     let mut peak = baseline;
 
     for i in 0..cycles {
-        let mut db = Builder::new()
-            .prefix("test/")
-            .mode(HaMode::SingleWriter)
-            .durability(turbodb::Durability::default())
-            .lease_store(lease.clone())
-            .manifest_store(manifest.clone())
-            .walrust_storage(walrust_storage.clone())
-            .turbolite_vfs(shared_vfs.clone(), &vfs_name)
-            .instance_id("fd-audit-node")
-            .manifest_poll_interval(Duration::from_millis(50))
-            .open(db_path.to_str().expect("path"), SCHEMA)
-            .await
-            .expect("open continuous db");
+        let mut db = build_turbolite_dedicated_with_page_and_walrust_storage(
+            &tmp.path().join(format!("cycle-{i}")),
+            "fd-audit",
+            turbodb::Durability::default(),
+            lease.clone(),
+            manifest.clone(),
+            "fd-audit-node",
+            page_storage.clone(),
+            walrust_storage.clone(),
+        )
+        .await;
 
         db.execute_async(
             "INSERT OR REPLACE INTO t (id, val) VALUES (?1, ?2)",
@@ -828,6 +843,136 @@ async fn continuous_write_latency_is_fast() {
         elapsed,
         threshold
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continuous_sync_does_not_publish_wal_writes_as_page_base() {
+    let tmp = TempDir::new().unwrap();
+    let lease = Arc::new(InMemoryLeaseStore::new());
+    let manifest = Arc::new(MemManifestStore::new());
+    let vfs = format!("flotilla_cont_manifest_{}", std::process::id());
+
+    let mut db = build_turbolite_dedicated(
+        tmp.path(),
+        "cont_manifest",
+        turbodb::Durability::default(),
+        lease,
+        manifest.clone(),
+        "node-1",
+        &vfs,
+    )
+    .await;
+
+    let manifest_key = "test/cont_manifest/_manifest";
+    let before = manifest
+        .get(manifest_key)
+        .await
+        .expect("manifest get before")
+        .expect("bootstrap manifest exists")
+        .payload;
+    let before_decoded =
+        TurboliteVfs::decode_manifest_bytes(&before).expect("decode bootstrap manifest");
+
+    db.execute_async("INSERT INTO t (id, val) VALUES (1, 'wal-only')", &[])
+        .await
+        .expect("insert wal-only row");
+    db.flush_turbolite().expect("flush wal-only row");
+
+    let after = manifest
+        .get(manifest_key)
+        .await
+        .expect("manifest get after")
+        .expect("manifest still exists")
+        .payload;
+    let after_decoded = TurboliteVfs::decode_manifest_bytes(&after).expect("decode after manifest");
+
+    assert_eq!(
+        after_decoded.version, before_decoded.version,
+        "ordinary continuous WAL sync must not publish a new page base"
+    );
+    assert_eq!(
+        after_decoded.change_counter, before_decoded.change_counter,
+        "ordinary continuous WAL sync must not advance the base replay cursor"
+    );
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continuous_leader_publishes_replayed_base_before_new_writes() {
+    let tmp = TempDir::new().unwrap();
+    let lease = Arc::new(InMemoryLeaseStore::new());
+    let manifest = Arc::new(MemManifestStore::new());
+    let page_storage: Arc<dyn StorageBackend> = Arc::new(common::InMemoryStorage::new());
+    let walrust_storage: Arc<dyn StorageBackend> = Arc::new(common::InMemoryStorage::new());
+
+    let mut db1 = build_turbolite_dedicated_with_page_and_walrust_storage(
+        &tmp.path().join("node1"),
+        "cont_replay_then_write",
+        turbodb::Durability::default(),
+        lease.clone(),
+        manifest.clone(),
+        "node-1",
+        page_storage.clone(),
+        walrust_storage.clone(),
+    )
+    .await;
+    db1.execute_async("INSERT INTO t (id, val) VALUES (1, 'node-1')", &[])
+        .await
+        .expect("node1 insert");
+    db1.flush_turbolite().expect("node1 flush");
+    db1.close().await.expect("node1 close");
+
+    let mut db2 = build_turbolite_dedicated_with_page_and_walrust_storage(
+        &tmp.path().join("node2"),
+        "cont_replay_then_write",
+        turbodb::Durability::default(),
+        lease.clone(),
+        manifest.clone(),
+        "node-2",
+        page_storage.clone(),
+        walrust_storage.clone(),
+    )
+    .await;
+    assert_eq!(
+        db2.query_row("SELECT val FROM t WHERE id = 1", &[], |r| {
+            r.get::<_, String>(0)
+        })
+        .expect("node2 query row1"),
+        "node-1".to_string()
+    );
+    db2.execute_async("INSERT INTO t (id, val) VALUES (2, 'node-2')", &[])
+        .await
+        .expect("node2 insert");
+    db2.flush_turbolite().expect("node2 flush");
+    db2.close().await.expect("node2 close");
+
+    let mut db3 = build_turbolite_dedicated_with_page_and_walrust_storage(
+        &tmp.path().join("node3"),
+        "cont_replay_then_write",
+        turbodb::Durability::default(),
+        lease,
+        manifest,
+        "node-3",
+        page_storage,
+        walrust_storage,
+    )
+    .await;
+    assert_eq!(
+        db3.query_row("SELECT val FROM t WHERE id = 1", &[], |r| {
+            r.get::<_, String>(0)
+        })
+        .expect("node3 query row1"),
+        "node-1".to_string()
+    );
+    assert_eq!(
+        db3.query_row("SELECT val FROM t WHERE id = 2", &[], |r| {
+            r.get::<_, String>(0)
+        })
+        .expect("node3 query row2"),
+        "node-2".to_string()
+    );
+    db3.close().await.expect("node3 close");
 }
 
 // ============================================================================
