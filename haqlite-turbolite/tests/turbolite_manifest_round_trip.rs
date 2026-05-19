@@ -1,11 +1,17 @@
 //! Phase Turbogenesis-b regression guard: turbolite manifest bytes
-//! round-trip preserves `epoch` and `change_counter`.
+//! round-trip preserves `discontinuity_stamp` (formerly `epoch`),
+//! `change_counter`, and the phase-004 `cursor` / `writer_id` fields.
 //!
 //! Pre-Turbogenesis-b, haqlite's converter layer from turbolite's
 //! `Manifest` → hadb's `Backend::Turbolite` silently dropped the
 //! `epoch` and `change_counter` fields (they had no home on the
 //! Backend variant). This test drives the full payload path and
 //! asserts those fields survive.
+//!
+//! Phase 004 renamed `epoch` to `discontinuity_stamp` to disambiguate
+//! from the new lease-epoch on [`turbolite::tiered::ReplayCursor`].
+//! Same semantic (out-of-band fork/rollback stamp), same positional
+//! slot in the wire envelope.
 //!
 //! Spun out of the deleted `turbolite_shared.rs` (Phase Košice). All
 //! the SharedWriter-dependent tests in that file targeted
@@ -18,7 +24,8 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 use turbolite::tiered::{
-    CacheConfig, GroupingStrategy, Manifest as TlManifest, TurboliteConfig, TurboliteVfs,
+    CacheConfig, GroupingStrategy, Manifest as TlManifest, ReplayCursor, TurboliteConfig,
+    TurboliteVfs,
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -62,7 +69,13 @@ async fn turbolite_manifest_bytes_round_trip_preserves_epoch_and_change_counter(
         tree_name_to_groups: HashMap::new(),
         group_to_tree_name: HashMap::new(),
         db_header: None,
-        epoch: 9,
+        discontinuity_stamp: 9,
+        cursor: ReplayCursor {
+            last_applied_seq: 17,
+            base_object_checksum: vec![0xAA; 32],
+            epoch: 3,
+        },
+        writer_id: "leader-A".into(),
     };
     seed.detect_and_normalize_strategy();
     vfs.set_manifest(seed);
@@ -88,9 +101,30 @@ async fn turbolite_manifest_bytes_round_trip_preserves_epoch_and_change_counter(
         .set_manifest_bytes(&bytes)
         .expect("set_manifest_bytes");
     let got = vfs_b.manifest();
-    assert_eq!(got.epoch, 9, "epoch must survive manifest round-trip");
+    assert_eq!(
+        got.discontinuity_stamp, 9,
+        "discontinuity_stamp must survive manifest round-trip"
+    );
     assert_eq!(
         got.change_counter, 4242,
         "change_counter must survive manifest round-trip"
+    );
+    // Phase 004: the new substrate fields round-trip too.
+    assert_eq!(
+        got.cursor.last_applied_seq, 17,
+        "cursor.last_applied_seq must survive manifest round-trip"
+    );
+    assert_eq!(
+        got.cursor.base_object_checksum,
+        vec![0xAA; 32],
+        "cursor.base_object_checksum must survive manifest round-trip"
+    );
+    assert_eq!(
+        got.cursor.epoch, 3,
+        "cursor.epoch (lease epoch) must survive manifest round-trip"
+    );
+    assert_eq!(
+        got.writer_id, "leader-A",
+        "writer_id must survive manifest round-trip"
     );
 }

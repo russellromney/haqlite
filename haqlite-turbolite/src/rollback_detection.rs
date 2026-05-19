@@ -150,7 +150,11 @@ impl RollbackDetector {
 fn decode_manifest_epoch(bytes: &[u8]) -> Result<u64> {
     let manifest: turbolite::tiered::Manifest =
         rmp_serde::from_slice(bytes).context("deserialize turbolite manifest")?;
-    Ok(manifest.epoch)
+    // Renamed from `epoch` to `discontinuity_stamp` in turbolite phase
+    // 004 to disambiguate from the new lease-epoch on ReplayCursor.
+    // Same field semantically (out-of-band fork/rollback stamp) and
+    // same positional slot in msgpack, so existing bytes still decode.
+    Ok(manifest.discontinuity_stamp)
 }
 
 fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
