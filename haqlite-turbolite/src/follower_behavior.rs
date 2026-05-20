@@ -32,6 +32,10 @@ pub struct TurboliteFollowerBehavior {
     wakeup: Option<Arc<tokio::sync::Notify>>,
     replay_base_pending_publish: Option<Arc<AtomicBool>>,
     replay_base_seq: Option<Arc<AtomicU64>>,
+    /// Phase 004 leadership-term epoch, shared with the replicator.
+    /// Reset to 0 on promotion so the replicator re-latches the new
+    /// term's lease revision from the fence on its next publish.
+    term_epoch: Option<Arc<AtomicU64>>,
 }
 
 impl TurboliteFollowerBehavior {
@@ -45,6 +49,7 @@ impl TurboliteFollowerBehavior {
             wakeup: None,
             replay_base_pending_publish: None,
             replay_base_seq: None,
+            term_epoch: None,
         }
     }
 
@@ -80,6 +85,13 @@ impl TurboliteFollowerBehavior {
     ) -> Self {
         self.replay_base_pending_publish = Some(pending_publish);
         self.replay_base_seq = Some(replay_seq);
+        self
+    }
+
+    /// Share the phase-004 term-epoch cell with the replicator. Reset
+    /// to 0 on promotion so the replicator re-latches the new term.
+    pub fn with_term_epoch(mut self, term_epoch: Arc<AtomicU64>) -> Self {
+        self.term_epoch = Some(term_epoch);
         self
     }
 
@@ -568,6 +580,13 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
         db_path: &PathBuf,
         position: u64,
     ) -> Result<()> {
+        // Phase 004: a new leadership term begins. Reset the shared
+        // term epoch so the replicator re-latches the new (higher)
+        // lease revision from the fence on its next publish — fencing
+        // a base published at the prior epoch.
+        if let Some(te) = &self.term_epoch {
+            te.store(0, Ordering::Release);
+        }
         if self.manifest_store.is_some() {
             match self.poll_manifest_store(db_name, db_path, position).await? {
                 Some(ApplyOutcome::TransientRetry(msg)) => {

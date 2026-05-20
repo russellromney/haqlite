@@ -829,6 +829,11 @@ impl Builder {
 
         let replay_base_pending_publish = Arc::new(AtomicBool::new(false));
         let replay_base_seq = Arc::new(AtomicU64::new(0));
+        // Phase 004 leadership-term epoch, shared between the replicator
+        // (writer, latches it from the fence + publishes phase-4 bases)
+        // and the follower behavior (resets it to 0 on promotion so the
+        // replicator re-latches the new term's revision). Starts unset.
+        let term_epoch = Arc::new(AtomicU64::new(0));
 
         // Pick replicator. Three sources, in priority order:
         // 1. Caller-supplied via `.replicator(...)` (test harnesses, alt WAL shippers).
@@ -875,7 +880,7 @@ impl Builder {
                                 shared_vfs.clone(),
                             )),
                         )?);
-                    Arc::new(crate::TurboliteWalReplicator::new(
+                    let mut wal_replicator = crate::TurboliteWalReplicator::new(
                         shared_vfs.clone(),
                         manifest_store.clone(),
                         self.inner.get_prefix(),
@@ -889,7 +894,16 @@ impl Builder {
                         delta_replicator,
                         replay_base_pending_publish.clone(),
                         replay_base_seq.clone(),
-                    ))
+                    )
+                    .with_term_epoch(term_epoch.clone());
+                    // Wire the lease fence when available (production
+                    // turbolite_http path) to activate phase-4 fenced
+                    // delta shipping. Without it the replicator stays on
+                    // the phase-3 path (term_epoch never latches).
+                    if let Some((fence, _)) = &shared_fence {
+                        wal_replicator = wal_replicator.with_fence(fence.clone());
+                    }
+                    Arc::new(wal_replicator)
                 }
             }
         };
@@ -922,7 +936,8 @@ impl Builder {
                         .with_replay_base_tracking(
                             replay_base_pending_publish.clone(),
                             replay_base_seq.clone(),
-                        );
+                        )
+                        .with_term_epoch(term_epoch.clone());
                 }
             }
             Arc::new(behavior)

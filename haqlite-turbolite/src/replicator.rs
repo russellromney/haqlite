@@ -11,8 +11,10 @@ use hadb_storage::StorageBackend;
 use turbodb::ManifestStore;
 use turbolite::tiered::SharedTurboliteVfs;
 
+use crate::phase4_chain::FollowerCursor;
 use crate::replay_sink::{
-    apply_prepared_page_replay, prepare_page_replay, HaqliteTurboliteReplaySink,
+    apply_prepared_page_replay, prepare_page_replay, prepare_phase4_replay,
+    HaqliteTurboliteReplaySink,
 };
 
 fn manifest_key(prefix: &str, db_name: &str) -> String {
@@ -219,14 +221,13 @@ fn should_publish_manifest(vfs: &SharedTurboliteVfs) -> bool {
     manifest.version > 0 || manifest.page_count > 0 || !manifest.page_group_keys.is_empty()
 }
 
-fn manifest_envelope(writer_id: &str, payload: Vec<u8>) -> turbodb::Manifest {
+fn manifest_envelope(writer_id: &str, epoch: u64, payload: Vec<u8>) -> turbodb::Manifest {
     turbodb::Manifest {
         version: 0,
-        // Epoch 0 here: phase-004 promotion (step 7) threads the live
-        // lease epoch into the envelope so the store can fence stale
-        // leaders. Until that wiring lands, all publishes share epoch 0
-        // and fall back to pure version-CAS (no behavior change).
-        epoch: 0,
+        // Phase-004 lease epoch: when > 0 the ManifestStore epoch fence
+        // (step 3) rejects a stale leader's publish. 0 = phase-3 mode
+        // (pure version-CAS, no behavior change).
+        epoch,
         writer_id: writer_id.to_string(),
         timestamp_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -247,9 +248,10 @@ async fn publish_manifest(
     store: &Arc<dyn ManifestStore>,
     key: &str,
     writer_id: &str,
+    epoch: u64,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>> {
-    let manifest = manifest_envelope(writer_id, payload);
+    let manifest = manifest_envelope(writer_id, epoch, payload);
     let expected = store.meta(key).await?.map(|m| m.version);
     let cas = store.put(key, &manifest, expected).await?;
     if cas.success {
@@ -340,6 +342,7 @@ impl TurboliteReplicator {
             &self.manifest_store,
             &self.manifest_key,
             &self.writer_id,
+            0, // Checkpoint mode: no walrust deltas, no phase-4 fencing.
             payload,
         )
         .await?;
@@ -386,6 +389,14 @@ pub struct TurboliteWalReplicator {
     replay_base_seq: Arc<AtomicU64>,
     last_published_base_cursor: Mutex<Option<walrust::ExternalBaseCursor>>,
     live_wal_path: Mutex<Option<std::path::PathBuf>>,
+    /// Phase 004: source of the live lease revision. When wired, the
+    /// replicator captures the term epoch from it and publishes
+    /// phase-4 (fenced TLM_DELTA) bases + deltas. `None` = phase-3.
+    fence: Option<Arc<dyn hadb_lease::FenceSource>>,
+    /// Latched lease epoch for the current leadership term (0 = unset →
+    /// re-latch from the fence on next publish). Shared with the
+    /// follower behavior, which resets it to 0 on promotion.
+    term_epoch: Arc<AtomicU64>,
 }
 
 impl TurboliteWalReplicator {
@@ -414,7 +425,52 @@ impl TurboliteWalReplicator {
             replay_base_seq,
             last_published_base_cursor: Mutex::new(None),
             live_wal_path: Mutex::new(None),
+            fence: None,
+            term_epoch: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Wire the lease fence (phase 004). Enables the fenced TLM_DELTA
+    /// writer path; without it the replicator stays on phase-3.
+    pub fn with_fence(mut self, fence: Arc<dyn hadb_lease::FenceSource>) -> Self {
+        self.fence = Some(fence);
+        self
+    }
+
+    /// Share the term-epoch cell with the follower behavior, which
+    /// resets it to 0 on promotion so the replicator re-latches.
+    pub fn with_term_epoch(mut self, term_epoch: Arc<AtomicU64>) -> Self {
+        self.term_epoch = term_epoch;
+        self
+    }
+
+    /// Current leadership-term epoch for phase-4 publishing.
+    ///
+    /// Returns 0 when no fence is wired (phase-3 mode). Otherwise
+    /// lazy-latches: if the term epoch is unset (0), capture the fence's
+    /// current revision and hold it for the term. The follower behavior
+    /// resets the cell to 0 on promotion so a new term re-latches the
+    /// new (higher) revision; renewals during a term do not change it.
+    fn current_term_epoch(&self) -> u64 {
+        let Some(fence) = self.fence.as_ref() else {
+            return 0;
+        };
+        let latched = self.term_epoch.load(Ordering::Acquire);
+        if latched != 0 {
+            return latched;
+        }
+        let rev = fence.current().unwrap_or(0);
+        if rev != 0 {
+            // Only the first writer to latch wins; concurrent publishes
+            // converge on the same (monotonic) fence revision anyway.
+            let _ = self.term_epoch.compare_exchange(
+                0,
+                rev,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        self.term_epoch.load(Ordering::Acquire)
     }
 
     pub fn walrust(&self) -> &Arc<haqlite::ExternalSnapshotSqliteReplicator> {
@@ -480,6 +536,61 @@ impl TurboliteWalReplicator {
             .vfs
             .publish_replayed_base()
             .map_err(|e| anyhow!("turbolite publish_replayed_base failed: {}", e))?;
+
+        // Phase 004: when a lease fence is wired and we hold a term
+        // epoch, publish a fenced base whose cursor carries the chain
+        // anchor + epoch + writer_id, then flip walrust to TLM_DELTA
+        // shipping anchored at that base. Phase-3 path below is
+        // untouched (term_epoch == 0 when no fence is wired).
+        let term_epoch = self.current_term_epoch();
+        if term_epoch > 0 {
+            let base_seq =
+                exact_replay_cursor.unwrap_or_else(|| self.vfs.manifest().change_counter);
+            // Adopt the replayed-base payload so the cursor stamp lands
+            // on the just-published page-group set.
+            self.vfs
+                .set_manifest_bytes(&payload)
+                .map_err(|e| anyhow!("turbolite adopt replay-base payload failed: {}", e))?;
+            let (p4_payload, anchor) = self
+                .vfs
+                .manifest_bytes_with_phase4_cursor(base_seq, term_epoch, &self.writer_id)
+                .map_err(|e| anyhow!("turbolite encode phase4 cursor failed: {}", e))?;
+
+            let actual_payload = publish_manifest(
+                &self.manifest_store,
+                &self.manifest_key,
+                &self.writer_id,
+                term_epoch,
+                p4_payload,
+            )
+            .await?;
+            self.vfs.set_manifest_bytes(&actual_payload).map_err(|e| {
+                anyhow!("turbolite install authoritative phase4 base failed: {}", e)
+            })?;
+
+            let anchor_arr: [u8; 32] = anchor.as_slice().try_into().map_err(|_| {
+                anyhow!(
+                    "phase4 base anchor for '{}' is {} bytes, expected 32",
+                    name,
+                    anchor.len()
+                )
+            })?;
+            // base-before-walrust-resume: the base + its fenced root are
+            // durable above; only now do we (re)anchor delta shipping.
+            self.walrust
+                .inner()
+                .set_phase4_base(name, term_epoch, &self.writer_id, base_seq, anchor_arr)
+                .await
+                .map_err(|e| anyhow!("walrust set_phase4_base failed: {e}"))?;
+
+            if used_pending_replay_base {
+                self.replay_base_pending_publish
+                    .store(false, Ordering::Release);
+                self.replay_base_seq.store(0, Ordering::Release);
+            }
+            return Ok(());
+        }
+
         let payload = if let Some(seq) = exact_replay_cursor {
             self.vfs
                 .set_manifest_bytes(&payload)
@@ -495,6 +606,7 @@ impl TurboliteWalReplicator {
             &self.manifest_store,
             &self.manifest_key,
             &self.writer_id,
+            0, // phase-3 path (no fence wired / term_epoch unset)
             payload,
         )
         .await?;
@@ -664,6 +776,85 @@ impl TurboliteWalReplicator {
         }
     }
 
+    /// Phase 004 writer catch-up: materialize the published base and
+    /// replay its TLM_DELTA chain, mirroring the follower apply path.
+    /// Used when the base manifest carries a populated cursor anchor.
+    async fn restore_from_phase4_manifest(
+        &self,
+        name: &str,
+        payload: &[u8],
+        decoded_manifest: turbolite::tiered::Manifest,
+    ) -> Result<()> {
+        let cursor = FollowerCursor {
+            last_applied_seq: decoded_manifest.cursor.last_applied_seq,
+            base_object_checksum: decoded_manifest.cursor.base_object_checksum.clone(),
+            epoch: decoded_manifest.cursor.epoch,
+            writer_id: decoded_manifest.writer_id.clone(),
+        };
+        let replay_start_seq = cursor.last_applied_seq;
+
+        let prepared =
+            prepare_phase4_replay(self.walrust_storage.as_ref(), &self.walrust_prefix, name, &cursor)
+                .await
+                .map_err(|e| anyhow!("phase4 prepare replay for '{}': {}", name, e))?;
+
+        let vfs = self.vfs.clone();
+        let cache_path = self.vfs.cache_file_path();
+        let gate = self.vfs.replay_gate();
+        let payload_owned = payload.to_vec();
+        let decoded_for_attempt = decoded_manifest.clone();
+        let name_owned = name.to_string();
+        let replay_base_pending_publish = self.replay_base_pending_publish.clone();
+        let replay_base_seq = self.replay_base_seq.clone();
+        let working_epoch = cursor.epoch;
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let _gate = loop {
+                if let Some(guard) = gate.try_write() {
+                    break guard;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+
+            vfs.shared_state()
+                .materialize_manifest_to_file(&decoded_for_attempt, &cache_path)
+                .context("turbolite phase4 materialize failed")?;
+            vfs.set_manifest_bytes(&payload_owned)
+                .map_err(|e| anyhow!("turbolite phase4 set_manifest_bytes failed: {}", e))?;
+            let page_count = vfs.manifest().page_count;
+            vfs.sync_after_external_restore(page_count);
+
+            let new_anchor = prepared.new_anchor.clone();
+            let new_last_applied_seq = prepared.new_last_applied_seq;
+
+            let handle = vfs
+                .begin_replay_after(replay_start_seq)
+                .map_err(|e| anyhow!("turbolite phase4 begin_replay failed: {}", e))?;
+            let mut sink = HaqliteTurboliteReplaySink::new_under_external_write(handle);
+            let final_seq = apply_prepared_page_replay(&mut sink, prepared.prepared)?;
+
+            if new_last_applied_seq > replay_start_seq {
+                vfs.update_replay_cursor(turbolite::tiered::ReplayCursor {
+                    last_applied_seq: new_last_applied_seq,
+                    base_object_checksum: new_anchor,
+                    epoch: working_epoch,
+                })
+                .map_err(|e| anyhow!("turbolite phase4 update_replay_cursor failed: {}", e))?;
+                replay_base_pending_publish.store(true, Ordering::Release);
+                replay_base_seq.fetch_max(new_last_applied_seq, Ordering::AcqRel);
+            }
+            tracing::debug!(
+                "TurboliteWalReplicator::restore_phase4('{}') replayed {} -> {}",
+                name_owned,
+                replay_start_seq,
+                final_seq,
+            );
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow!("turbolite phase4 restore task panicked: {}", e))?
+    }
+
     async fn restore_from_manifest(&self, name: &str, _path: &Path) -> Result<()> {
         let Some(manifest) = self.manifest_store.get(&self.manifest_key).await? else {
             return Err(anyhow!("{}", hybrid_manifest_required_message(name)));
@@ -674,6 +865,18 @@ impl TurboliteWalReplicator {
         let decoded_manifest =
             turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&payload_owned)
                 .map_err(|e| anyhow!("turbolite decode_manifest_bytes failed: {}", e))?;
+
+        // Phase 004 interlock: a base with a populated cursor anchor was
+        // published on the fenced TLM_DELTA contract. The writer's own
+        // catch-up MUST use the phase-4 replay path — the phase-3
+        // `.hadbp` discovery below would find no `.hadbp` deltas (a
+        // phase-4 writer ships `.tlmd`) and silently stall.
+        if !decoded_manifest.cursor.base_object_checksum.is_empty() {
+            return self
+                .restore_from_phase4_manifest(name, &payload_owned, decoded_manifest)
+                .await;
+        }
+
         let walrust_seq = decoded_manifest.change_counter;
 
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -881,13 +1084,14 @@ mod tests {
     #[tokio::test]
     async fn publish_manifest_returns_authoritative_same_writer_payload_on_create_conflict() {
         let store = Arc::new(SameWriterCreateConflictStore::default());
-        let existing = manifest_envelope("writer-a", b"already-published".to_vec());
+        let existing = manifest_envelope("writer-a", 0, b"already-published".to_vec());
         *store.current.lock().expect("lock") = Some(existing);
 
         let actual = publish_manifest(
             &(store as Arc<dyn ManifestStore>),
             "db/_manifest",
             "writer-a",
+            0,
             b"candidate".to_vec(),
         )
         .await
