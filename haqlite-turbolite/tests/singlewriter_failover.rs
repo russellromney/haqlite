@@ -1682,9 +1682,12 @@ async fn singlewriter_promotion_publishes_usable_base() {
             .payload;
         let m = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&bytes)
             .expect("decode post-promotion manifest");
-        let published_count = materialized_manifest_count(&follower.vfs, &m, "t")
-            .await
-            .expect("materialize post-promotion manifest for count");
+        // On an eventually-consistent store (Tigris) the manifest can be
+        // visible before its freshly-uploaded page groups are readable;
+        // the production follower treats that as a transient and retries
+        // on the next poll. Mirror that here — a materialize error means
+        // "not ready yet", not a hard failure.
+        let published_count = (materialized_manifest_count(&follower.vfs, &m, "t").await).unwrap_or(0);
         if m.version > pre_manifest.version && published_count >= 1 {
             break bytes;
         }
