@@ -855,6 +855,41 @@ impl TurboliteWalReplicator {
         .map_err(|e| anyhow!("turbolite phase4 restore task panicked: {}", e))?
     }
 
+    /// Re-anchor phase-4 delta shipping after the walrust db is
+    /// registered.
+    ///
+    /// publish_current_manifest calls set_phase4_base, but during `add`
+    /// it runs BEFORE add_external_base_with_retry registers the walrust
+    /// db, so that call no-ops (db not found) and walrust would ship
+    /// phase-3 .hadbp deltas under a phase-4 base — a fatal mix the
+    /// follower can't read. Calling this after registration re-applies
+    /// the anchor from the now-published base cursor so the very first
+    /// delta is .tlmd.
+    async fn reanchor_phase4_if_needed(&self, name: &str) -> Result<()> {
+        let m = self.vfs.manifest();
+        if m.cursor.base_object_checksum.is_empty() || m.cursor.epoch == 0 {
+            return Ok(()); // phase-3 base, nothing to anchor
+        }
+        let anchor: [u8; 32] = m
+            .cursor
+            .base_object_checksum
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("phase4 base anchor for '{}' is not 32 bytes", name))?;
+        self.walrust
+            .inner()
+            .set_phase4_base(
+                name,
+                m.cursor.epoch,
+                &self.writer_id,
+                m.cursor.last_applied_seq,
+                anchor,
+            )
+            .await
+            .map_err(|e| anyhow!("walrust reanchor set_phase4_base failed: {e}"))?;
+        Ok(())
+    }
+
     async fn restore_from_manifest(&self, name: &str, _path: &Path) -> Result<()> {
         let Some(manifest) = self.manifest_store.get(&self.manifest_key).await? else {
             return Err(anyhow!("{}", hybrid_manifest_required_message(name)));
@@ -975,7 +1010,10 @@ impl Replicator for TurboliteWalReplicator {
         }
         let base = self.external_base_cursor(&cache_path)?;
         self.add_external_base_with_retry(name, &cache_path, &wal_path, base)
-            .await
+            .await?;
+        // Re-anchor phase-4 now that the walrust db is registered, so
+        // the first delta ships as .tlmd (not .hadbp under a phase-4 base).
+        self.reanchor_phase4_if_needed(name).await
     }
 
     async fn add_continuing(&self, name: &str, path: &Path) -> Result<()> {
@@ -994,7 +1032,8 @@ impl Replicator for TurboliteWalReplicator {
         let base = self.external_base_cursor(&cache_path)?;
 
         self.add_external_base_with_retry(name, &cache_path, &wal_path, base)
-            .await
+            .await?;
+        self.reanchor_phase4_if_needed(name).await
     }
 
     async fn pull(&self, name: &str, path: &Path) -> Result<()> {

@@ -770,20 +770,12 @@ impl Builder {
                         rt_handle,
                     )
                     .map_err(|e| anyhow::anyhow!("turbolite VFS (caller-supplied): {e}"))?;
-                    // Phase 004 NOTE: returning a shared_fence here would
-                    // flip the storage-path continuous default to phase-4
-                    // (fenced TLM_DELTA). The protocol is proven
-                    // (phase4_handshake, phase4_object_store, and the
-                    // promotion/bootstrap suites pass on phase-4), but the
-                    // default flip currently breaks 3 flotilla_regression
-                    // close/reopen + replayed-base flows
-                    // (continuous_leader_publishes_replayed_base_before_new_writes,
-                    // close_reopen_continuous_survives,
-                    // continuous_close_can_retry_after_failed_final_sync):
-                    // a fresh node fails to converge in those flows. Keep
-                    // None (phase-3 default) until those are fixed; the
-                    // production turbolite_http path still wires a fence.
-                    Ok((turbolite::tiered::SharedTurboliteVfs::new(vfs), None, None))
+                    let shared_fence = new_shared_fence();
+                    Ok((
+                        turbolite::tiered::SharedTurboliteVfs::new(vfs),
+                        Some(shared_fence),
+                        None,
+                    ))
                 })?;
                 (
                     registration.shared_vfs,
