@@ -222,6 +222,11 @@ fn should_publish_manifest(vfs: &SharedTurboliteVfs) -> bool {
 fn manifest_envelope(writer_id: &str, payload: Vec<u8>) -> turbodb::Manifest {
     turbodb::Manifest {
         version: 0,
+        // Epoch 0 here: phase-004 promotion (step 7) threads the live
+        // lease epoch into the envelope so the store can fence stale
+        // leaders. Until that wiring lands, all publishes share epoch 0
+        // and fall back to pure version-CAS (no behavior change).
+        epoch: 0,
         writer_id: writer_id.to_string(),
         timestamp_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
