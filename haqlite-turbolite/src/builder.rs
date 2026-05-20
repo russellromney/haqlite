@@ -384,6 +384,40 @@ impl Builder {
         self.lease_store(store)
     }
 
+    /// Lease store against the cinch internal NoAuth listener
+    /// (`database_id` query param, no Bearer token).
+    pub fn lease_endpoint_internal(self, endpoint: &str, database_id: &str) -> Self {
+        let store = Arc::new(hadb_lease_cinch::CinchLeaseStore::new_internal(
+            endpoint,
+            database_id,
+        ));
+        self.lease_store(store)
+    }
+
+    /// One-shot HTTP wiring (Phase 005 L2).
+    ///
+    /// Points lease, manifest, and page/WAL storage at the same cinch
+    /// endpoint with one Bearer token — replacing three separate
+    /// `.lease_endpoint(..)` / `.manifest_endpoint(..)` /
+    /// `.turbolite_http(..)` calls. Composes with everything else:
+    /// `.durability(Continuous { .. })` (walrust is inferred from the
+    /// same endpoint) and `.with_rollback_detection(..)` both chain
+    /// after it.
+    pub fn http(self, endpoint: &str, token: &str) -> Self {
+        self.lease_endpoint(endpoint, token)
+            .manifest_endpoint(endpoint, token)
+            .turbolite_http(endpoint, token)
+    }
+
+    /// One-shot internal-NoAuth HTTP wiring: lease + manifest + storage
+    /// against `endpoint`, scoped by `database_id` instead of a token.
+    /// For system databases on the cinch internal listener.
+    pub fn http_internal(self, endpoint: &str, database_id: &str) -> Self {
+        self.lease_endpoint_internal(endpoint, database_id)
+            .manifest_endpoint_internal(endpoint, database_id)
+            .turbolite_http_internal(endpoint, database_id)
+    }
+
     pub fn mode(mut self, mode: HaMode) -> Self {
         self.mode = mode;
         self
@@ -1255,5 +1289,43 @@ mod tests {
             before,
             "preflight failures must not register a process-lifetime VFS"
         );
+    }
+
+    // ---- Phase 005 L2: Builder::http one-shot ----
+
+    #[test]
+    fn http_wires_lease_manifest_and_storage() {
+        let b = Builder::new().http("https://cinch.example.com", "tok");
+        assert!(
+            b.turbolite_http.is_some(),
+            "http() must wire turbolite page/WAL storage"
+        );
+        assert!(
+            b.manifest_http.is_some(),
+            "http() must wire the manifest endpoint"
+        );
+        assert!(
+            b.inner.get_lease_store().is_some(),
+            "http() must wire the lease store"
+        );
+    }
+
+    #[test]
+    fn http_internal_wires_all_three() {
+        let b = Builder::new().http_internal("http://cinch.internal:8010", "_system/placement-db");
+        assert!(b.turbolite_http.is_some());
+        assert!(b.manifest_http.is_some());
+        assert!(b.inner.get_lease_store().is_some());
+    }
+
+    #[test]
+    fn http_then_rollback_detection_compose() {
+        // L2 must stay composable with the phase-004 rollback detector.
+        let b = Builder::new()
+            .http("https://cinch.example.com", "tok")
+            .with_rollback_detection("db-1", "tok");
+        assert!(b.turbolite_http.is_some());
+        assert!(b.manifest_http.is_some());
+        assert!(b.inner.get_lease_store().is_some());
     }
 }
