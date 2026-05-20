@@ -798,6 +798,21 @@ impl TurboliteWalReplicator {
                 .await
                 .map_err(|e| anyhow!("phase4 prepare replay for '{}': {}", name, e))?;
 
+        // A forked or gapped chain means the verifiable WAL tail is a strict
+        // prefix of the real history. A read-only follower may apply that
+        // prefix (and leave itself not-caught-up), but this is the WRITER
+        // catch-up path: applying the prefix and then advancing the publish
+        // cursor would publish a TRUNCATED base over real history — data loss
+        // on failover. Refuse to adopt/publish on any break.
+        if !matches!(prepared.break_reason, crate::phase4_chain::ChainBreak::Ok) {
+            return Err(anyhow!(
+                "phase4 writer catch-up for '{}' hit a chain break ({:?}); refusing to \
+                 adopt or publish a truncated base",
+                name,
+                prepared.break_reason
+            ));
+        }
+
         let vfs = self.vfs.clone();
         let cache_path = self.vfs.cache_file_path();
         let gate = self.vfs.replay_gate();

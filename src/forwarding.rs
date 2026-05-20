@@ -123,6 +123,16 @@ pub(crate) async fn handle_forwarded_execute(
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let conn = conn_arc.lock();
 
+    // Re-check leadership UNDER the connection lock. The role can flip
+    // (demotion / lease loss) between the check above and acquiring the
+    // lock; without this re-check a write admitted while leader could
+    // commit after demotion. The read-only authorizer installed on
+    // demotion only affects statements prepared *after* it is set, so this
+    // lock-held re-check is what actually fences the forwarded-write path.
+    if state.inner.current_role() != Some(Role::Leader) {
+        return Err(StatusCode::MISDIRECTED_REQUEST);
+    }
+
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = req
         .params
         .iter()
