@@ -4217,6 +4217,7 @@ dependencies = [
  "rusqlite",
  "rustyline",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sqlite-vfs",
  "tempfile",
