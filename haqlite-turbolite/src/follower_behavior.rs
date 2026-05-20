@@ -297,11 +297,17 @@ impl TurboliteFollowerBehavior {
         let local = self.vfs.manifest();
         let local_cursor = local.cursor.clone();
 
-        // Adopt the published base (re-materialize) only when it moves
-        // the floor past our working position.
+        // Adopt the published base (re-materialize) only when it moves the
+        // floor past our working position. A higher manifest version alone
+        // must NOT trigger adoption if it would rewind the applied-seq floor
+        // backward (re-materializing an older image and re-applying deltas
+        // already folded in); guard the version clause on a non-decreasing
+        // seq. Same-epoch republish keeps the same writer_id by the
+        // strictly-monotonic-epoch lease invariant.
         let adopt_base = base_cursor.epoch > local_cursor.epoch
             || base_cursor.last_applied_seq > local_cursor.last_applied_seq
-            || decoded_manifest.version > local.version;
+            || (decoded_manifest.version > local.version
+                && base_cursor.last_applied_seq >= local_cursor.last_applied_seq);
         let working = if adopt_base {
             base_cursor.clone()
         } else {
