@@ -27,14 +27,37 @@
 
 use walrust::DiscoveredDelta;
 
-/// The cursor a follower reads from its current base manifest.
+/// The follower's **working** replay cursor.
+///
+/// This is *not* the same value as the cursor embedded in a published
+/// base manifest. It starts equal to the base's cursor (anchor = the
+/// base manifest's BLAKE3, `last_applied_seq` = the seq folded into the
+/// base), and then **advances as the follower applies deltas**:
+///
+/// - After applying a verified prefix ending at delta `D`, the caller
+///   MUST set `last_applied_seq = D.seq` AND
+///   `base_object_checksum = D.envelope_checksum`.
+/// - The anchor therefore points at the last *applied object*, not
+///   permanently at the base. This is required because delta `N+1`'s
+///   `prev_checksum` is the hash of delta `N`'s envelope, not the
+///   base's — so the next poll must verify against delta `N`'s hash.
+///
+/// The working cursor is persisted separately from the published base
+/// manifest. It is only reset back to a base's cursor when the base
+/// manifest's **epoch** changes (promotion) — see step 7. Failing to
+/// advance the anchor makes every poll after the first base-mismatch
+/// at `last_applied_seq + 1`.
 #[derive(Debug, Clone)]
 pub struct FollowerCursor {
-    /// Seq of the last delta already folded into the base. Followers
-    /// only consider deltas with `seq > last_applied_seq`.
+    /// Seq of the last object already applied (base initially, then the
+    /// last applied delta). Followers only consider `seq > last_applied_seq`.
     pub last_applied_seq: u64,
-    /// BLAKE3 of the published base manifest object — the anchor the
-    /// first delta's `prev_checksum` must equal.
+    /// BLAKE3 of the last applied object's on-the-wire bytes — the
+    /// anchor the next delta's `prev_checksum` must equal. The base
+    /// manifest's hash initially; advances to each applied delta's
+    /// `envelope_checksum`. Must be 32 bytes for verification to
+    /// proceed (an empty anchor means "no established base" and rejects
+    /// every candidate).
     pub base_object_checksum: Vec<u8>,
     /// Lease epoch of the base. Deltas at any other epoch are filtered.
     pub epoch: u64,
@@ -57,6 +80,12 @@ pub enum ChainBreak {
     /// A non-first delta's `prev_checksum` does not equal the prior
     /// delta's envelope checksum.
     Fork { seq: u64 },
+    /// The cursor has no anchor (empty `base_object_checksum`). There
+    /// is no established base to chain from, so nothing is verified.
+    /// A real base always carries a 32-byte BLAKE3 anchor; an empty
+    /// one means the follower has no base yet (or a misconfigured
+    /// cursor) and must not accept any delta.
+    NoAnchor,
 }
 
 /// Equivocation: two distinct candidates at the same seq (after the
@@ -140,6 +169,17 @@ pub fn filter_candidates(
 /// prefix. Duplicate-seq survivors with *identical* checksum (idempotent
 /// re-publish that slipped past dedup) collapse to one.
 pub fn verify_chain(candidates: Vec<DiscoveredDelta>, cursor: &FollowerCursor) -> VerifiedChain {
+    // An empty anchor means there is no established base to chain from.
+    // Reject every candidate rather than risk verifying a forged delta
+    // that also carries an empty prev_checksum. Real bases always carry
+    // a 32-byte BLAKE3 anchor.
+    if cursor.base_object_checksum.is_empty() {
+        return VerifiedChain {
+            verified: Vec::new(),
+            break_reason: ChainBreak::NoAnchor,
+        };
+    }
+
     let mut verified: Vec<DiscoveredDelta> = Vec::new();
     let mut expected_seq = cursor.last_applied_seq + 1;
     let mut expected_prev: Vec<u8> = cursor.base_object_checksum.clone();
@@ -383,6 +423,73 @@ mod tests {
         let seqs: Vec<u64> = result.verified.iter().map(|d| d.seq).collect();
         assert_eq!(seqs, vec![1, 2]);
         assert_eq!(result.break_reason, ChainBreak::Ok);
+    }
+
+    /// The load-bearing working-cursor invariant: after applying a
+    /// verified prefix, the caller advances the anchor to the last
+    /// applied delta's envelope checksum and last_applied_seq to its
+    /// seq. The NEXT poll must then verify the following deltas. If the
+    /// anchor were left at the base, poll 2 would base-mismatch.
+    #[test]
+    fn two_poll_cycles_advance_anchor() {
+        let base = vec![0xBB; 32];
+        let writer = "leader-A";
+        let chain = valid_chain(1, 4, 5, writer, base.clone());
+
+        // Poll 1: cursor at the base, deltas 1,2 available.
+        let cur0 = cursor(0, base.clone(), 5, writer);
+        let r1 = filter_and_verify(vec![chain[0].clone(), chain[1].clone()], &cur0)
+            .expect("no equivocation");
+        assert_eq!(r1.break_reason, ChainBreak::Ok);
+        assert_eq!(r1.verified.iter().map(|d| d.seq).collect::<Vec<_>>(), vec![1, 2]);
+
+        // Caller advances the working cursor per the contract.
+        let last = r1.verified.last().unwrap();
+        let cur1 = cursor(last.seq, last.envelope_checksum.to_vec(), 5, writer);
+
+        // Poll 2: deltas 3,4 arrive; verify against the advanced anchor.
+        let r2 = filter_and_verify(vec![chain[2].clone(), chain[3].clone()], &cur1)
+            .expect("no equivocation");
+        assert_eq!(
+            r2.break_reason,
+            ChainBreak::Ok,
+            "poll 2 verifies only because the anchor advanced to delta-2's checksum"
+        );
+        assert_eq!(r2.verified.iter().map(|d| d.seq).collect::<Vec<_>>(), vec![3, 4]);
+    }
+
+    /// If the caller (wrongly) leaves the anchor at the base for poll 2,
+    /// verification base-mismatches — proving the advance is required.
+    #[test]
+    fn stale_anchor_base_mismatches_on_second_poll() {
+        let base = vec![0xBB; 32];
+        let writer = "leader-A";
+        let chain = valid_chain(1, 4, 5, writer, base.clone());
+
+        // Pretend we applied 1,2 but failed to advance the anchor:
+        // cursor still points at the base, but last_applied_seq = 2.
+        let stale = cursor(2, base.clone(), 5, writer);
+        let r = filter_and_verify(vec![chain[2].clone(), chain[3].clone()], &stale)
+            .expect("no equivocation");
+        assert!(r.verified.is_empty());
+        assert_eq!(
+            r.break_reason,
+            ChainBreak::BaseMismatch { seq: 3 },
+            "delta-3 chains to delta-2, not the base; stale anchor base-mismatches"
+        );
+    }
+
+    /// An empty anchor (un-anchored / default cursor) rejects every
+    /// candidate, even a forged delta carrying an empty prev_checksum.
+    #[test]
+    fn empty_anchor_rejects_all_candidates() {
+        let writer = "leader-A";
+        let cur = cursor(0, Vec::new(), 5, writer);
+        // A forged delta with an empty prev_checksum must NOT verify.
+        let forged = delta(1, 5, writer, Vec::new(), 101, vec![1]);
+        let r = filter_and_verify(vec![forged], &cur).expect("no equivocation");
+        assert!(r.verified.is_empty());
+        assert_eq!(r.break_reason, ChainBreak::NoAnchor);
     }
 
     #[test]
