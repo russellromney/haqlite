@@ -1672,7 +1672,11 @@ async fn singlewriter_promotion_publishes_usable_base() {
     // must now be present in the pure page/base manifest. The later
     // rows are expected to arrive through walrust deltas, not by
     // forcing an immediate SQLite checkpoint.
-    let deadline = Instant::now() + Duration::from_secs(8);
+    // 30s, not 8s: against an eventually-consistent store under
+    // concurrent test load, the promotion publish + page-group upload
+    // can take longer to become readable. The follower retries
+    // internally; this only bounds the test's patience.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let post_promotion_manifest_bytes = loop {
         let bytes = manifest_store
             .get("test/failover/_manifest")
@@ -1934,7 +1938,11 @@ async fn singlewriter_promotion_publishes_already_replayed_base() {
     // page-group key AND a bumped envelope version. Same-keys is
     // the negative signal — accumulated state never reached the
     // store.
-    let deadline = Instant::now() + Duration::from_secs(8);
+    // 30s, not 8s: against an eventually-consistent store under
+    // concurrent test load, the promotion publish + page-group upload
+    // can take longer to become readable. The follower retries
+    // internally; this only bounds the test's patience.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let post_promotion_manifest_bytes = loop {
         let bytes = manifest_store
             .get("test/failover/_manifest")

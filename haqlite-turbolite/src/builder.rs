@@ -407,7 +407,7 @@ impl Builder {
         self.turbolite_http_with_client(client, endpoint, token)
     }
 
-    /// Use grabby's public HTTP sync API with a caller-provided client.
+    /// Use the cinch HTTP sync API with a caller-provided client.
     ///
     /// Reusing one `reqwest::Client` across lease, manifest, WAL, and page
     /// storage keeps repeated open/close cycles from creating one transport
@@ -426,7 +426,7 @@ impl Builder {
         self
     }
 
-    /// Use grabby's internal NoAuth sync API for turbolite page/WAL storage.
+    /// Use the cinch internal-NoAuth sync API for turbolite page/WAL storage.
     /// Requests carry `database_id` as a query parameter instead of Bearer auth.
     pub fn turbolite_http_internal(self, endpoint: &str, database_id: &str) -> Self {
         let client = reqwest::Client::builder()
@@ -436,7 +436,7 @@ impl Builder {
         self.turbolite_http_internal_with_client(client, endpoint, database_id)
     }
 
-    /// Use grabby's internal NoAuth sync API with a caller-provided client.
+    /// Use the cinch internal-NoAuth sync API with a caller-provided client.
     pub fn turbolite_http_internal_with_client(
         mut self,
         client: reqwest::Client,
@@ -501,7 +501,7 @@ impl Builder {
         self.manifest_endpoint_with_client(client, endpoint, token)
     }
 
-    /// Use grabby's public manifest API with a caller-provided client.
+    /// Use the cinch HTTP manifest API with a caller-provided client.
     pub fn manifest_endpoint_with_client(
         mut self,
         client: reqwest::Client,
@@ -517,7 +517,7 @@ impl Builder {
         self
     }
 
-    /// Use grabby's internal NoAuth manifest API for system DB manifests.
+    /// Use the cinch internal-NoAuth manifest API for system DB manifests.
     /// Requests carry `database_id` as a query parameter instead of Bearer auth.
     pub fn manifest_endpoint_internal(self, endpoint: &str, database_id: &str) -> Self {
         let client = reqwest::Client::builder()
@@ -527,7 +527,7 @@ impl Builder {
         self.manifest_endpoint_internal_with_client(client, endpoint, database_id)
     }
 
-    /// Use grabby's internal NoAuth manifest API with a caller-provided client.
+    /// Use the cinch internal-NoAuth manifest API with a caller-provided client.
     pub fn manifest_endpoint_internal_with_client(
         mut self,
         client: reqwest::Client,

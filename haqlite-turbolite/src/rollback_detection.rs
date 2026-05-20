@@ -124,7 +124,7 @@ impl RollbackDetector {
             .bearer_auth(&self.token)
             .send()
             .await
-            .context("grabby /v1/sync/pages/manifest.msgpack GET failed")?;
+            .context("cinch sync /v1/sync/pages/manifest.msgpack GET failed")?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -132,7 +132,7 @@ impl RollbackDetector {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!(
-                "grabby /v1/sync/pages/manifest.msgpack returned {}: {}",
+                "cinch sync /v1/sync/pages/manifest.msgpack returned {}: {}",
                 status,
                 text
             );
@@ -140,7 +140,7 @@ impl RollbackDetector {
         let bytes = resp
             .bytes()
             .await
-            .context("read grabby manifest body")?
+            .context("read cinch manifest body")?
             .to_vec();
         let epoch = decode_manifest_epoch(&bytes)?;
         Ok(Some((bytes, epoch)))
