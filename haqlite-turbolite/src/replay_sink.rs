@@ -195,6 +195,108 @@ pub(crate) fn apply_prepared_page_replay(
     }
 }
 
+/// Result of preparing a phase-004 (TLM_DELTA) replay.
+///
+/// Carries the same `PreparedPageReplay` the phase-3 path produces (so
+/// the existing atomic-apply machinery is reused verbatim) plus the
+/// follower's *advanced* working-cursor position. After
+/// `apply_prepared_page_replay` succeeds, the caller persists
+/// `new_last_applied_seq` + `new_anchor` as its working cursor — the
+/// anchor MUST advance to the last applied delta's envelope checksum
+/// (see `phase4_chain::FollowerCursor`).
+pub(crate) struct PreparedPhase4Replay {
+    pub prepared: PreparedPageReplay,
+    /// Working anchor after applying the verified prefix. Equals the
+    /// last applied delta's envelope checksum, or the cursor's input
+    /// anchor unchanged if nothing was applied.
+    pub new_anchor: Vec<u8>,
+    /// last_applied_seq after applying the verified prefix.
+    pub new_last_applied_seq: u64,
+    /// Why chain verification stopped (Ok = whole candidate set applied).
+    pub break_reason: crate::phase4_chain::ChainBreak,
+}
+
+/// Phase-004 follower replay preparation: list TLM_DELTA envelopes
+/// after the cursor floor, run the candidate filter + chain verifier,
+/// decode the verified prefix's LTX payloads into physical changesets,
+/// and package them for atomic apply with `end_page_count` driving the
+/// final page count.
+///
+/// Equivocation (two valid candidates at one seq) is fatal and returns
+/// `Err` — the follower must not guess which history is real. A chain
+/// break (gap/fork/base-mismatch) is NOT an error: the maximal verified
+/// prefix is still safe to apply and `break_reason` records where it
+/// stopped so the next poll retries from the advanced cursor.
+pub(crate) async fn prepare_phase4_replay(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    cursor: &crate::phase4_chain::FollowerCursor,
+) -> Result<PreparedPhase4Replay> {
+    let deltas =
+        walrust::list_delta_envelopes_after(storage, prefix, db_name, cursor.last_applied_seq)
+            .await?;
+
+    let verified = crate::phase4_chain::filter_and_verify(deltas, cursor).map_err(|eq| {
+        anyhow!(
+            "fatal delta equivocation for '{}' at seq {} (epoch {}, writer {}): {} vs {}",
+            db_name,
+            eq.seq,
+            eq.epoch,
+            eq.writer_id,
+            eq.key_a,
+            eq.key_b
+        )
+    })?;
+
+    let mut changesets = Vec::with_capacity(verified.verified.len());
+    let mut target_page_count = None;
+    let mut new_anchor = cursor.base_object_checksum.clone();
+    let mut new_last_applied_seq = cursor.last_applied_seq;
+
+    for d in &verified.verified {
+        let changeset = physical::decode(&d.payload.ltx_payload).map_err(|e| {
+            anyhow!(
+                "failed to decode LTX payload in delta seq {} for '{}': {}",
+                d.seq,
+                db_name,
+                e
+            )
+        })?;
+        if changeset.header.seq != d.seq {
+            return Err(anyhow!(
+                "delta seq {} carries an LTX changeset with header seq {} for '{}'",
+                d.seq,
+                changeset.header.seq,
+                db_name
+            ));
+        }
+        // end_page_count of the last applied delta drives the final
+        // file page count (shrink/grow/VACUUM/truncate aware).
+        target_page_count = Some(d.payload.end_page_count);
+        new_anchor = d.envelope_checksum.to_vec();
+        new_last_applied_seq = d.seq;
+        changesets.push((d.seq, changeset));
+    }
+
+    let prepared = PreparedPageReplay {
+        current_seq: cursor.last_applied_seq,
+        changesets,
+        target_page_count,
+        // The phase-4 BLAKE3 envelope chain is already verified by
+        // filter_and_verify; the inner LTX u64 chain is not the
+        // authority here, so no base-file checksum gate.
+        base_file_checksum_required: false,
+    };
+
+    Ok(PreparedPhase4Replay {
+        prepared,
+        new_anchor,
+        new_last_applied_seq,
+        break_reason: verified.break_reason,
+    })
+}
+
 fn sqlite_header_page_count(data: &[u8]) -> Option<u64> {
     if data.len() < 32 || data.get(0..16) != Some(b"SQLite format 3\0") {
         return None;
@@ -405,6 +507,100 @@ mod tests {
             ChangesetKind::Physical,
         );
         storage.put_sync(key, physical::encode(changeset));
+    }
+
+    use crate::phase4_chain::{ChainBreak, FollowerCursor};
+    use walrust::external_delta::{self, DeltaPayloadV1};
+
+    /// Publish a TLM_DELTA whose ltx_payload is the encoded physical
+    /// changeset, chaining from `prev`. Returns the envelope checksum
+    /// (the next delta's prev).
+    async fn publish_phase4_delta(
+        storage: &MemoryStorage,
+        seq: u64,
+        epoch: u64,
+        writer: &str,
+        prev: Vec<u8>,
+        end_page_count: u64,
+        changeset: &PhysicalChangeset,
+    ) -> [u8; 32] {
+        let payload = DeltaPayloadV1 {
+            seq,
+            epoch,
+            writer_id: writer.to_string(),
+            prev_checksum: prev,
+            end_page_count,
+            ltx_payload: physical::encode(changeset),
+        };
+        walrust::publish_delta_envelope(storage, "prefix/", "db", &payload)
+            .await
+            .expect("publish phase4 delta");
+        let envelope = external_delta::encode(&payload).expect("encode");
+        external_delta::checksum(&envelope)
+    }
+
+    #[tokio::test]
+    async fn prepare_phase4_replay_verifies_chain_and_carries_end_page_count() {
+        let storage = MemoryStorage::default();
+        let base_anchor = vec![0xBB; 32];
+        let writer = "leader-A";
+
+        // Publish a 3-delta chain anchored at base_anchor.
+        let c1 = changeset(1, 0, 1, 0x11);
+        let ck1 = publish_phase4_delta(&storage, 1, 5, writer, base_anchor.clone(), 10, &c1).await;
+        let c2 = changeset(2, 0, 1, 0x22);
+        let ck2 = publish_phase4_delta(&storage, 2, 5, writer, ck1.to_vec(), 20, &c2).await;
+        let c3 = changeset(3, 0, 1, 0x33);
+        let ck3 = publish_phase4_delta(&storage, 3, 5, writer, ck2.to_vec(), 30, &c3).await;
+
+        let cursor = FollowerCursor {
+            last_applied_seq: 0,
+            base_object_checksum: base_anchor.clone(),
+            epoch: 5,
+            writer_id: writer.to_string(),
+        };
+
+        let prep = prepare_phase4_replay(&storage, "prefix/", "db", &cursor)
+            .await
+            .expect("prepare");
+        assert_eq!(prep.break_reason, ChainBreak::Ok);
+        let seqs: Vec<u64> = prep.prepared.changesets.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+        // end_page_count of the LAST applied delta drives target page count.
+        assert_eq!(prep.prepared.target_page_count, Some(30));
+        // Working anchor advanced to the last delta's envelope checksum.
+        assert_eq!(prep.new_anchor, ck3.to_vec());
+        assert_eq!(prep.new_last_applied_seq, 3);
+    }
+
+    #[tokio::test]
+    async fn prepare_phase4_replay_stops_at_chain_break_and_applies_prefix() {
+        let storage = MemoryStorage::default();
+        let base_anchor = vec![0xBB; 32];
+        let writer = "leader-A";
+
+        let c1 = changeset(1, 0, 1, 0x11);
+        let ck1 = publish_phase4_delta(&storage, 1, 5, writer, base_anchor.clone(), 10, &c1).await;
+        let c2 = changeset(2, 0, 1, 0x22);
+        let _ck2 = publish_phase4_delta(&storage, 2, 5, writer, ck1.to_vec(), 20, &c2).await;
+        // Delta 3 forged to chain from the WRONG prior -> fork after 2.
+        let c3 = changeset(3, 0, 1, 0x33);
+        let _ = publish_phase4_delta(&storage, 3, 5, writer, vec![0x77; 32], 30, &c3).await;
+
+        let cursor = FollowerCursor {
+            last_applied_seq: 0,
+            base_object_checksum: base_anchor,
+            epoch: 5,
+            writer_id: writer.to_string(),
+        };
+        let prep = prepare_phase4_replay(&storage, "prefix/", "db", &cursor)
+            .await
+            .expect("prepare");
+        let seqs: Vec<u64> = prep.prepared.changesets.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, vec![1, 2], "applies exactly the verified prefix");
+        assert_eq!(prep.break_reason, ChainBreak::Fork { seq: 3 });
+        assert_eq!(prep.prepared.target_page_count, Some(20));
+        assert_eq!(prep.new_last_applied_seq, 2);
     }
 
     #[tokio::test]
