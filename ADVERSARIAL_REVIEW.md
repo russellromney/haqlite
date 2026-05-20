@@ -39,9 +39,9 @@ empty-anchor) is sound and intentionally left unchanged — the bugs are in the
 
 ---
 
-## Documented (verified real; fix specified)
+## Findings (originally documented; now fixed unless noted)
 
-### F4 — [High] First-delta checksum mismatch is downgraded instead of rejected — **Documented**
+### F4 — [High] First-delta checksum mismatch is downgraded instead of rejected — **Fixed**
 - `haqlite-turbolite/src/replay_sink.rs:121-134`
 - For the first delta after the cursor (`file.seq == current_seq + 1`), a
   `prev_checksum` mismatch sets `base_file_checksum_required = true` instead of
@@ -56,7 +56,7 @@ empty-anchor) is sound and intentionally left unchanged — the bugs are in the
   first-delta tests, which is why it is staged for a verified follow-up rather
   than bundled here.
 
-### F3 — [High] `caught_up` set without comparing applied seq to the chain head — **Documented**
+### F3 — [High] `caught_up` set without comparing applied seq to the chain head — **Fixed**
 - `haqlite-turbolite/src/follower_behavior.rs:481-504`
 - `caught_up = true` whenever `new_version > current_version`, never comparing
   the applied seq to the actual chain head, so a follower that applied a short
@@ -64,21 +64,21 @@ empty-anchor) is sound and intentionally left unchanged — the bugs are in the
 - **Fix:** thread the discovered chain-head seq out of `prepare_*` and set
   `caught_up = true` only when `final_seq == head_seq`.
 
-### F5 — [Med] `pull_incremental` bridges chain gaps "by page content" — **Documented**
+### F5 — [Med] `pull_incremental` bridges chain gaps "by page content" — **Fixed**
 - `src/replicator.rs:181-201`, `follower_behavior.rs:66-89`
 - Deliberately merges a forked history rather than failing.
 - **Fix:** gate gap-bridging behind an explicit fork-acknowledgement/generation
   check; by default hard-error when `restore()` stopped on a chain break and
   `pull_incremental` would cross it.
 
-### F6 — [Med] Phase-3 `target_page_count` only tracks page-1 sightings → stale trailing pages — **Documented**
+### F6 — [Med] Phase-3 `target_page_count` only tracks page-1 sightings → stale trailing pages — **Fixed**
 - `haqlite-turbolite/src/replay_sink.rs:135-141`
 - Set only when a changeset includes page 1; a shrink omitting page 1 leaves
   stale trailing pages (phase-4 carries an explicit `end_page_count`).
 - **Fix:** carry the post-commit page count per changeset and use the last
   applied changeset's value, mirroring phase-4.
 
-### F7 — [Med] Phase-4 base anchor uses `change_counter` vs cursor seam — **Documented**
+### F7 — [Med] Phase-4 base anchor uses `change_counter` vs cursor seam — **Fixed**
 - `haqlite-turbolite/src/replicator.rs:545-584`
 - When no replay base is pending, the base is anchored at `change_counter` but
   followers anchor deltas at `cursor.last_applied_seq`; divergence yields a
@@ -86,15 +86,24 @@ empty-anchor) is sound and intentionally left unchanged — the bugs are in the
 - **Fix:** when the persisted replay cursor is populated, derive `base_seq` from
   `cursor.last_applied_seq`, not `change_counter`.
 
-### F8 — [Med] Forwarded-write retry is not idempotent — **Documented**
+### F8 — [Med] Forwarded-write retry is not idempotent — **Fixed**
 - `src/database.rs:1688-1781` `execute_forwarded`
 - Retries on connection/421/5xx with no idempotency key, so a committed-but-
   response-lost write is applied twice.
-- **Fix:** client-generated idempotency token on `ForwardedExecute`; leader
-  records applied tokens (dedup table in the same transaction) and returns the
-  cached result on replay; document at-least-once until durable dedup lands.
+- **Fix:** client-generated idempotency token on `ForwardedExecute`, generated
+  once per logical write and reused across all forwarding retries (both the
+  in-process `execute_forwarded` retry loop and the `HaQLiteClient`/`HaClient`
+  forward retry). The leader consults + records the token in a bounded
+  in-memory FIFO dedup map (`ForwardedIdempotencyCache`, 4096 entries) under the
+  same connection lock that serializes execution, so check + execute + record is
+  atomic against concurrent forwarded writes; a replayed token returns the
+  cached `rows_affected` instead of re-executing. The token field is
+  `#[serde(default)] Option<String>` for wire-compat with older clients.
+  **At-least-once across leader restart / failover** (the cache is in memory and
+  lost on restart); the durable follow-up is a dedup table written in the same
+  SQLite transaction as the write.
 
-### F9 — [Med] Hrana follower reads bypass the VFS replay gate — **Documented**
+### F9 — [Med] Hrana follower reads bypass the VFS replay gate — **Fixed**
 - `src/hrana.rs:60-99`
 - Opens a raw connection on the plain OS path, bypassing the replay gate that
   the builder's follower-read opener routes through → torn reads during
@@ -102,7 +111,7 @@ empty-anchor) is sound and intentionally left unchanged — the bugs are in the
 - **Fix:** route hrana follower reads through the VFS read opener (same
   `vfs_name`); resolve role once and fence on lease loss.
 
-### F10 — [Low-Med] Bootstrap-race accepts a same-writer manifest without epoch check — **Documented**
+### F10 — [Low-Med] Bootstrap-race accepts a same-writer manifest without epoch check — **Fixed**
 - `haqlite-turbolite/src/replicator.rs:278-296`
 - On a create-CAS conflict, if `current.writer_id == manifest.writer_id` the
   current payload is treated as authoritative without an epoch/freshness check,
@@ -110,7 +119,7 @@ empty-anchor) is sound and intentionally left unchanged — the bugs are in the
 - **Fix:** also require `current.epoch >= manifest.epoch` (and ideally that the
   decoded cursor is not behind ours).
 
-### F11 — [High] Base SingleWriter replication ships changesets with no leader epoch — **Documented**
+### F11 — [High] Base SingleWriter replication ships changesets with no leader epoch — **Partial**
 - `src/database.rs` SingleWriter path, `src/ops.rs:50`
 - Changesets are keyed only by `seq` with no leader epoch, so combined with a
   lease/TOCTOU race a former leader's changesets are accepted on key-name seq
@@ -119,11 +128,34 @@ empty-anchor) is sound and intentionally left unchanged — the bugs are in the
   stamp it on each changeset, and reject (follower-side) any changeset whose
   epoch is below the current lease epoch. Depends on the `hadb` fencing-token
   contract (`fence_accepts`, strictly increasing) added in that repo.
+- **Status — Partial (one line):** the epoch-stamped, writer-fenced contract is
+  fully realized on the phase-4 TLM_DELTA path (`DeltaPayloadV1` carries
+  `epoch` + `writer_id`; `phase4_chain::filter_and_verify` rejects wrong-epoch
+  / forked deltas; the leader stamps the term epoch via `set_phase4_base`), so
+  the fenced shipping path enforces F11. The remaining gap is the **legacy base
+  `.hadbp` SingleWriter path** (`SqliteReplicator` + `SqliteFollowerBehavior`
+  shipping `physical::PhysicalChangeset` keyed by seq): the HADBP header has no
+  epoch field, so stamping + follower-side `fence_accepts(current, incoming)`
+  rejection there is a `walrust` HADBP wire-format change (plus a follower
+  `pull_incremental` epoch gate), which is out of scope for a single,
+  test-green haqlite-side PR. Implementing it in-repo would require changing the
+  on-disk changeset format and is deferred; the safe interim posture is to run
+  the fenced phase-4 path (which is what the turbolite builder wires when a
+  lease fence is present) and to fence the underlying object-store writes via
+  the `AtomicFence` storage wrapper. Durable follow-up: add an `epoch` field to
+  the HADBP `PhysicalHeader`, stamp the leader term epoch on publish, and gate
+  the legacy follower pull on `fence_accepts`.
 
 ---
 
 ## Test / build notes
 
-- `cargo build --workspace` green; the Fixed cluster compiles.
+- `cargo build --workspace` green across the whole findings set.
+- F1, F2 fixed earlier in this branch. F3, F4, F5, F6, F7, F8, F9, F10 are
+  fixed here. F11 is Partial (fenced phase-4 path enforces it; the legacy base
+  `.hadbp` path needs a `walrust`/`hadb` wire-format change — see F11).
+- Unit coverage added/updated: replay_sink first-delta chain-break + page-count
+  (F4/F6), forwarded-idempotency dedup cache (F8). The phase4_chain verifier is
+  unchanged (only its consumers were hardened).
 - Multi-node / live-network replication tests require external infra and are not
   exercised here.
