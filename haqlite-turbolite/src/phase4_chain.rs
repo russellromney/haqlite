@@ -279,7 +279,13 @@ mod tests {
 
     /// Build a valid chain of `n` deltas anchored at `base_ck`,
     /// starting at seq `start`. Returns the deltas in order.
-    fn valid_chain(start: u64, n: u64, epoch: u64, writer: &str, base_ck: Vec<u8>) -> Vec<DiscoveredDelta> {
+    fn valid_chain(
+        start: u64,
+        n: u64,
+        epoch: u64,
+        writer: &str,
+        base_ck: Vec<u8>,
+    ) -> Vec<DiscoveredDelta> {
         let mut out = Vec::new();
         let mut prev = base_ck;
         for i in 0..n {
@@ -441,7 +447,10 @@ mod tests {
         let r1 = filter_and_verify(vec![chain[0].clone(), chain[1].clone()], &cur0)
             .expect("no equivocation");
         assert_eq!(r1.break_reason, ChainBreak::Ok);
-        assert_eq!(r1.verified.iter().map(|d| d.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            r1.verified.iter().map(|d| d.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
 
         // Caller advances the working cursor per the contract.
         let last = r1.verified.last().unwrap();
@@ -455,7 +464,10 @@ mod tests {
             ChainBreak::Ok,
             "poll 2 verifies only because the anchor advanced to delta-2's checksum"
         );
-        assert_eq!(r2.verified.iter().map(|d| d.seq).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(
+            r2.verified.iter().map(|d| d.seq).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
     }
 
     /// If the caller (wrongly) leaves the anchor at the base for poll 2,

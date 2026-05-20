@@ -276,10 +276,24 @@ async fn publish_manifest(
             }
 
             if let Some(current) = store.get(key).await? {
+                // A same-writer winner is only authoritative if it is at least
+                // as fresh as ours. A restarted instance reusing its writer_id
+                // can otherwise adopt a stale, lower-epoch manifest it raced
+                // against (F10). Require current.epoch >= manifest.epoch.
                 if current.writer_id == manifest.writer_id {
+                    if current.epoch < manifest.epoch {
+                        return Err(anyhow!(
+                            "manifest CAS conflict for '{}' won by same writer '{}' at stale epoch {} < ours {}",
+                            key,
+                            current.writer_id,
+                            current.epoch,
+                            manifest.epoch
+                        ));
+                    }
                     tracing::debug!(
                         key,
                         winner_version = current.version,
+                        winner_epoch = current.epoch,
                         writer_id = %current.writer_id,
                         "manifest create lost race to same writer; treating existing manifest as authoritative"
                     );
@@ -463,12 +477,9 @@ impl TurboliteWalReplicator {
         if rev != 0 {
             // Only the first writer to latch wins; concurrent publishes
             // converge on the same (monotonic) fence revision anyway.
-            let _ = self.term_epoch.compare_exchange(
-                0,
-                rev,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            let _ = self
+                .term_epoch
+                .compare_exchange(0, rev, Ordering::AcqRel, Ordering::Acquire);
         }
         self.term_epoch.load(Ordering::Acquire)
     }
@@ -544,8 +555,21 @@ impl TurboliteWalReplicator {
         // untouched (term_epoch == 0 when no fence is wired).
         let term_epoch = self.current_term_epoch();
         if term_epoch > 0 {
-            let base_seq =
-                exact_replay_cursor.unwrap_or_else(|| self.vfs.manifest().change_counter);
+            // Anchor the base at the same seam followers anchor deltas at.
+            // Followers advance their delta cursor on cursor.last_applied_seq,
+            // so when the persisted replay cursor is populated the base MUST be
+            // anchored there too — not at change_counter, which can diverge and
+            // open a base/delta seam gap or overlap (F7). The change_counter
+            // fallback only applies when there is no populated replay cursor.
+            let base_seq = exact_replay_cursor.unwrap_or_else(|| {
+                let manifest = self.vfs.manifest();
+                let cursor = &manifest.cursor;
+                if cursor.last_applied_seq > 0 || !cursor.base_object_checksum.is_empty() {
+                    cursor.last_applied_seq
+                } else {
+                    manifest.change_counter
+                }
+            });
             // Adopt the replayed-base payload so the cursor stamp lands
             // on the just-published page-group set.
             self.vfs
@@ -793,10 +817,14 @@ impl TurboliteWalReplicator {
         };
         let replay_start_seq = cursor.last_applied_seq;
 
-        let prepared =
-            prepare_phase4_replay(self.walrust_storage.as_ref(), &self.walrust_prefix, name, &cursor)
-                .await
-                .map_err(|e| anyhow!("phase4 prepare replay for '{}': {}", name, e))?;
+        let prepared = prepare_phase4_replay(
+            self.walrust_storage.as_ref(),
+            &self.walrust_prefix,
+            name,
+            &cursor,
+        )
+        .await
+        .map_err(|e| anyhow!("phase4 prepare replay for '{}': {}", name, e))?;
 
         // A forked or gapped chain means the verifiable WAL tail is a strict
         // prefix of the real history. A read-only follower may apply that

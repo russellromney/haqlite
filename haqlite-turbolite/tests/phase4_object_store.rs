@@ -84,7 +84,17 @@ mod object_store {
 
         // Writer ships a 3-delta chain to the real store.
         let c1 = changeset(1, 1, 0x11);
-        let ck1 = publish(storage.as_ref(), db, 1, epoch, writer, base_anchor.clone(), 4, &c1).await;
+        let ck1 = publish(
+            storage.as_ref(),
+            db,
+            1,
+            epoch,
+            writer,
+            base_anchor.clone(),
+            4,
+            &c1,
+        )
+        .await;
         let c2 = changeset(2, 2, 0x22);
         let ck2 = publish(storage.as_ref(), db, 2, epoch, writer, ck1.to_vec(), 5, &c2).await;
         let c3 = changeset(3, 3, 0x33);
@@ -103,7 +113,11 @@ mod object_store {
         let result = filter_and_verify(deltas, &cursor).expect("no equivocation");
         assert_eq!(result.break_reason, ChainBreak::Ok);
         let seqs: Vec<u64> = result.verified.iter().map(|d| d.seq).collect();
-        assert_eq!(seqs, vec![1, 2, 3], "real-store listing yields the full chain in order");
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3],
+            "real-store listing yields the full chain in order"
+        );
         assert_eq!(result.verified[0].payload.prev_checksum, base_anchor);
         assert_eq!(result.verified.last().unwrap().payload.end_page_count, 6);
     }
@@ -123,7 +137,17 @@ mod object_store {
         let db = "objdb";
 
         let c1 = changeset(1, 1, 0x11);
-        publish(storage.as_ref(), db, 1, 5, "writer-A", vec![0xBB; 32], 4, &c1).await;
+        publish(
+            storage.as_ref(),
+            db,
+            1,
+            5,
+            "writer-A",
+            vec![0xBB; 32],
+            4,
+            &c1,
+        )
+        .await;
         let c2 = changeset(2, 2, 0x22);
         let ck1 = external_delta::checksum(
             &external_delta::encode(&DeltaPayloadV1 {

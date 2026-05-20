@@ -949,6 +949,25 @@ impl HaQLiteInner {
         })
     }
 
+    /// Open a fresh writable connection for an external leader session
+    /// (hrana). Routes through the VFS-backed connection opener when a sibling
+    /// crate installed one, so the session and the native write path see the
+    /// same VFS bytes; otherwise opens a raw read-write connection on the OS
+    /// path. The fence/demotion authorizer still applies on lease loss.
+    fn open_leader_session_conn(&self) -> Result<rusqlite::Connection, HaQLiteError> {
+        if let Some(ref opener) = self.connection_opener {
+            return opener();
+        }
+
+        rusqlite::Connection::open_with_flags(
+            &self.db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| {
+            HaQLiteError::DatabaseError(format!("Failed to open leader session connection: {e}"))
+        })
+    }
+
     pub(crate) fn get_conn(
         &self,
     ) -> std::result::Result<Option<Arc<Mutex<rusqlite::Connection>>>, HaQLiteError> {
@@ -1349,6 +1368,37 @@ impl HaQLite {
     /// Get the current role of this node.
     pub fn role(&self) -> Option<Role> {
         self.inner.current_role()
+    }
+
+    /// Open a connection for an external session (e.g. the hrana HTTP API),
+    /// resolving the role ONCE and routing through the VFS opener so reads see
+    /// the same replay-gated bytes as the native query path.
+    ///
+    /// Returns the resolved role alongside the connection so the caller can
+    /// decide writability from the SAME role snapshot used to open it — no
+    /// per-request re-resolution. Followers/clients get a read-only connection
+    /// opened via the follower VFS read opener (its xLock(SHARED) takes the
+    /// replay gate, blocking torn reads against an in-flight materialize).
+    /// Leaders/local get a writable VFS-routed connection. A lease lost after
+    /// this snapshot is still fenced by the connection-level authorizer
+    /// installed on demotion (F9 / F1).
+    pub fn open_session_connection(
+        &self,
+    ) -> std::result::Result<(Option<Role>, rusqlite::Connection), HaQLiteError> {
+        let role = self.inner.current_role();
+        match role {
+            Some(Role::Follower) | Some(Role::Client) => {
+                let conn = self.inner.open_follower_read_conn()?;
+                Ok((role, conn))
+            }
+            Some(Role::Leader) | None => {
+                let conn = self.inner.open_leader_session_conn()?;
+                Ok((role, conn))
+            }
+            Some(Role::LatentWriter) => Err(HaQLiteError::ConfigurationError(
+                "LatentWriter mode does not support external session connections".into(),
+            )),
+        }
     }
 
     /// Get the underlying rusqlite connection.
