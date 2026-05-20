@@ -573,6 +573,40 @@ mod tests {
         assert_eq!(prep.new_last_applied_seq, 3);
     }
 
+    /// Shape: end_page_count can DECREASE across deltas (VACUUM /
+    /// truncate). The last applied delta's end_page_count must win, so a
+    /// shrinking workload sets the smaller target page count — the value
+    /// turbolite's set_target_page_count truncates the file to.
+    #[tokio::test]
+    async fn prepare_phase4_replay_shrink_uses_last_delta_end_page_count() {
+        let storage = MemoryStorage::default();
+        let base_anchor = vec![0xBB; 32];
+        let writer = "leader-A";
+
+        // Grow to 1000 pages, then a VACUUM-shaped delta shrinks to 100.
+        let c1 = changeset(1, 0, 1, 0x11);
+        let ck1 =
+            publish_phase4_delta(&storage, 1, 5, writer, base_anchor.clone(), 1000, &c1).await;
+        let c2 = changeset(2, 0, 1, 0x22);
+        let _ = publish_phase4_delta(&storage, 2, 5, writer, ck1.to_vec(), 100, &c2).await;
+
+        let cursor = FollowerCursor {
+            last_applied_seq: 0,
+            base_object_checksum: base_anchor,
+            epoch: 5,
+            writer_id: writer.to_string(),
+        };
+        let prep = prepare_phase4_replay(&storage, "prefix/", "db", &cursor)
+            .await
+            .expect("prepare");
+        assert_eq!(prep.break_reason, ChainBreak::Ok);
+        assert_eq!(
+            prep.prepared.target_page_count,
+            Some(100),
+            "shrink: last delta's end_page_count wins (1000 -> 100)"
+        );
+    }
+
     #[tokio::test]
     async fn prepare_phase4_replay_stops_at_chain_break_and_applies_prefix() {
         let storage = MemoryStorage::default();

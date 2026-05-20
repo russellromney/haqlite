@@ -11,8 +11,10 @@ use hadb::{FollowerBehavior, HaMetrics, Replicator};
 use hadb_storage::StorageBackend;
 use turbodb::ManifestStore;
 
+use crate::phase4_chain::FollowerCursor;
 use crate::replay_sink::{
-    apply_prepared_page_replay, prepare_page_replay, HaqliteTurboliteReplaySink,
+    apply_prepared_page_replay, prepare_page_replay, prepare_phase4_replay,
+    HaqliteTurboliteReplaySink,
 };
 
 enum ApplyOutcome {
@@ -106,6 +108,19 @@ impl TurboliteFollowerBehavior {
         let decoded_manifest = turbolite::tiered::TurboliteVfs::decode_manifest_bytes(payload)
             .map_err(|e| anyhow!("turbolite decode_manifest_bytes failed: {}", e))?;
         let continuous = self.requires_delta_replay();
+
+        // Phase 004: when the base manifest carries a populated cursor
+        // anchor, the writer is on the fenced TLM_DELTA contract — use
+        // the phase-4 follower path. An empty anchor means a pre-cursor
+        // base (phase-3 publisher), so fall back to the .hadbp path.
+        // This gate keeps the shipped phase-3 failover behavior intact
+        // until the writer starts populating the cursor (step 7).
+        if continuous && !decoded_manifest.cursor.base_object_checksum.is_empty() {
+            return self
+                .apply_manifest_payload_phase4(db_name, decoded_manifest, payload)
+                .await;
+        }
+
         if !continuous && decoded_manifest.version <= current_version {
             return Ok(ApplyOutcome::Noop);
         }
@@ -233,6 +248,156 @@ impl TurboliteFollowerBehavior {
         })
         .await
         .map_err(|e| anyhow!("turbolite apply task panicked: {}", e))??;
+
+        Ok(result)
+    }
+
+    /// Phase 004 follower apply path (fenced TLM_DELTA contract).
+    ///
+    /// Working-cursor model: the follower's replay position lives in the
+    /// turbolite VFS local manifest's `cursor` field and **advances** as
+    /// deltas are applied. We adopt the published base's cursor (and
+    /// re-materialize the base) only when the base advances the floor
+    /// beyond our working position — a higher epoch (promotion), a
+    /// higher folded-in seq (new checkpoint), or a higher manifest
+    /// version. Otherwise we keep advancing the local working cursor and
+    /// list deltas after it, so a same-base poll picks up new deltas
+    /// without re-materializing.
+    async fn apply_manifest_payload_phase4(
+        &self,
+        db_name: &str,
+        decoded_manifest: turbolite::tiered::Manifest,
+        payload: &[u8],
+    ) -> Result<ApplyOutcome> {
+        let storage = self
+            .walrust_storage
+            .as_ref()
+            .ok_or_else(|| anyhow!("phase4 follower '{}' missing walrust storage", db_name))?
+            .clone();
+        let prefix = self
+            .walrust_prefix
+            .as_ref()
+            .ok_or_else(|| anyhow!("phase4 follower '{}' missing walrust prefix", db_name))?
+            .clone();
+
+        let base_cursor = decoded_manifest.cursor.clone();
+        let base_writer_id = decoded_manifest.writer_id.clone();
+        let local = self.vfs.manifest();
+        let local_cursor = local.cursor.clone();
+
+        // Adopt the published base (re-materialize) only when it moves
+        // the floor past our working position.
+        let adopt_base = base_cursor.epoch > local_cursor.epoch
+            || base_cursor.last_applied_seq > local_cursor.last_applied_seq
+            || decoded_manifest.version > local.version;
+        let working = if adopt_base {
+            base_cursor.clone()
+        } else {
+            local_cursor.clone()
+        };
+        let materialize_base = adopt_base;
+
+        let follower_cursor = FollowerCursor {
+            last_applied_seq: working.last_applied_seq,
+            base_object_checksum: working.base_object_checksum.clone(),
+            epoch: working.epoch,
+            writer_id: base_writer_id,
+        };
+        let replay_start_seq = working.last_applied_seq;
+        let working_epoch = working.epoch;
+
+        // Storage I/O (list + fetch + verify) before the blocking apply.
+        let prepared = prepare_phase4_replay(storage.as_ref(), &prefix, db_name, &follower_cursor)
+            .await
+            .map_err(|e| anyhow!("phase4 prepare replay for '{}': {}", db_name, e))?;
+
+        // A chain break is not an error — the verified prefix still
+        // applies — but a gap/fork means the follower has NOT fully
+        // caught up this poll. Surface it so ops can see a stuck chain.
+        if !matches!(prepared.break_reason, crate::phase4_chain::ChainBreak::Ok) {
+            tracing::warn!(
+                "Follower '{}': phase4 chain stopped early at {:?}; applying verified prefix and retrying next poll",
+                db_name,
+                prepared.break_reason,
+            );
+        }
+
+        let vfs = self.vfs.clone();
+        let cache_path = self.vfs.cache_file_path();
+        let gate = self.vfs.replay_gate();
+        let payload_owned = payload.to_vec();
+        let db_name_owned = db_name.to_string();
+        let replay_base_pending_publish = self.replay_base_pending_publish.clone();
+        let replay_base_seq = self.replay_base_seq.clone();
+        let decoded_for_materialize = decoded_manifest.clone();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<ApplyOutcome> {
+            let _gate = loop {
+                if let Some(guard) = gate.try_write() {
+                    break guard;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+
+            if materialize_base {
+                match vfs
+                    .shared_state()
+                    .materialize_manifest_to_file(&decoded_for_materialize, &cache_path)
+                {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(ApplyOutcome::TransientRetry(format!(
+                            "missing page-group during phase4 materialize for '{}': {}",
+                            db_name_owned, e
+                        )));
+                    }
+                    Err(e) => return Err(anyhow!("turbolite phase4 materialize failed: {}", e)),
+                }
+                vfs.set_manifest_bytes(&payload_owned)
+                    .map_err(|e| anyhow!("turbolite phase4 set_manifest_bytes failed: {}", e))?;
+                let page_count = vfs.manifest().page_count;
+                vfs.sync_after_external_restore(page_count);
+            }
+
+            let new_anchor = prepared.new_anchor.clone();
+            let new_last_applied_seq = prepared.new_last_applied_seq;
+
+            let handle = vfs
+                .begin_replay_after(replay_start_seq)
+                .map_err(|e| anyhow!("turbolite phase4 begin_replay failed: {}", e))?;
+            let mut sink = HaqliteTurboliteReplaySink::new_under_external_write(handle);
+            let final_seq = apply_prepared_page_replay(&mut sink, prepared.prepared)?;
+
+            // Advance the persisted working cursor to the last applied
+            // delta's envelope checksum (or leave it unchanged if nothing
+            // applied). This is the load-bearing FollowerCursor invariant.
+            if new_last_applied_seq > replay_start_seq {
+                vfs.update_replay_cursor(turbolite::tiered::ReplayCursor {
+                    last_applied_seq: new_last_applied_seq,
+                    base_object_checksum: new_anchor,
+                    epoch: working_epoch,
+                })
+                .map_err(|e| anyhow!("turbolite phase4 update_replay_cursor failed: {}", e))?;
+
+                if let Some(pending) = replay_base_pending_publish {
+                    pending.store(true, Ordering::Release);
+                }
+                if let Some(seq) = replay_base_seq {
+                    seq.fetch_max(new_last_applied_seq, Ordering::AcqRel);
+                }
+            }
+
+            tracing::debug!(
+                "Follower '{}': phase4 replayed {} -> {} (epoch {})",
+                db_name_owned,
+                replay_start_seq,
+                final_seq,
+                working_epoch,
+            );
+            Ok(ApplyOutcome::Applied(new_last_applied_seq))
+        })
+        .await
+        .map_err(|e| anyhow!("turbolite phase4 apply task panicked: {}", e))??;
 
         Ok(result)
     }
