@@ -119,43 +119,49 @@ empty-anchor) is sound and intentionally left unchanged — the bugs are in the
 - **Fix:** also require `current.epoch >= manifest.epoch` (and ideally that the
   decoded cursor is not behind ours).
 
-### F11 — [High] Base SingleWriter replication ships changesets with no leader epoch — **Partial**
-- `src/database.rs` SingleWriter path, `src/ops.rs:50`
+### F11 — [High] Base SingleWriter replication ships changesets with no leader epoch — **Fixed**
+- `src/database.rs` SingleWriter path, `src/ops.rs:50`, `src/epoch_fence.rs`,
+  `src/replicator.rs`, `src/follower_behavior.rs`
 - Changesets are keyed only by `seq` with no leader epoch, so combined with a
   lease/TOCTOU race a former leader's changesets are accepted on key-name seq
   alone.
-- **Fix:** plumb the `hadb` fence/epoch into the SingleWriter publish path,
-  stamp it on each changeset, and reject (follower-side) any changeset whose
-  epoch is below the current lease epoch. Depends on the `hadb` fencing-token
-  contract (`fence_accepts`, strictly increasing) added in that repo.
-- **Status — Partial (one line):** the epoch-stamped, writer-fenced contract is
-  fully realized on the phase-4 TLM_DELTA path (`DeltaPayloadV1` carries
-  `epoch` + `writer_id`; `phase4_chain::filter_and_verify` rejects wrong-epoch
-  / forked deltas; the leader stamps the term epoch via `set_phase4_base`), so
-  the fenced shipping path enforces F11. The remaining gap is the **legacy base
-  `.hadbp` SingleWriter path** (`SqliteReplicator` + `SqliteFollowerBehavior`
-  shipping `physical::PhysicalChangeset` keyed by seq): the HADBP header has no
-  epoch field, so stamping + follower-side `fence_accepts(current, incoming)`
-  rejection there is a `walrust` HADBP wire-format change (plus a follower
-  `pull_incremental` epoch gate), which is out of scope for a single,
-  test-green haqlite-side PR. Implementing it in-repo would require changing the
-  on-disk changeset format and is deferred; the safe interim posture is to run
-  the fenced phase-4 path (which is what the turbolite builder wires when a
-  lease fence is present) and to fence the underlying object-store writes via
-  the `AtomicFence` storage wrapper. Durable follow-up: add an `epoch` field to
-  the HADBP `PhysicalHeader`, stamp the leader term epoch on publish, and gate
-  the legacy follower pull on `fence_accepts`.
+- **Fix:** the leader's lease epoch (the lease store etag parsed to `u64`,
+  monotonic across CAS takeovers — the same revision `hadb`'s fence uses) is
+  published into an `AtomicFence` on every claim/renew via
+  `CoordinatorConfig.fence_writer`. The base `.hadbp` SingleWriter publish path
+  (`SqliteReplicator::sync`) reads that epoch **at publish time** and stamps it
+  into a per-database `_epoch` marker object that ships next to the changesets
+  (`{prefix}{db}/_epoch`; no `{GGGG}/` segment, so changeset discovery never
+  treats it as a changeset). The follower
+  (`SqliteFollowerBehavior::run_follower_loop` / `catchup_on_promotion`) reads
+  the **stamped** marker — never the live lease — before `pull_incremental`
+  applies, and refuses any epoch strictly below the highest already accepted
+  (`epoch_fence::AppliedEpoch::admit`, strict `<` rejection; equal-or-greater
+  from the same writer is accepted). A demoted leader carries its own
+  now-superseded epoch, so its stale write is fenced. The marker is monotonic
+  (`stamp_leader_epoch` only advances), and the comparison matches
+  `hadb_lease::fence::fence_accepts` exactly (never weakened to `>=`). No fence
+  configured (single-node / legacy DB with no marker) = no stamp and no gate,
+  preserving the prior behavior.
+- This is self-contained on the haqlite side: it needs no HADBP wire-format
+  change (the epoch travels in a sidecar marker, not the changeset header) and
+  no unpublished `hadb` dep. The fenced phase-4 TLM_DELTA path
+  (`DeltaPayloadV1` epoch + `writer_id`; `phase4_chain::filter_and_verify`)
+  continues to enforce F11 independently on its own path; this fix closes the
+  legacy base path that previously had no epoch.
 
 ---
 
 ## Test / build notes
 
 - `cargo build --workspace` green across the whole findings set.
-- F1, F2 fixed earlier in this branch. F3, F4, F5, F6, F7, F8, F9, F10 are
-  fixed here. F11 is Partial (fenced phase-4 path enforces it; the legacy base
-  `.hadbp` path needs a `walrust`/`hadb` wire-format change — see F11).
+- F1, F2 fixed earlier in this branch. F3, F4, F5, F6, F7, F8, F9, F10, F11 are
+  fixed here. F11 closes the legacy base `.hadbp` path with a sidecar `_epoch`
+  marker (no wire-format change); the fenced phase-4 path enforced it already.
 - Unit coverage added/updated: replay_sink first-delta chain-break + page-count
-  (F4/F6), forwarded-idempotency dedup cache (F8). The phase4_chain verifier is
-  unchanged (only its consumers were hardened).
+  (F4/F6), forwarded-idempotency dedup cache (F8), leader-epoch fence
+  stamp/read/gate round-trip — older-epoch rejected, current/newer accepted,
+  equal-epoch-same-writer accepted (F11, `epoch_fence::tests`). The phase4_chain
+  verifier is unchanged (only its consumers were hardened).
 - Multi-node / live-network replication tests require external infra and are not
   exercised here.

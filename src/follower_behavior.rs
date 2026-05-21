@@ -14,6 +14,8 @@ use tokio::sync::watch;
 use hadb::{FollowerBehavior, HaMetrics, Replicator};
 use hadb_storage::StorageBackend;
 
+use crate::epoch_fence::{self, AppliedEpoch};
+
 /// SQLite-specific follower behavior.
 ///
 /// For WAL-based durability (Replicated/Eventual), uses walrust pull_incremental.
@@ -24,6 +26,13 @@ pub struct SqliteFollowerBehavior {
     /// When the coordinator receives a ManifestChanged event, it calls notify_one()
     /// to immediately wake the follower loop instead of waiting for poll interval.
     wakeup: Option<Arc<tokio::sync::Notify>>,
+    /// Highest leader epoch this follower has accepted (F11). Seeded empty;
+    /// advanced as higher-epoch batches apply. A changeset batch stamped with
+    /// an epoch strictly below this mark is a former leader's stale write and
+    /// is refused before `pull_incremental` applies it. Shared as `Arc` so all
+    /// apply paths (`run_follower_loop`, `catchup_on_promotion`) gate on the
+    /// same high-water mark.
+    applied_epoch: Arc<AppliedEpoch>,
 }
 
 /// Verify the changeset checksum chain after `current_seq` before applying it
@@ -113,6 +122,7 @@ impl SqliteFollowerBehavior {
         Self {
             walrust_storage,
             wakeup: None,
+            applied_epoch: Arc::new(AppliedEpoch::new()),
         }
     }
 
@@ -122,6 +132,23 @@ impl SqliteFollowerBehavior {
     pub fn with_wakeup(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
         self.wakeup = Some(notify);
         self
+    }
+
+    /// F11 leader-epoch gate. Reads the per-database `_epoch` marker the leader
+    /// stamped at publish time and refuses to apply when the stamped epoch is
+    /// strictly below the highest epoch this follower has already accepted —
+    /// a former leader's stale changeset. An accepted epoch advances the
+    /// high-water mark. No marker (legacy database / no lease fence) = no gate.
+    ///
+    /// Reads the stamped marker, never the live lease: a demoted leader's
+    /// published batch carries its own superseded epoch, so the follower must
+    /// compare against what travelled with the changesets.
+    async fn gate_leader_epoch(&self, prefix: &str, db_name: &str) -> Result<()> {
+        match epoch_fence::read_leader_epoch(self.walrust_storage.as_ref(), prefix, db_name).await?
+        {
+            Some(epoch) => self.applied_epoch.admit(db_name, epoch),
+            None => Ok(()),
+        }
     }
 }
 
@@ -155,6 +182,15 @@ impl FollowerBehavior for SqliteFollowerBehavior {
                         current_seq,
                     ).await {
                         tracing::error!("Follower '{}': chain verify failed: {}", db_name, e);
+                        caught_up.store(false, Ordering::SeqCst);
+                        metrics.follower_caught_up.store(0, Ordering::Relaxed);
+                        metrics.inc(&metrics.follower_pulls_failed);
+                        continue;
+                    }
+                    // F11: refuse a former leader's stale-epoch changeset before
+                    // applying it. Fail closed (stall, visible) on rejection.
+                    if let Err(e) = self.gate_leader_epoch(prefix, db_name).await {
+                        tracing::error!("Follower '{}': leader-epoch gate rejected: {}", db_name, e);
                         caught_up.store(false, Ordering::SeqCst);
                         metrics.follower_caught_up.store(0, Ordering::Relaxed);
                         metrics.inc(&metrics.follower_pulls_failed);
@@ -206,6 +242,8 @@ impl FollowerBehavior for SqliteFollowerBehavior {
     ) -> Result<()> {
         // F5: fail closed on a forked tail rather than bridging it by content.
         verify_chain_after(self.walrust_storage.as_ref(), prefix, db_name, position).await?;
+        // F11: refuse a former leader's stale-epoch changeset before applying.
+        self.gate_leader_epoch(prefix, db_name).await?;
         let new_seq = walrust::sync::pull_incremental(
             self.walrust_storage.as_ref(),
             prefix,

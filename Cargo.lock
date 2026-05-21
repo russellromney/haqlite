@@ -4213,6 +4213,7 @@ dependencies = [
  "libsqlite3-sys",
  "once_cell",
  "parking_lot",
+ "rand 0.8.6",
  "rayon",
  "rmp-serde",
  "rusqlite",

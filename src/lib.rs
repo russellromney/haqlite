@@ -27,6 +27,7 @@ pub mod cli_config;
 pub mod client;
 pub mod database;
 pub mod env;
+pub mod epoch_fence;
 pub mod error;
 pub mod follower_behavior;
 pub mod forwarding;

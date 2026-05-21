@@ -6,10 +6,13 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
+use hadb_lease::AtomicFence;
 use hadb_storage::StorageBackend;
 use walrust::{ReplicationConfig, SnapshotOwnership, SnapshotSource};
 
 use hadb::Replicator;
+
+use crate::epoch_fence;
 
 /// SQLite replicator wrapping walrust.
 ///
@@ -25,6 +28,13 @@ pub struct SqliteReplicator {
     /// a chain break that `restore()` refused is a hard error rather than a
     /// silent fork merge (F5). Only enable with an explicit fork-ack policy.
     allow_fork_bridge: bool,
+    /// Reader side of the lease fence. When present, the leader stamps its
+    /// current lease epoch into a per-database `_epoch` marker next to the
+    /// changesets it publishes (F11). The follower reads that marker and
+    /// refuses a strictly-lower epoch (a former leader's stale write). `None`
+    /// in single-node / no-lease deployments: the marker is never written and
+    /// the follower never gates, preserving the legacy behavior.
+    fence: Option<AtomicFence>,
 }
 
 /// Guard against `pull_incremental` silently bridging a forked history (F5).
@@ -76,7 +86,17 @@ impl SqliteReplicator {
             inner: walrust::Replicator::new(storage, prefix, config),
             skip_snapshot_on_add: false,
             allow_fork_bridge: false,
+            fence: None,
         }
+    }
+
+    /// Attach the lease fence so each `sync()` stamps the current leader epoch
+    /// into the per-database `_epoch` marker (F11). Pair this with the same
+    /// fence handed to the follower behavior so a former leader's stale
+    /// changesets are rejected on apply.
+    pub fn with_fence(mut self, fence: AtomicFence) -> Self {
+        self.fence = Some(fence);
+        self
     }
 
     /// Skip snapshot upload on `add()`. For SingleWriter+Synchronous where
@@ -289,6 +309,22 @@ impl Replicator for SqliteReplicator {
                 name,
                 frames
             );
+        }
+        // F11: stamp the leader's current lease epoch into the per-database
+        // marker so the follower can fence a former leader's stale changesets.
+        // Read the epoch at publish time and ship it next to the changesets —
+        // a demoted leader carries its own (now-superseded) epoch, never the
+        // live one. No fence configured (single-node) = no marker, no gate.
+        if let Some(fence) = &self.fence {
+            if let Some(epoch) = fence.current() {
+                epoch_fence::stamp_leader_epoch(
+                    self.inner.storage().as_ref(),
+                    self.inner.prefix(),
+                    name,
+                    epoch,
+                )
+                .await?;
+            }
         }
         Ok(())
     }

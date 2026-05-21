@@ -510,6 +510,15 @@ impl HaQLiteBuilder {
         config.lease = Some(lease_cfg);
         config.requested_role = self.role;
 
+        // F11: pair a lease fence so the leader's current lease epoch (the
+        // lease store etag parsed to u64, monotonic across CAS takeovers) is
+        // published into an AtomicFence on every claim/renew. The replicator
+        // reads it at publish time and stamps it onto the per-database marker
+        // it ships next to the changesets; the follower reads that stamp and
+        // refuses a strictly-lower epoch (a former leader's stale write).
+        let (fence, fence_writer) = hadb_lease::AtomicFence::new();
+        config.fence_writer = Some(Arc::new(fence_writer));
+
         let (sync_interval, skip_snapshot) = match walrust_durability {
             hadb::Durability::Replicated(dur) => (dur, false),
             hadb::Durability::Local => (Duration::from_secs(3600), false),
@@ -524,7 +533,8 @@ impl HaQLiteBuilder {
         };
         let replicator = Arc::new(
             SqliteReplicator::new(walrust_storage.clone(), &self.prefix, replication_config)
-                .with_skip_snapshot(skip_snapshot),
+                .with_skip_snapshot(skip_snapshot)
+                .with_fence(fence),
         );
 
         let follower_behavior: Arc<dyn hadb::FollowerBehavior> =
