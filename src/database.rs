@@ -510,6 +510,15 @@ impl HaQLiteBuilder {
         config.lease = Some(lease_cfg);
         config.requested_role = self.role;
 
+        // F11: pair a lease fence so the leader's current lease epoch (the
+        // lease store etag parsed to u64, monotonic across CAS takeovers) is
+        // published into an AtomicFence on every claim/renew. The replicator
+        // reads it at publish time and stamps it onto the per-database marker
+        // it ships next to the changesets; the follower reads that stamp and
+        // refuses a strictly-lower epoch (a former leader's stale write).
+        let (fence, fence_writer) = hadb_lease::AtomicFence::new();
+        config.fence_writer = Some(Arc::new(fence_writer));
+
         let (sync_interval, skip_snapshot) = match walrust_durability {
             hadb::Durability::Replicated(dur) => (dur, false),
             hadb::Durability::Local => (Duration::from_secs(3600), false),
@@ -524,7 +533,8 @@ impl HaQLiteBuilder {
         };
         let replicator = Arc::new(
             SqliteReplicator::new(walrust_storage.clone(), &self.prefix, replication_config)
-                .with_skip_snapshot(skip_snapshot),
+                .with_skip_snapshot(skip_snapshot)
+                .with_fence(fence),
         );
 
         let follower_behavior: Arc<dyn hadb::FollowerBehavior> =
@@ -670,7 +680,50 @@ pub struct HaQLiteInner {
     /// Optional flush callback for tiered storage (turbolite). Set by sibling
     /// crates that inject a custom VFS; base haqlite never sets this.
     pub on_flush: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
+    /// Bounded in-memory dedup of forwarded-write idempotency tokens (F8).
+    /// Maps token -> rows_affected so a retried forwarded write whose response
+    /// was lost returns the cached result instead of double-applying. Bounded
+    /// FIFO; lost across leader restart/failover (at-least-once until a durable
+    /// dedup table lands — see ADVERSARIAL_REVIEW F8).
+    pub forwarded_idempotency: Mutex<ForwardedIdempotencyCache>,
 }
+
+/// Bounded FIFO dedup cache for forwarded-write idempotency tokens (F8).
+pub struct ForwardedIdempotencyCache {
+    map: std::collections::HashMap<String, u64>,
+    order: std::collections::VecDeque<String>,
+    capacity: usize,
+}
+
+impl ForwardedIdempotencyCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get(&self, token: &str) -> Option<u64> {
+        self.map.get(token).copied()
+    }
+
+    fn insert(&mut self, token: &str, rows_affected: u64) {
+        if self.map.contains_key(token) {
+            return;
+        }
+        if self.order.len() >= self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.map.remove(&evicted);
+            }
+        }
+        self.map.insert(token.to_string(), rows_affected);
+        self.order.push_back(token.to_string());
+    }
+}
+
+/// Max forwarded-write idempotency tokens retained in memory per node (F8).
+const FORWARDED_IDEMPOTENCY_CAPACITY: usize = 4096;
 
 impl HaQLiteInner {
     /// Create a new HaQLiteInner with default values for optional fields.
@@ -714,6 +767,9 @@ impl HaQLiteInner {
             connection_opener: None,
             follower_read_connection_opener: None,
             on_flush: None,
+            forwarded_idempotency: Mutex::new(ForwardedIdempotencyCache::new(
+                FORWARDED_IDEMPOTENCY_CAPACITY,
+            )),
         }
     }
 
@@ -949,6 +1005,37 @@ impl HaQLiteInner {
         })
     }
 
+    /// Open a fresh writable connection for an external leader session
+    /// (hrana). Routes through the VFS-backed connection opener when a sibling
+    /// crate installed one, so the session and the native write path see the
+    /// same VFS bytes; otherwise opens a raw read-write connection on the OS
+    /// path. The fence/demotion authorizer still applies on lease loss.
+    fn open_leader_session_conn(&self) -> Result<rusqlite::Connection, HaQLiteError> {
+        if let Some(ref opener) = self.connection_opener {
+            return opener();
+        }
+
+        rusqlite::Connection::open_with_flags(
+            &self.db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| {
+            HaQLiteError::DatabaseError(format!("Failed to open leader session connection: {e}"))
+        })
+    }
+
+    /// Look up a cached forwarded-write result by idempotency token (F8).
+    pub(crate) fn lookup_idempotent_result(&self, token: &str) -> Option<u64> {
+        self.forwarded_idempotency.lock().get(token)
+    }
+
+    /// Record a forwarded-write result under its idempotency token (F8).
+    pub(crate) fn record_idempotent_result(&self, token: &str, rows_affected: u64) {
+        self.forwarded_idempotency
+            .lock()
+            .insert(token, rows_affected);
+    }
+
     pub(crate) fn get_conn(
         &self,
     ) -> std::result::Result<Option<Arc<Mutex<rusqlite::Connection>>>, HaQLiteError> {
@@ -1038,6 +1125,9 @@ impl HaQLite {
             connection_opener: None,
             follower_read_connection_opener: None,
             on_flush: None,
+            forwarded_idempotency: Mutex::new(ForwardedIdempotencyCache::new(
+                FORWARDED_IDEMPOTENCY_CAPACITY,
+            )),
         });
 
         // Apply custom authorizer (unfenced) on initial connection.
@@ -1349,6 +1439,37 @@ impl HaQLite {
     /// Get the current role of this node.
     pub fn role(&self) -> Option<Role> {
         self.inner.current_role()
+    }
+
+    /// Open a connection for an external session (e.g. the hrana HTTP API),
+    /// resolving the role ONCE and routing through the VFS opener so reads see
+    /// the same replay-gated bytes as the native query path.
+    ///
+    /// Returns the resolved role alongside the connection so the caller can
+    /// decide writability from the SAME role snapshot used to open it — no
+    /// per-request re-resolution. Followers/clients get a read-only connection
+    /// opened via the follower VFS read opener (its xLock(SHARED) takes the
+    /// replay gate, blocking torn reads against an in-flight materialize).
+    /// Leaders/local get a writable VFS-routed connection. A lease lost after
+    /// this snapshot is still fenced by the connection-level authorizer
+    /// installed on demotion (F9 / F1).
+    pub fn open_session_connection(
+        &self,
+    ) -> std::result::Result<(Option<Role>, rusqlite::Connection), HaQLiteError> {
+        let role = self.inner.current_role();
+        match role {
+            Some(Role::Follower) | Some(Role::Client) => {
+                let conn = self.inner.open_follower_read_conn()?;
+                Ok((role, conn))
+            }
+            Some(Role::Leader) | None => {
+                let conn = self.inner.open_leader_session_conn()?;
+                Ok((role, conn))
+            }
+            Some(Role::LatentWriter) => Err(HaQLiteError::ConfigurationError(
+                "LatentWriter mode does not support external session connections".into(),
+            )),
+        }
     }
 
     /// Get the underlying rusqlite connection.
@@ -1690,9 +1811,13 @@ impl HaQLite {
         sql: &str,
         params: &[SqlValue],
     ) -> std::result::Result<u64, HaQLiteError> {
+        // F8: generate the idempotency token ONCE so every retry below carries
+        // the same token. A committed-but-response-lost write is then deduped
+        // by the leader on replay instead of double-applying.
         let body = forwarding::ForwardedExecute {
             sql: sql.to_string(),
             params: params.to_vec(),
+            idempotency_token: Some(uuid::Uuid::new_v4().to_string()),
         };
 
         let backoffs = [
@@ -1882,6 +2007,9 @@ pub async fn open_with_coordinator(
         connection_opener,
         follower_read_connection_opener,
         on_flush,
+        forwarded_idempotency: Mutex::new(ForwardedIdempotencyCache::new(
+            FORWARDED_IDEMPOTENCY_CAPACITY,
+        )),
     });
 
     // bootstrap_conn was dropped above. For leader, reopen via the
@@ -2127,6 +2255,35 @@ mod send_tests {
         let params = vec![SqlValue::Integer(1)];
         let fut = db.execute_async("SELECT 1", &params);
         assert_send(&fut);
+    }
+}
+
+#[cfg(test)]
+mod forwarded_idempotency_tests {
+    use super::*;
+
+    /// A repeated token returns the cached result (dedup) and does not change it.
+    #[test]
+    fn cache_dedups_repeated_token() {
+        let mut cache = ForwardedIdempotencyCache::new(8);
+        assert_eq!(cache.get("t1"), None);
+        cache.insert("t1", 5);
+        assert_eq!(cache.get("t1"), Some(5));
+        // Re-insert with a different value must not overwrite a recorded token.
+        cache.insert("t1", 99);
+        assert_eq!(cache.get("t1"), Some(5), "first recorded result wins");
+    }
+
+    /// FIFO eviction once capacity is exceeded.
+    #[test]
+    fn cache_evicts_oldest_at_capacity() {
+        let mut cache = ForwardedIdempotencyCache::new(2);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        cache.insert("c", 3); // evicts "a"
+        assert_eq!(cache.get("a"), None, "oldest token evicted");
+        assert_eq!(cache.get("b"), Some(2));
+        assert_eq!(cache.get("c"), Some(3));
     }
 }
 

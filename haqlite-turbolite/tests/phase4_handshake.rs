@@ -167,9 +167,10 @@ async fn writer_base_anchor_links_to_follower_chain() {
     };
 
     // The chain verifies from the base anchor through both deltas.
-    let deltas = walrust::list_delta_envelopes_after(&storage, "wal/", "db", cursor.last_applied_seq)
-        .await
-        .expect("list deltas");
+    let deltas =
+        walrust::list_delta_envelopes_after(&storage, "wal/", "db", cursor.last_applied_seq)
+            .await
+            .expect("list deltas");
     let result = filter_and_verify(deltas, &cursor).expect("no equivocation");
     assert_eq!(result.break_reason, ChainBreak::Ok);
     let seqs: Vec<u64> = result.verified.iter().map(|d| d.seq).collect();

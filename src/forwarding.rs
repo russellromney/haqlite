@@ -69,6 +69,14 @@ impl SqlValue {
 pub(crate) struct ForwardedExecute {
     pub sql: String,
     pub params: Vec<SqlValue>,
+    /// Client-generated idempotency token, generated ONCE per logical write
+    /// and reused across forwarding retries (F8). The leader records applied
+    /// tokens and returns the cached result on a replay, so a committed-but-
+    /// response-lost write is not applied twice. Optional for wire-compat with
+    /// older clients (`#[serde(default)]`); a `None` token gets at-most-once
+    /// best-effort with no dedup.
+    #[serde(default)]
+    pub idempotency_token: Option<String>,
 }
 
 /// Response body for forwarded execute calls.
@@ -123,6 +131,33 @@ pub(crate) async fn handle_forwarded_execute(
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let conn = conn_arc.lock();
 
+    // Re-check leadership UNDER the connection lock. The role can flip
+    // (demotion / lease loss) between the check above and acquiring the
+    // lock; without this re-check a write admitted while leader could
+    // commit after demotion. The read-only authorizer installed on
+    // demotion only affects statements prepared *after* it is set, so this
+    // lock-held re-check is what actually fences the forwarded-write path.
+    if state.inner.current_role() != Some(Role::Leader) {
+        return Err(StatusCode::MISDIRECTED_REQUEST);
+    }
+
+    // F8: idempotent retry. A token replay means the client retried after a
+    // committed-but-lost response — return the cached row count instead of
+    // re-executing. The dedup map is consulted and updated UNDER the same
+    // connection lock that serializes execution, so the check + execute +
+    // record is atomic against concurrent forwarded writes. NOTE: this dedup
+    // is bounded and in-memory, so it is at-least-once across a leader restart
+    // / failover (the cache is lost). A durable dedup table written in the
+    // same SQLite transaction is the follow-up; see ADVERSARIAL_REVIEW F8.
+    if let Some(token) = req.idempotency_token.as_deref() {
+        if let Some(cached) = state.inner.lookup_idempotent_result(token) {
+            tracing::debug!(token, cached, "forwarded execute deduped (cached replay)");
+            return Ok(Json(ExecuteResult {
+                rows_affected: cached,
+            }));
+        }
+    }
+
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = req
         .params
         .iter()
@@ -133,15 +168,19 @@ pub(crate) async fn handle_forwarded_execute(
         tracing::error!("Forwarded execute failed: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    let rows_affected = rows_affected as u64;
+
+    if let Some(token) = req.idempotency_token.as_deref() {
+        state.inner.record_idempotent_result(token, rows_affected);
+    }
+
     tracing::debug!(
         rows_affected,
         sql = %req.sql,
         "leader handled forwarded execute"
     );
 
-    Ok(Json(ExecuteResult {
-        rows_affected: rows_affected as u64,
-    }))
+    Ok(Json(ExecuteResult { rows_affected }))
 }
 
 /// Request body for forwarded query calls.

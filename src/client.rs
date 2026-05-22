@@ -183,9 +183,13 @@ impl HaQLiteClient {
     /// Always forwards to the leader, even in read-replica mode.
     /// Returns an error if no leader is available (e.g. `read_replica_only`).
     pub async fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        // F8: one idempotency token per logical write. HaClient::forward
+        // retries internally and reuses this same body, so the leader dedups a
+        // committed-but-response-lost write instead of double-applying.
         let body = forwarding::ForwardedExecute {
             sql: sql.to_string(),
             params: params.to_vec(),
+            idempotency_token: Some(uuid::Uuid::new_v4().to_string()),
         };
 
         let result: forwarding::ExecuteResult =

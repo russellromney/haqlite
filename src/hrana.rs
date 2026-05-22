@@ -35,7 +35,6 @@ pub struct HranaState {
 /// Write forwarding is not supported through hrana — followers reject writes
 /// via `is_writable()`. Use haqlite's native `execute()` for write forwarding.
 pub struct HaqliteHranaBackend {
-    db_path: PathBuf,
     db: Arc<HaQLite>,
     secret: Option<String>,
 }
@@ -58,35 +57,34 @@ impl HranaBackend for HaqliteHranaBackend {
     }
 
     fn connection(&self, _database_id: &str) -> Result<ConnectionInfo, HranaError> {
-        let role = self.db.role();
-        let flags = match role {
-            Some(Role::Leader) | None => {
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            }
-            Some(Role::Follower) | Some(Role::Client) => {
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            }
-            Some(Role::LatentWriter) => {
-                return Err(HranaError {
-                    message: "LatentWriter mode not yet implemented in hrana".to_string(),
-                    code: "INTERNAL".to_string(),
-                });
-            }
-        };
-
-        let conn = rusqlite::Connection::open_with_flags(&self.db_path, flags).map_err(|e| {
-            HranaError {
-                message: format!("Failed to open connection: {e}"),
+        // Resolve the role ONCE and route through the VFS opener so follower
+        // reads take the replay gate (no torn reads against an in-flight
+        // materialize) and leader writes use the same VFS bytes as the native
+        // path. Opening directly on the OS path bypassed the gate (F9).
+        //
+        // A demotion that races this snapshot still fences: follower
+        // connections carry the read-only authorizer, and the shared
+        // connection's fence authorizer rejects writes on lease loss.
+        let (role, conn) = self.db.open_session_connection().map_err(|e| match e {
+            crate::error::HaQLiteError::ConfigurationError(msg) => HranaError {
+                message: msg,
                 code: "INTERNAL".to_string(),
-            }
+            },
+            other => HranaError {
+                message: format!("Failed to open connection: {other}"),
+                code: "INTERNAL".to_string(),
+            },
         })?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
-            .map_err(|e| HranaError {
-                message: format!("PRAGMA journal_mode failed: {e}"),
-                code: "INTERNAL".to_string(),
-            })?;
+
+        // Followers must not flip the shared journaling mode; only enforce WAL
+        // for the writable leader/local path.
+        if matches!(role, Some(Role::Leader) | None) {
+            conn.execute_batch("PRAGMA journal_mode=WAL;")
+                .map_err(|e| HranaError {
+                    message: format!("PRAGMA journal_mode failed: {e}"),
+                    code: "INTERNAL".to_string(),
+                })?;
+        }
 
         Ok(ConnectionInfo {
             conn: Arc::new(Mutex::new(conn)),
@@ -105,16 +103,15 @@ impl HranaBackend for HaqliteHranaBackend {
 /// into the main application router.
 pub fn build_hrana_router(
     db: Arc<HaQLite>,
-    db_path: PathBuf,
+    // Connections now route through the database's VFS opener (so reads take
+    // the replay gate), so the raw OS path is no longer opened here. Kept in
+    // the signature for caller compatibility.
+    _db_path: PathBuf,
     secret: Option<String>,
 ) -> axum::Router {
     let config = HranaConfig::default();
     let state = Arc::new(HranaState {
-        backend: HaqliteHranaBackend {
-            db_path,
-            db,
-            secret,
-        },
+        backend: HaqliteHranaBackend { db, secret },
         sessions: SessionManager::new(&config),
         config,
     });

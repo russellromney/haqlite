@@ -1691,7 +1691,8 @@ async fn singlewriter_promotion_publishes_usable_base() {
         // the production follower treats that as a transient and retries
         // on the next poll. Mirror that here — a materialize error means
         // "not ready yet", not a hard failure.
-        let published_count = (materialized_manifest_count(&follower.vfs, &m, "t").await).unwrap_or(0);
+        let published_count =
+            (materialized_manifest_count(&follower.vfs, &m, "t").await).unwrap_or(0);
         if m.version > pre_manifest.version && published_count >= 1 {
             break bytes;
         }

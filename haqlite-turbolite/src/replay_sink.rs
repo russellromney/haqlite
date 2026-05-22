@@ -92,7 +92,20 @@ pub(crate) async fn prepare_page_replay(
         },
         None => None,
     };
-    let mut base_file_checksum_required = expected_prev_checksum.is_none();
+    // Only legitimate when there is no prior changeset object: the first delta
+    // then chains from the materialized base file, validated separately via
+    // validate_base_checksum. When a prior changeset exists this stays false
+    // and the in-loop checksum chain is the sole authority.
+    let base_file_checksum_required = expected_prev_checksum.is_none();
+    // Post-commit page count per changeset, mirroring phase-4's
+    // end_page_count: the LAST applied changeset's value is the target
+    // file size. Page 1's SQLite header is the authoritative DB size when
+    // the changeset touches it (shrink/grow both update it); otherwise the
+    // count carries forward but is raised to the highest page id written so
+    // an append-only changeset still grows the file. Tracking it per
+    // changeset (not as a global last-page-1 sighting) prevents a later
+    // changeset that omits page 1 from leaving stale trailing pages (F6).
+    let mut running_page_count: Option<u64> = None;
     let mut target_page_count = None;
     for file in files {
         let data = storage
@@ -118,27 +131,44 @@ pub(crate) async fn prepare_page_replay(
                 changeset.header.seq
             ));
         }
+        // A prior changeset object exists (expected_prev_checksum is Some),
+        // so the chain is authoritative: a mismatch is a real break and must
+        // hard-error — including at the first delta after the cursor. Do NOT
+        // downgrade to a materialized-base-file checksum here; that fallback is
+        // only legitimate when there was no prior changeset object at all
+        // (expected_prev_checksum is None), in which case this branch is never
+        // entered and base_file_checksum_required stays true from init.
         if let Some(expected_prev) = expected_prev_checksum {
             if changeset.header.prev_checksum != expected_prev {
-                if file.seq == current_seq + 1 {
-                    base_file_checksum_required = true;
-                } else {
-                    return Err(anyhow!(
-                        "changeset checksum chain break at {}: expected prev {:016x}, found {:016x}",
-                        file.key,
-                        expected_prev,
-                        changeset.header.prev_checksum
-                    ));
-                }
+                return Err(anyhow!(
+                    "changeset checksum chain break at {}: expected prev {:016x}, found {:016x}",
+                    file.key,
+                    expected_prev,
+                    changeset.header.prev_checksum
+                ));
             }
         }
+        // Resolve THIS changeset's post-commit page count.
+        let mut header_page_count = None;
+        let mut max_page_id = 0u64;
         for page in &changeset.pages {
-            if page.page_id.to_u64() == 1 {
+            let pid = page.page_id.to_u64();
+            max_page_id = max_page_id.max(pid);
+            if pid == 1 {
                 if let Some(page_count) = sqlite_header_page_count(&page.data) {
-                    target_page_count = Some(page_count);
+                    header_page_count = Some(page_count);
                 }
             }
         }
+        running_page_count = match header_page_count {
+            // Page 1 present: SQLite header is authoritative (handles shrink).
+            Some(pc) => Some(pc),
+            // No page 1: keep prior count but never below the highest page
+            // written this changeset (an append must still grow the file).
+            None => Some(running_page_count.unwrap_or(0).max(max_page_id)),
+        };
+        // Last applied changeset wins, mirroring phase-4 end_page_count.
+        target_page_count = running_page_count;
         expected_prev_checksum = Some(changeset.checksum);
         expected_seq += 1;
         changesets.push((file.seq, changeset));
@@ -702,6 +732,93 @@ mod tests {
             .contains("first changeset checksum chain break"));
     }
 
+    /// Build a page-1 page whose SQLite header records `page_count`.
+    fn page1_with_count(page_count: u32, fill: u8) -> Vec<u8> {
+        let mut data = vec![fill; 128];
+        data[..16].copy_from_slice(b"SQLite format 3\0");
+        data[28..32].copy_from_slice(&page_count.to_be_bytes());
+        data
+    }
+
+    fn changeset_pages(seq: u64, prev: u64, pages: Vec<PageEntry>) -> PhysicalChangeset {
+        PhysicalChangeset::new(seq, prev, PageIdSize::U32, 128, pages)
+    }
+
+    /// F6: a shrink that writes page 1 with a smaller header page count must
+    /// drive target_page_count DOWN. The last applied changeset's count wins,
+    /// so trailing pages from the prior larger size are truncated.
+    #[tokio::test]
+    async fn prepare_page_replay_shrink_drives_target_page_count_down() {
+        let storage = MemoryStorage::default();
+        // seq1 grows to 1000 pages (page 1 header says 1000).
+        let c1 = changeset_pages(
+            1,
+            0,
+            vec![PageEntry {
+                page_id: PageId::U32(1),
+                data: page1_with_count(1000, 0x11),
+            }],
+        );
+        // seq2 shrinks to 100 pages (page 1 header says 100).
+        let c2 = changeset_pages(
+            2,
+            c1.checksum,
+            vec![PageEntry {
+                page_id: PageId::U32(1),
+                data: page1_with_count(100, 0x22),
+            }],
+        );
+        put_changeset(&storage, 1, &c1);
+        put_changeset(&storage, 2, &c2);
+
+        let prepared = prepare_page_replay(&storage, "prefix/", "db", 0)
+            .await
+            .expect("valid replay prepares");
+        assert_eq!(
+            prepared.target_page_count,
+            Some(100),
+            "last applied changeset's page-1 header wins (1000 -> 100)"
+        );
+    }
+
+    /// F6: a later changeset that omits page 1 must NOT leave the target stuck
+    /// at an earlier larger page-1 count. The post-commit count carries forward
+    /// but is never below the highest page id written, so an append grows it and
+    /// a non-growing tail keeps the prior count rather than a stale page-1 spike.
+    #[tokio::test]
+    async fn prepare_page_replay_carries_count_when_later_changeset_omits_page1() {
+        let storage = MemoryStorage::default();
+        // seq1: page 1 header says 5 pages.
+        let c1 = changeset_pages(
+            1,
+            0,
+            vec![PageEntry {
+                page_id: PageId::U32(1),
+                data: page1_with_count(5, 0x11),
+            }],
+        );
+        // seq2: appends page 8 (no page 1) -> file must be at least 8 pages.
+        let c2 = changeset_pages(
+            2,
+            c1.checksum,
+            vec![PageEntry {
+                page_id: PageId::U32(8),
+                data: page(8, 0x22),
+            }],
+        );
+        put_changeset(&storage, 1, &c1);
+        put_changeset(&storage, 2, &c2);
+
+        let prepared = prepare_page_replay(&storage, "prefix/", "db", 0)
+            .await
+            .expect("valid replay prepares");
+        assert_eq!(
+            prepared.target_page_count,
+            Some(8),
+            "append without page 1 grows the file to the highest page written"
+        );
+    }
+
     #[tokio::test]
     async fn prepared_page_replay_uses_previous_changeset_checksum_after_base() {
         let storage = MemoryStorage::default();
@@ -719,18 +836,43 @@ mod tests {
             .expect("whole-file checksum is not used after a previous changeset exists");
     }
 
+    /// When a prior changeset object exists at the cursor seq, the changeset
+    /// chain is authoritative. A first-delta `prev_checksum` that disagrees
+    /// with the prior changeset's checksum is a real chain break and must
+    /// hard-error during preparation — it is NOT downgraded to a
+    /// materialized-base-file checksum fallback (F4). The base-file fallback is
+    /// only legitimate when no prior changeset object exists at all.
     #[tokio::test]
-    async fn prepare_page_replay_falls_back_to_base_checksum_when_previous_checksum_misses() {
+    async fn prepare_page_replay_rejects_first_delta_break_when_prior_changeset_exists() {
         let storage = MemoryStorage::default();
         let c3 = changeset(3, 0xAA55, 1, 0x33);
-        let base_checksum = 0xBB66;
-        let c4 = changeset(4, base_checksum, 2, 0x44);
+        // c4 chains from a wrong prev (not c3.checksum) — a real break, even
+        // though it is the first delta after the cursor (current_seq + 1).
+        let c4 = changeset(4, c3.checksum.wrapping_add(0xBB66), 2, 0x44);
         put_changeset(&storage, 3, &c3);
         put_changeset(&storage, 4, &c4);
 
-        let prepared = prepare_page_replay(&storage, "prefix/", "db", 3)
+        let err = prepare_page_replay(&storage, "prefix/", "db", 3)
             .await
-            .expect("first post-base delta may chain from the materialized base");
+            .expect_err("first-delta break against an existing prior changeset must fail closed");
+
+        assert!(err.to_string().contains("changeset checksum chain break"));
+    }
+
+    /// The materialized-base-file checksum fallback stays valid ONLY when there
+    /// is no prior changeset object at the cursor seq. Here the cursor is at
+    /// seq 0 with no prior changeset, so the first delta chains from the base
+    /// file and validate_base_checksum is the authority.
+    #[tokio::test]
+    async fn prepare_page_replay_uses_base_checksum_when_no_prior_changeset() {
+        let storage = MemoryStorage::default();
+        let base_checksum = 0xBB66;
+        let c1 = changeset(1, base_checksum, 1, 0x11);
+        put_changeset(&storage, 1, &c1);
+
+        let prepared = prepare_page_replay(&storage, "prefix/", "db", 0)
+            .await
+            .expect("first delta with no prior changeset chains from the materialized base");
 
         prepared
             .validate_base_checksum(base_checksum)

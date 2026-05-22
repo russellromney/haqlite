@@ -6,10 +6,13 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
+use hadb_lease::AtomicFence;
 use hadb_storage::StorageBackend;
 use walrust::{ReplicationConfig, SnapshotOwnership, SnapshotSource};
 
 use hadb::Replicator;
+
+use crate::epoch_fence;
 
 /// SQLite replicator wrapping walrust.
 ///
@@ -20,6 +23,56 @@ pub struct SqliteReplicator {
     /// Used for SingleWriter+Synchronous where remote storage handles durability
     /// and the local SQLite file may be empty (data is in S3 page groups).
     skip_snapshot_on_add: bool,
+    /// When true, `pull()` is allowed to bridge a chain break by applying
+    /// forked changesets by page content (the old behavior). Default false:
+    /// a chain break that `restore()` refused is a hard error rather than a
+    /// silent fork merge (F5). Only enable with an explicit fork-ack policy.
+    allow_fork_bridge: bool,
+    /// Reader side of the lease fence. When present, the leader stamps its
+    /// current lease epoch into a per-database `_epoch` marker next to the
+    /// changesets it publishes (F11). The follower reads that marker and
+    /// refuses a strictly-lower epoch (a former leader's stale write). `None`
+    /// in single-node / no-lease deployments: the marker is never written and
+    /// the follower never gates, preserving the legacy behavior.
+    fence: Option<AtomicFence>,
+}
+
+/// Guard against `pull_incremental` silently bridging a forked history (F5).
+///
+/// `restore()` applies every chain-valid contiguous incremental after the
+/// snapshot and stops at the first checksum-chain break. So any changeset
+/// object still present after `restored_seq` is one `restore()` deliberately
+/// refused — a fork from a prior lineage. `pull_incremental` would then apply
+/// it by raw page content, merging the fork. Unless fork-bridging is explicitly
+/// acknowledged, that is a hard error.
+async fn ensure_no_fork_after_restore(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    name: &str,
+    restored_seq: u64,
+    allow_fork_bridge: bool,
+) -> Result<()> {
+    if allow_fork_bridge {
+        return Ok(());
+    }
+    let leftover = walrust::hadb_changeset::storage::discover_after(
+        storage,
+        prefix,
+        name,
+        restored_seq,
+        walrust::hadb_changeset::storage::ChangesetKind::Physical,
+    )
+    .await?;
+    if let Some(first) = leftover.first() {
+        anyhow::bail!(
+            "refusing to bridge a chain break for '{}': restore stopped at seq {} but {} changeset(s) remain (next at seq {}); these are a forked lineage restore refused. Enable explicit fork-ack to bridge.",
+            name,
+            restored_seq,
+            leftover.len(),
+            first.seq,
+        );
+    }
+    Ok(())
 }
 
 impl SqliteReplicator {
@@ -32,13 +85,32 @@ impl SqliteReplicator {
         Self {
             inner: walrust::Replicator::new(storage, prefix, config),
             skip_snapshot_on_add: false,
+            allow_fork_bridge: false,
+            fence: None,
         }
+    }
+
+    /// Attach the lease fence so each `sync()` stamps the current leader epoch
+    /// into the per-database `_epoch` marker (F11). Pair this with the same
+    /// fence handed to the follower behavior so a former leader's stale
+    /// changesets are rejected on apply.
+    pub fn with_fence(mut self, fence: AtomicFence) -> Self {
+        self.fence = Some(fence);
+        self
     }
 
     /// Skip snapshot upload on `add()`. For SingleWriter+Synchronous where
     /// remote storage handles durability and the local SQLite file has no data.
     pub fn with_skip_snapshot(mut self, skip: bool) -> Self {
         self.skip_snapshot_on_add = skip;
+        self
+    }
+
+    /// Allow `pull()` to bridge a chain break by applying forked changesets
+    /// by page content. Default is false (fork = hard error). Only enable
+    /// behind an explicit fork-acknowledgement policy (F5).
+    pub fn with_allow_fork_bridge(mut self, allow: bool) -> Self {
+        self.allow_fork_bridge = allow;
         self
     }
 
@@ -99,6 +171,8 @@ impl SqliteReplicator {
 pub struct ExternalSnapshotSqliteReplicator {
     inner: Arc<walrust::Replicator>,
     snapshot_source: Arc<dyn SnapshotSource>,
+    /// See `SqliteReplicator::allow_fork_bridge` (F5). Default false.
+    allow_fork_bridge: bool,
 }
 
 impl ExternalSnapshotSqliteReplicator {
@@ -123,7 +197,16 @@ impl ExternalSnapshotSqliteReplicator {
         Ok(Self {
             inner: walrust::Replicator::try_new(storage, prefix, config)?,
             snapshot_source,
+            allow_fork_bridge: false,
         })
+    }
+
+    /// Allow `pull()` to bridge a chain break by applying forked changesets
+    /// by page content. Default is false (fork = hard error). Only enable
+    /// behind an explicit fork-acknowledgement policy (F5).
+    pub fn with_allow_fork_bridge(mut self, allow: bool) -> Self {
+        self.allow_fork_bridge = allow;
+        self
     }
 
     pub fn inner(&self) -> &Arc<walrust::Replicator> {
@@ -177,10 +260,22 @@ impl Replicator for SqliteReplicator {
         let restored_seq = self.inner.restore(name, path).await?;
         let seq = restored_seq.unwrap_or(0);
 
-        // Apply any remaining incrementals that restore() skipped due to
-        // checksum chain breaks (e.g., changesets from a promoted leader
-        // whose chain diverged). pull_incremental applies by page content,
-        // not checksum chain, so it can bridge the gap.
+        // F5: a changeset still present after `restored_seq` is one restore
+        // refused for a checksum-chain break (a forked lineage). Bridging it
+        // by page content silently merges divergent history, so hard-error
+        // unless fork-bridging is explicitly acknowledged.
+        ensure_no_fork_after_restore(
+            self.inner.storage().as_ref(),
+            self.inner.prefix(),
+            name,
+            seq,
+            self.allow_fork_bridge,
+        )
+        .await?;
+
+        // Apply any remaining incrementals after the restored seq. With
+        // fork-bridging acknowledged this can cross a chain break by page
+        // content; otherwise the guard above already failed closed.
         let final_seq = walrust::sync::pull_incremental(
             self.inner.storage().as_ref(),
             self.inner.prefix(),
@@ -215,6 +310,22 @@ impl Replicator for SqliteReplicator {
                 frames
             );
         }
+        // F11: stamp the leader's current lease epoch into the per-database
+        // marker so the follower can fence a former leader's stale changesets.
+        // Read the epoch at publish time and ship it next to the changesets —
+        // a demoted leader carries its own (now-superseded) epoch, never the
+        // live one. No fence configured (single-node) = no marker, no gate.
+        if let Some(fence) = &self.fence {
+            if let Some(epoch) = fence.current() {
+                epoch_fence::stamp_leader_epoch(
+                    self.inner.storage().as_ref(),
+                    self.inner.prefix(),
+                    name,
+                    epoch,
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 }
@@ -236,6 +347,17 @@ impl Replicator for ExternalSnapshotSqliteReplicator {
             name,
             path,
             self.snapshot_source.as_ref(),
+        )
+        .await?;
+
+        // F5: hard-error on a forked tail restore refused, unless fork-bridging
+        // is explicitly acknowledged.
+        ensure_no_fork_after_restore(
+            self.inner.storage().as_ref(),
+            self.inner.prefix(),
+            name,
+            restored_seq,
+            self.allow_fork_bridge,
         )
         .await?;
 

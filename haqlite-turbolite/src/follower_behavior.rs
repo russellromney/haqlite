@@ -18,7 +18,14 @@ use crate::replay_sink::{
 };
 
 enum ApplyOutcome {
-    Applied(u64),
+    /// Applied a prefix and advanced to `position`. `caught_up` is true only
+    /// when the applied seq reached the discovered chain head; a verified-prefix
+    /// apply that stopped at a chain break (gap/fork) is NOT caught up and must
+    /// not advertise fresh reads (F3).
+    Applied {
+        position: u64,
+        caught_up: bool,
+    },
     Noop,
     TransientRetry(String),
 }
@@ -253,10 +260,19 @@ impl TurboliteFollowerBehavior {
                         seq.fetch_max(final_seq, Ordering::AcqRel);
                     }
                 }
-                return Ok(ApplyOutcome::Applied(final_seq));
+                // prepare_page_replay applies every discovered contiguous
+                // changeset up to the listed head and fails closed on a gap or
+                // chain break, so a successful apply means we reached the head.
+                return Ok(ApplyOutcome::Applied {
+                    position: final_seq,
+                    caught_up: true,
+                });
             }
 
-            Ok(ApplyOutcome::Applied(vfs.manifest().version))
+            Ok(ApplyOutcome::Applied {
+                position: vfs.manifest().version,
+                caught_up: true,
+            })
         })
         .await
         .map_err(|e| anyhow!("turbolite apply task panicked: {}", e))??;
@@ -332,11 +348,13 @@ impl TurboliteFollowerBehavior {
         // A chain break is not an error — the verified prefix still
         // applies — but a gap/fork means the follower has NOT fully
         // caught up this poll. Surface it so ops can see a stuck chain.
-        if !matches!(prepared.break_reason, crate::phase4_chain::ChainBreak::Ok) {
+        let break_reason = prepared.break_reason.clone();
+        let chain_ok = matches!(break_reason, crate::phase4_chain::ChainBreak::Ok);
+        if !chain_ok {
             tracing::warn!(
                 "Follower '{}': phase4 chain stopped early at {:?}; applying verified prefix and retrying next poll",
                 db_name,
-                prepared.break_reason,
+                break_reason,
             );
         }
 
@@ -412,7 +430,13 @@ impl TurboliteFollowerBehavior {
                 final_seq,
                 working_epoch,
             );
-            Ok(ApplyOutcome::Applied(new_last_applied_seq))
+            // Caught up only if the chain verified to the head this poll. A
+            // gap/fork applied only a verified prefix, so more is expected and
+            // we must not advertise caught-up off a short prefix (F3).
+            Ok(ApplyOutcome::Applied {
+                position: new_last_applied_seq,
+                caught_up: chain_ok,
+            })
         })
         .await
         .map_err(|e| anyhow!("turbolite phase4 apply task panicked: {}", e))??;
@@ -485,22 +509,30 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
                     .poll_manifest_store(db_name, db_path, current_version)
                     .await
                 {
-                    Ok(Some(ApplyOutcome::Applied(new_version)))
-                        if new_version > current_version =>
-                    {
+                    Ok(Some(ApplyOutcome::Applied {
+                        position: new_version,
+                        caught_up: is_caught_up,
+                    })) if new_version > current_version => {
                         tracing::debug!(
-                            "Follower '{}': manifest v{} -> v{}",
+                            "Follower '{}': manifest v{} -> v{} (caught_up={})",
                             db_name,
                             current_version,
                             new_version,
+                            is_caught_up,
                         );
                         position.store(new_version, Ordering::SeqCst);
                         metrics
                             .follower_replay_position
                             .store(new_version, Ordering::Relaxed);
                         metrics.inc(&metrics.follower_pulls_succeeded);
-                        caught_up.store(true, Ordering::SeqCst);
-                        metrics.follower_caught_up.store(1, Ordering::Relaxed);
+                        // Only advertise caught-up when the applied seq reached
+                        // the chain head. A verified-prefix apply that stopped
+                        // at a gap/fork advanced position but is NOT caught up
+                        // and must not serve fresh reads (F3).
+                        caught_up.store(is_caught_up, Ordering::SeqCst);
+                        metrics
+                            .follower_caught_up
+                            .store(u64::from(is_caught_up), Ordering::Relaxed);
                     }
                     Ok(Some(ApplyOutcome::TransientRetry(msg))) => {
                         tracing::warn!(
@@ -512,7 +544,17 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
                         metrics.follower_caught_up.store(0, Ordering::Relaxed);
                         metrics.inc(&metrics.follower_pulls_failed);
                     }
-                    Ok(Some(ApplyOutcome::Applied(_)))
+                    // Same-position apply: did the poll reach the head? A
+                    // not-caught-up apply at the same position means the chain
+                    // is still broken/short — keep caught_up false (F3).
+                    Ok(Some(ApplyOutcome::Applied {
+                        caught_up: false, ..
+                    })) => {
+                        caught_up.store(false, Ordering::SeqCst);
+                        metrics.follower_caught_up.store(0, Ordering::Relaxed);
+                        metrics.inc(&metrics.follower_pulls_no_new_data);
+                    }
+                    Ok(Some(ApplyOutcome::Applied { .. }))
                     | Ok(Some(ApplyOutcome::Noop))
                     | Ok(None) => {
                         caught_up.store(true, Ordering::SeqCst);
@@ -602,7 +644,9 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
                         msg
                     ));
                 }
-                Some(ApplyOutcome::Applied(_)) | Some(ApplyOutcome::Noop) | None => return Ok(()),
+                Some(ApplyOutcome::Applied { .. }) | Some(ApplyOutcome::Noop) | None => {
+                    return Ok(())
+                }
             }
         }
 
