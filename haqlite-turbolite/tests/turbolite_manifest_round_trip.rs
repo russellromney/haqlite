@@ -1,14 +1,14 @@
-//! Phase Turbogenesis-b regression guard: turbolite manifest bytes
+//! Opaque-envelope regression guard: turbolite manifest bytes
 //! round-trip preserves `discontinuity_stamp` (formerly `epoch`),
-//! `change_counter`, and the phase-004 `cursor` / `writer_id` fields.
+//! `change_counter`, and the replay-cursor `cursor` / `writer_id` fields.
 //!
-//! Pre-Turbogenesis-b, haqlite's converter layer from turbolite's
+//! Before the opaque-envelope conversion, haqlite's converter layer from turbolite's
 //! `Manifest` → hadb's `Backend::Turbolite` silently dropped the
 //! `epoch` and `change_counter` fields (they had no home on the
 //! Backend variant). This test drives the full payload path and
 //! asserts those fields survive.
 //!
-//! Phase 004 renamed `epoch` to `discontinuity_stamp` to disambiguate
+//! Replay cursor renamed `epoch` to `discontinuity_stamp` to disambiguate
 //! from the new lease-epoch on [`turbolite::tiered::ReplayCursor`].
 //! Same semantic (out-of-band fork/rollback stamp), same positional
 //! slot in the wire envelope.
@@ -109,7 +109,7 @@ async fn turbolite_manifest_bytes_round_trip_preserves_epoch_and_change_counter(
         got.change_counter, 4242,
         "change_counter must survive manifest round-trip"
     );
-    // Phase 004: the new substrate fields round-trip too.
+    // Replay cursor: the new substrate fields round-trip too.
     assert_eq!(
         got.cursor.last_applied_seq, 17,
         "cursor.last_applied_seq must survive manifest round-trip"

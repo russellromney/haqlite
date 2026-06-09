@@ -1,9 +1,8 @@
-//! Phase 004 follower candidate filter + chain verifier.
+//! Replay cursor follower candidate filter + chain verifier.
 //!
 //! Pure logic (no storage I/O) that turns a raw, ordered list of
 //! discovered TLM_DELTA envelopes into the maximal verified prefix a
-//! follower may apply. Two stages, matching the plan's replication
-//! shape:
+//! follower may apply. It has two stages:
 //!
 //! 1. **Candidate filter** — drop deltas whose `(epoch, writer_id)`
 //!    does not match the cursor's epoch + the base's writer_id (stale
@@ -44,9 +43,8 @@ use walrust::DiscoveredDelta;
 ///
 /// The working cursor is persisted separately from the published base
 /// manifest. It is only reset back to a base's cursor when the base
-/// manifest's **epoch** changes (promotion) — see step 7. Failing to
-/// advance the anchor makes every poll after the first base-mismatch
-/// at `last_applied_seq + 1`.
+/// manifest's **epoch** changes (promotion). Failing to advance the anchor
+/// makes every poll after the first base-mismatch at `last_applied_seq + 1`.
 #[derive(Debug, Clone)]
 pub struct FollowerCursor {
     /// Seq of the last object already applied (base initially, then the

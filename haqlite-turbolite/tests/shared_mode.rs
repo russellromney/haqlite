@@ -409,7 +409,7 @@ async fn shared_failover_lease_expires_other_node_writes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_manifest_version_tracks_writes() {
     // Verify writes advance the manifest envelope and the payload is
-    // non-empty turbolite bytes. After Phase Turbogenesis-b haqlite
+    // non-empty turbolite bytes. After Opaque-envelope haqlite
     // carries opaque bytes; decoding belongs to turbolite.
     let tmp = TempDir::new().unwrap();
     let prefix = unique_prefix("shared_manifest_version_tracks_writes");

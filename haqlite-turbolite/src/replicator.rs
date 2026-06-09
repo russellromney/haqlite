@@ -11,9 +11,9 @@ use hadb_storage::StorageBackend;
 use turbodb::ManifestStore;
 use turbolite::tiered::SharedTurboliteVfs;
 
-use crate::phase4_chain::FollowerCursor;
+use crate::cursor_chain::FollowerCursor;
 use crate::replay_sink::{
-    apply_prepared_page_replay, prepare_page_replay, prepare_phase4_replay,
+    apply_prepared_page_replay, prepare_page_replay, prepare_cursor_replay,
     HaqliteTurboliteReplaySink,
 };
 
@@ -224,9 +224,9 @@ fn should_publish_manifest(vfs: &SharedTurboliteVfs) -> bool {
 fn manifest_envelope(writer_id: &str, epoch: u64, payload: Vec<u8>) -> turbodb::Manifest {
     turbodb::Manifest {
         version: 0,
-        // Phase-004 lease epoch: when > 0 the ManifestStore epoch fence
-        // (step 3) rejects a stale leader's publish. 0 = phase-3 mode
-        // (pure version-CAS, no behavior change).
+        // Replay-cursor lease epoch: when > 0 the ManifestStore epoch fence
+        // rejects a stale leader's publish. 0 = legacy mode (pure
+        // version-CAS, no behavior change).
         epoch,
         writer_id: writer_id.to_string(),
         timestamp_ms: SystemTime::now()
@@ -356,7 +356,7 @@ impl TurboliteReplicator {
             &self.manifest_store,
             &self.manifest_key,
             &self.writer_id,
-            0, // Checkpoint mode: no walrust deltas, no phase-4 fencing.
+            0, // Checkpoint mode: no walrust deltas, no cursor-chain fencing.
             payload,
         )
         .await?;
@@ -403,9 +403,9 @@ pub struct TurboliteWalReplicator {
     replay_base_seq: Arc<AtomicU64>,
     last_published_base_cursor: Mutex<Option<walrust::ExternalBaseCursor>>,
     live_wal_path: Mutex<Option<std::path::PathBuf>>,
-    /// Phase 004: source of the live lease revision. When wired, the
+    /// Replay cursor: source of the live lease revision. When wired, the
     /// replicator captures the term epoch from it and publishes
-    /// phase-4 (fenced TLM_DELTA) bases + deltas. `None` = phase-3.
+    /// cursor-chain (fenced TLM_DELTA) bases + deltas. `None` = legacy.
     fence: Option<Arc<dyn hadb_lease::FenceSource>>,
     /// Latched lease epoch for the current leadership term (0 = unset →
     /// re-latch from the fence on next publish). Shared with the
@@ -444,8 +444,8 @@ impl TurboliteWalReplicator {
         }
     }
 
-    /// Wire the lease fence (phase 004). Enables the fenced TLM_DELTA
-    /// writer path; without it the replicator stays on phase-3.
+    /// Wire the lease fence (replay cursor). Enables the fenced TLM_DELTA
+    /// writer path; without it the replicator stays on legacy.
     pub fn with_fence(mut self, fence: Arc<dyn hadb_lease::FenceSource>) -> Self {
         self.fence = Some(fence);
         self
@@ -458,9 +458,9 @@ impl TurboliteWalReplicator {
         self
     }
 
-    /// Current leadership-term epoch for phase-4 publishing.
+    /// Current leadership-term epoch for cursor-chain publishing.
     ///
-    /// Returns 0 when no fence is wired (phase-3 mode). Otherwise
+    /// Returns 0 when no fence is wired (legacy mode). Otherwise
     /// lazy-latches: if the term epoch is unset (0), capture the fence's
     /// current revision and hold it for the term. The follower behavior
     /// resets the cell to 0 on promotion so a new term re-latches the
@@ -533,25 +533,10 @@ impl TurboliteWalReplicator {
         // delta chain after it.
         let exact_replay_cursor = replay_base_seq;
 
-        // Route through `publish_replayed_base`. For a leader that
-        // checkpointed via the SQLite write path, pending replay
-        // state is empty and this is equivalent to encoding the
-        // current pure base manifest. For a freshly-promoted follower
-        // that has accumulated replay staging logs and dirty
-        // groups, this flushes them to remote storage as fresh
-        // page-group keys before encoding the hybrid manifest, so
-        // a third fresh follower joining from the published
-        // manifest sees the replayed bytes — not stale pre-replay
-        // page-group keys.
-        let payload = self
-            .vfs
-            .publish_replayed_base()
-            .map_err(|e| anyhow!("turbolite publish_replayed_base failed: {}", e))?;
-
-        // Phase 004: when a lease fence is wired and we hold a term
+        // Replay cursor: when a lease fence is wired and we hold a term
         // epoch, publish a fenced base whose cursor carries the chain
         // anchor + epoch + writer_id, then flip walrust to TLM_DELTA
-        // shipping anchored at that base. Phase-3 path below is
+        // shipping anchored at that base. Legacy path below is
         // untouched (term_epoch == 0 when no fence is wired).
         let term_epoch = self.current_term_epoch();
         if term_epoch > 0 {
@@ -570,31 +555,33 @@ impl TurboliteWalReplicator {
                     manifest.change_counter
                 }
             });
-            // Adopt the replayed-base payload so the cursor stamp lands
-            // on the just-published page-group set.
-            self.vfs
-                .set_manifest_bytes(&payload)
-                .map_err(|e| anyhow!("turbolite adopt replay-base payload failed: {}", e))?;
-            let (p4_payload, anchor) = self
+            let (replay_cursor_payload, anchor) = self
                 .vfs
-                .manifest_bytes_with_phase4_cursor(base_seq, term_epoch, &self.writer_id)
-                .map_err(|e| anyhow!("turbolite encode phase4 cursor failed: {}", e))?;
+                .publish_replayed_base_with_replay_cursor_anchor(
+                    base_seq,
+                    term_epoch,
+                    &self.writer_id,
+                )
+                .map_err(|e| anyhow!("turbolite publish replay-cursor base failed: {}", e))?;
 
             let actual_payload = publish_manifest(
                 &self.manifest_store,
                 &self.manifest_key,
                 &self.writer_id,
                 term_epoch,
-                p4_payload,
+                replay_cursor_payload,
             )
             .await?;
             self.vfs.set_manifest_bytes(&actual_payload).map_err(|e| {
-                anyhow!("turbolite install authoritative phase4 base failed: {}", e)
+                anyhow!(
+                    "turbolite install authoritative replay-cursor base failed: {}",
+                    e
+                )
             })?;
 
             let anchor_arr: [u8; 32] = anchor.as_slice().try_into().map_err(|_| {
                 anyhow!(
-                    "phase4 base anchor for '{}' is {} bytes, expected 32",
+                    "replay-cursor base anchor for '{}' is {} bytes, expected 32",
                     name,
                     anchor.len()
                 )
@@ -603,9 +590,9 @@ impl TurboliteWalReplicator {
             // durable above; only now do we (re)anchor delta shipping.
             self.walrust
                 .inner()
-                .set_phase4_base(name, term_epoch, &self.writer_id, base_seq, anchor_arr)
+                .set_external_delta_base(name, term_epoch, &self.writer_id, base_seq, anchor_arr)
                 .await
-                .map_err(|e| anyhow!("walrust set_phase4_base failed: {e}"))?;
+                .map_err(|e| anyhow!("walrust set_external_delta_base failed: {e}"))?;
 
             if used_pending_replay_base {
                 self.replay_base_pending_publish
@@ -614,6 +601,18 @@ impl TurboliteWalReplicator {
             }
             return Ok(());
         }
+
+        // Legacy publisher path: flush replay staging/dirty groups to remote
+        // storage, then encode the pure base manifest. This is the old
+        // `publish_replayed_base` behavior spelled out without using the
+        // deprecated anchored-promotion API.
+        self.vfs
+            .flush_to_storage()
+            .map_err(|e| anyhow!("turbolite flush_to_storage failed: {}", e))?;
+        let payload = self
+            .vfs
+            .manifest_bytes()
+            .map_err(|e| anyhow!("turbolite manifest_bytes failed: {}", e))?;
 
         let payload = if let Some(seq) = exact_replay_cursor {
             self.vfs
@@ -630,7 +629,7 @@ impl TurboliteWalReplicator {
             &self.manifest_store,
             &self.manifest_key,
             &self.writer_id,
-            0, // phase-3 path (no fence wired / term_epoch unset)
+            0, // legacy path (no fence wired / term_epoch unset)
             payload,
         )
         .await?;
@@ -800,10 +799,10 @@ impl TurboliteWalReplicator {
         }
     }
 
-    /// Phase 004 writer catch-up: materialize the published base and
+    /// Replay cursor writer catch-up: materialize the published base and
     /// replay its TLM_DELTA chain, mirroring the follower apply path.
     /// Used when the base manifest carries a populated cursor anchor.
-    async fn restore_from_phase4_manifest(
+    async fn restore_from_cursor_manifest(
         &self,
         name: &str,
         payload: &[u8],
@@ -817,14 +816,14 @@ impl TurboliteWalReplicator {
         };
         let replay_start_seq = cursor.last_applied_seq;
 
-        let prepared = prepare_phase4_replay(
+        let prepared = prepare_cursor_replay(
             self.walrust_storage.as_ref(),
             &self.walrust_prefix,
             name,
             &cursor,
         )
         .await
-        .map_err(|e| anyhow!("phase4 prepare replay for '{}': {}", name, e))?;
+        .map_err(|e| anyhow!("replay cursor prepare replay for '{}': {}", name, e))?;
 
         // A forked or gapped chain means the verifiable WAL tail is a strict
         // prefix of the real history. A read-only follower may apply that
@@ -832,9 +831,9 @@ impl TurboliteWalReplicator {
         // catch-up path: applying the prefix and then advancing the publish
         // cursor would publish a TRUNCATED base over real history — data loss
         // on failover. Refuse to adopt/publish on any break.
-        if !matches!(prepared.break_reason, crate::phase4_chain::ChainBreak::Ok) {
+        if !matches!(prepared.break_reason, crate::cursor_chain::ChainBreak::Ok) {
             return Err(anyhow!(
-                "phase4 writer catch-up for '{}' hit a chain break ({:?}); refusing to \
+                "replay cursor writer catch-up for '{}' hit a chain break ({:?}); refusing to \
                  adopt or publish a truncated base",
                 name,
                 prepared.break_reason
@@ -861,9 +860,9 @@ impl TurboliteWalReplicator {
 
             vfs.shared_state()
                 .materialize_manifest_to_file(&decoded_for_attempt, &cache_path)
-                .context("turbolite phase4 materialize failed")?;
+                .context("turbolite replay cursor materialize failed")?;
             vfs.set_manifest_bytes(&payload_owned)
-                .map_err(|e| anyhow!("turbolite phase4 set_manifest_bytes failed: {}", e))?;
+                .map_err(|e| anyhow!("turbolite replay cursor set_manifest_bytes failed: {}", e))?;
             let page_count = vfs.manifest().page_count;
             vfs.sync_after_external_restore(page_count);
 
@@ -872,7 +871,7 @@ impl TurboliteWalReplicator {
 
             let handle = vfs
                 .begin_replay_after(replay_start_seq)
-                .map_err(|e| anyhow!("turbolite phase4 begin_replay failed: {}", e))?;
+                .map_err(|e| anyhow!("turbolite replay cursor begin_replay failed: {}", e))?;
             let mut sink = HaqliteTurboliteReplaySink::new_under_external_write(handle);
             let final_seq = apply_prepared_page_replay(&mut sink, prepared.prepared)?;
 
@@ -882,12 +881,12 @@ impl TurboliteWalReplicator {
                     base_object_checksum: new_anchor,
                     epoch: working_epoch,
                 })
-                .map_err(|e| anyhow!("turbolite phase4 update_replay_cursor failed: {}", e))?;
+                .map_err(|e| anyhow!("turbolite replay cursor update_replay_cursor failed: {}", e))?;
                 replay_base_pending_publish.store(true, Ordering::Release);
                 replay_base_seq.fetch_max(new_last_applied_seq, Ordering::AcqRel);
             }
             tracing::debug!(
-                "TurboliteWalReplicator::restore_phase4('{}') replayed {} -> {}",
+                "TurboliteWalReplicator::restore_replay cursor('{}') replayed {} -> {}",
                 name_owned,
                 replay_start_seq,
                 final_seq,
@@ -895,33 +894,33 @@ impl TurboliteWalReplicator {
             Ok(())
         })
         .await
-        .map_err(|e| anyhow!("turbolite phase4 restore task panicked: {}", e))?
+        .map_err(|e| anyhow!("turbolite replay cursor restore task panicked: {}", e))?
     }
 
-    /// Re-anchor phase-4 delta shipping after the walrust db is
+    /// Re-anchor cursor-chain delta shipping after the walrust db is
     /// registered.
     ///
-    /// publish_current_manifest calls set_phase4_base, but during `add`
-    /// it runs BEFORE add_external_base_with_retry registers the walrust
-    /// db, so that call no-ops (db not found) and walrust would ship
-    /// phase-3 .hadbp deltas under a phase-4 base — a fatal mix the
+    /// publish_current_manifest calls walrust's cursor-chain base setter, but
+    /// during `add` it runs BEFORE add_external_base_with_retry registers the
+    /// walrust db, so that call no-ops (db not found) and walrust would ship
+    /// legacy .hadbp deltas under a cursor-chain base — a fatal mix the
     /// follower can't read. Calling this after registration re-applies
     /// the anchor from the now-published base cursor so the very first
     /// delta is .tlmd.
-    async fn reanchor_phase4_if_needed(&self, name: &str) -> Result<()> {
+    async fn reanchor_cursor_chain_if_needed(&self, name: &str) -> Result<()> {
         let m = self.vfs.manifest();
         if m.cursor.base_object_checksum.is_empty() || m.cursor.epoch == 0 {
-            return Ok(()); // phase-3 base, nothing to anchor
+            return Ok(()); // legacy base, nothing to anchor
         }
         let anchor: [u8; 32] = m
             .cursor
             .base_object_checksum
             .as_slice()
             .try_into()
-            .map_err(|_| anyhow!("phase4 base anchor for '{}' is not 32 bytes", name))?;
+            .map_err(|_| anyhow!("replay-cursor base anchor for '{}' is not 32 bytes", name))?;
         self.walrust
             .inner()
-            .set_phase4_base(
+            .set_external_delta_base(
                 name,
                 m.cursor.epoch,
                 &self.writer_id,
@@ -929,7 +928,7 @@ impl TurboliteWalReplicator {
                 anchor,
             )
             .await
-            .map_err(|e| anyhow!("walrust reanchor set_phase4_base failed: {e}"))?;
+            .map_err(|e| anyhow!("walrust reanchor set_external_delta_base failed: {e}"))?;
         Ok(())
     }
 
@@ -944,14 +943,14 @@ impl TurboliteWalReplicator {
             turbolite::tiered::TurboliteVfs::decode_manifest_bytes(&payload_owned)
                 .map_err(|e| anyhow!("turbolite decode_manifest_bytes failed: {}", e))?;
 
-        // Phase 004 interlock: a base with a populated cursor anchor was
+        // Replay cursor interlock: a base with a populated cursor anchor was
         // published on the fenced TLM_DELTA contract. The writer's own
-        // catch-up MUST use the phase-4 replay path — the phase-3
+        // catch-up MUST use the cursor-chain replay path — the legacy
         // `.hadbp` discovery below would find no `.hadbp` deltas (a
-        // phase-4 writer ships `.tlmd`) and silently stall.
+        // cursor-chain writer ships `.tlmd`) and silently stall.
         if !decoded_manifest.cursor.base_object_checksum.is_empty() {
             return self
-                .restore_from_phase4_manifest(name, &payload_owned, decoded_manifest)
+                .restore_from_cursor_manifest(name, &payload_owned, decoded_manifest)
                 .await;
         }
 
@@ -1054,9 +1053,9 @@ impl Replicator for TurboliteWalReplicator {
         let base = self.external_base_cursor(&cache_path)?;
         self.add_external_base_with_retry(name, &cache_path, &wal_path, base)
             .await?;
-        // Re-anchor phase-4 now that the walrust db is registered, so
-        // the first delta ships as .tlmd (not .hadbp under a phase-4 base).
-        self.reanchor_phase4_if_needed(name).await
+        // Re-anchor cursor-chain now that the walrust db is registered, so
+        // the first delta ships as .tlmd (not .hadbp under a cursor-chain base).
+        self.reanchor_cursor_chain_if_needed(name).await
     }
 
     async fn add_continuing(&self, name: &str, path: &Path) -> Result<()> {
@@ -1076,7 +1075,7 @@ impl Replicator for TurboliteWalReplicator {
 
         self.add_external_base_with_retry(name, &cache_path, &wal_path, base)
             .await?;
-        self.reanchor_phase4_if_needed(name).await
+        self.reanchor_cursor_chain_if_needed(name).await
     }
 
     async fn pull(&self, name: &str, path: &Path) -> Result<()> {

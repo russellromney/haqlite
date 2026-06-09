@@ -11,9 +11,9 @@ use hadb::{FollowerBehavior, HaMetrics, Replicator};
 use hadb_storage::StorageBackend;
 use turbodb::ManifestStore;
 
-use crate::phase4_chain::FollowerCursor;
+use crate::cursor_chain::FollowerCursor;
 use crate::replay_sink::{
-    apply_prepared_page_replay, prepare_page_replay, prepare_phase4_replay,
+    apply_prepared_page_replay, prepare_page_replay, prepare_cursor_replay,
     HaqliteTurboliteReplaySink,
 };
 
@@ -39,7 +39,7 @@ pub struct TurboliteFollowerBehavior {
     wakeup: Option<Arc<tokio::sync::Notify>>,
     replay_base_pending_publish: Option<Arc<AtomicBool>>,
     replay_base_seq: Option<Arc<AtomicU64>>,
-    /// Phase 004 leadership-term epoch, shared with the replicator.
+    /// Replay cursor leadership-term epoch, shared with the replicator.
     /// Reset to 0 on promotion so the replicator re-latches the new
     /// term's lease revision from the fence on its next publish.
     term_epoch: Option<Arc<AtomicU64>>,
@@ -95,7 +95,7 @@ impl TurboliteFollowerBehavior {
         self
     }
 
-    /// Share the phase-004 term-epoch cell with the replicator. Reset
+    /// Share the replay-cursor term-epoch cell with the replicator. Reset
     /// to 0 on promotion so the replicator re-latches the new term.
     pub fn with_term_epoch(mut self, term_epoch: Arc<AtomicU64>) -> Self {
         self.term_epoch = Some(term_epoch);
@@ -128,15 +128,15 @@ impl TurboliteFollowerBehavior {
             .map_err(|e| anyhow!("turbolite decode_manifest_bytes failed: {}", e))?;
         let continuous = self.requires_delta_replay();
 
-        // Phase 004: when the base manifest carries a populated cursor
+        // Replay cursor: when the base manifest carries a populated cursor
         // anchor, the writer is on the fenced TLM_DELTA contract — use
-        // the phase-4 follower path. An empty anchor means a pre-cursor
-        // base (phase-3 publisher), so fall back to the .hadbp path.
-        // This gate keeps the shipped phase-3 failover behavior intact
-        // until the writer starts populating the cursor (step 7).
+        // the cursor-chain follower path. An empty anchor means a pre-cursor
+        // base (legacy publisher), so fall back to the .hadbp path.
+        // This gate keeps the shipped legacy failover behavior intact
+        // until the writer starts populating the cursor.
         if continuous && !decoded_manifest.cursor.base_object_checksum.is_empty() {
             return self
-                .apply_manifest_payload_phase4(db_name, decoded_manifest, payload)
+                .apply_manifest_payload_cursor_chain(db_name, decoded_manifest, payload)
                 .await;
         }
 
@@ -280,7 +280,7 @@ impl TurboliteFollowerBehavior {
         Ok(result)
     }
 
-    /// Phase 004 follower apply path (fenced TLM_DELTA contract).
+    /// Replay cursor follower apply path (fenced TLM_DELTA contract).
     ///
     /// Working-cursor model: the follower's replay position lives in the
     /// turbolite VFS local manifest's `cursor` field and **advances** as
@@ -291,7 +291,7 @@ impl TurboliteFollowerBehavior {
     /// version. Otherwise we keep advancing the local working cursor and
     /// list deltas after it, so a same-base poll picks up new deltas
     /// without re-materializing.
-    async fn apply_manifest_payload_phase4(
+    async fn apply_manifest_payload_cursor_chain(
         &self,
         db_name: &str,
         decoded_manifest: turbolite::tiered::Manifest,
@@ -300,12 +300,12 @@ impl TurboliteFollowerBehavior {
         let storage = self
             .walrust_storage
             .as_ref()
-            .ok_or_else(|| anyhow!("phase4 follower '{}' missing walrust storage", db_name))?
+            .ok_or_else(|| anyhow!("replay cursor follower '{}' missing walrust storage", db_name))?
             .clone();
         let prefix = self
             .walrust_prefix
             .as_ref()
-            .ok_or_else(|| anyhow!("phase4 follower '{}' missing walrust prefix", db_name))?
+            .ok_or_else(|| anyhow!("replay cursor follower '{}' missing walrust prefix", db_name))?
             .clone();
 
         let base_cursor = decoded_manifest.cursor.clone();
@@ -341,18 +341,18 @@ impl TurboliteFollowerBehavior {
         let working_epoch = working.epoch;
 
         // Storage I/O (list + fetch + verify) before the blocking apply.
-        let prepared = prepare_phase4_replay(storage.as_ref(), &prefix, db_name, &follower_cursor)
+        let prepared = prepare_cursor_replay(storage.as_ref(), &prefix, db_name, &follower_cursor)
             .await
-            .map_err(|e| anyhow!("phase4 prepare replay for '{}': {}", db_name, e))?;
+            .map_err(|e| anyhow!("replay cursor prepare replay for '{}': {}", db_name, e))?;
 
         // A chain break is not an error — the verified prefix still
         // applies — but a gap/fork means the follower has NOT fully
         // caught up this poll. Surface it so ops can see a stuck chain.
         let break_reason = prepared.break_reason.clone();
-        let chain_ok = matches!(break_reason, crate::phase4_chain::ChainBreak::Ok);
+        let chain_ok = matches!(break_reason, crate::cursor_chain::ChainBreak::Ok);
         if !chain_ok {
             tracing::warn!(
-                "Follower '{}': phase4 chain stopped early at {:?}; applying verified prefix and retrying next poll",
+                "Follower '{}': replay cursor chain stopped early at {:?}; applying verified prefix and retrying next poll",
                 db_name,
                 break_reason,
             );
@@ -383,14 +383,14 @@ impl TurboliteFollowerBehavior {
                     Ok(_) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         return Ok(ApplyOutcome::TransientRetry(format!(
-                            "missing page-group during phase4 materialize for '{}': {}",
+                            "missing page-group during replay cursor materialize for '{}': {}",
                             db_name_owned, e
                         )));
                     }
-                    Err(e) => return Err(anyhow!("turbolite phase4 materialize failed: {}", e)),
+                    Err(e) => return Err(anyhow!("turbolite replay cursor materialize failed: {}", e)),
                 }
                 vfs.set_manifest_bytes(&payload_owned)
-                    .map_err(|e| anyhow!("turbolite phase4 set_manifest_bytes failed: {}", e))?;
+                    .map_err(|e| anyhow!("turbolite replay cursor set_manifest_bytes failed: {}", e))?;
                 let page_count = vfs.manifest().page_count;
                 vfs.sync_after_external_restore(page_count);
             }
@@ -400,7 +400,7 @@ impl TurboliteFollowerBehavior {
 
             let handle = vfs
                 .begin_replay_after(replay_start_seq)
-                .map_err(|e| anyhow!("turbolite phase4 begin_replay failed: {}", e))?;
+                .map_err(|e| anyhow!("turbolite replay cursor begin_replay failed: {}", e))?;
             let mut sink = HaqliteTurboliteReplaySink::new_under_external_write(handle);
             let final_seq = apply_prepared_page_replay(&mut sink, prepared.prepared)?;
 
@@ -413,7 +413,7 @@ impl TurboliteFollowerBehavior {
                     base_object_checksum: new_anchor,
                     epoch: working_epoch,
                 })
-                .map_err(|e| anyhow!("turbolite phase4 update_replay_cursor failed: {}", e))?;
+                .map_err(|e| anyhow!("turbolite replay cursor update_replay_cursor failed: {}", e))?;
 
                 if let Some(pending) = replay_base_pending_publish {
                     pending.store(true, Ordering::Release);
@@ -424,7 +424,7 @@ impl TurboliteFollowerBehavior {
             }
 
             tracing::debug!(
-                "Follower '{}': phase4 replayed {} -> {} (epoch {})",
+                "Follower '{}': replay cursor replayed {} -> {} (epoch {})",
                 db_name_owned,
                 replay_start_seq,
                 final_seq,
@@ -439,7 +439,7 @@ impl TurboliteFollowerBehavior {
             })
         })
         .await
-        .map_err(|e| anyhow!("turbolite phase4 apply task panicked: {}", e))??;
+        .map_err(|e| anyhow!("turbolite replay cursor apply task panicked: {}", e))??;
 
         Ok(result)
     }
@@ -628,7 +628,7 @@ impl FollowerBehavior for TurboliteFollowerBehavior {
         db_path: &PathBuf,
         position: u64,
     ) -> Result<()> {
-        // Phase 004: a new leadership term begins. Reset the shared
+        // Replay cursor: a new leadership term begins. Reset the shared
         // term epoch so the replicator re-latches the new (higher)
         // lease revision from the fence on its next publish — fencing
         // a base published at the prior epoch.
