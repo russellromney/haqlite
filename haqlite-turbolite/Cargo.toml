@@ -22,10 +22,10 @@ turbodb = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0"
 turbodb-manifest-cinch = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "turbodb-manifest-cinch", branch = "hoist-prereq-internal-lease-store" }
 
 # Turbolite VFS
-turbolite = { git = "https://github.com/russellromney/turbolite.git", version = "0.5", features = ["zstd", "wal"], branch = "benchmark/s3-express-verify" }
+turbolite = { git = "https://github.com/russellromney/turbolite.git", version = "0.5", features = ["zstd", "wal"], branch = "codex/replay-cursor-quint" }
 
 # WAL sync (walrust is always present for Continuous/Checkpoint paths)
-walrust = { git = "https://github.com/russellromney/walrust.git", version = "0.3.1", package = "walrust", branch = "hoist-public-deps" }
+walrust = { git = "https://github.com/russellromney/walrust.git", version = "0.3.1", package = "walrust", branch = "main" }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
