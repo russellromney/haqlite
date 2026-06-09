@@ -590,9 +590,9 @@ impl TurboliteWalReplicator {
             // durable above; only now do we (re)anchor delta shipping.
             self.walrust
                 .inner()
-                .set_phase4_base(name, term_epoch, &self.writer_id, base_seq, anchor_arr)
+                .set_external_delta_base(name, term_epoch, &self.writer_id, base_seq, anchor_arr)
                 .await
-                .map_err(|e| anyhow!("walrust set_phase4_base failed: {e}"))?;
+                .map_err(|e| anyhow!("walrust set_external_delta_base failed: {e}"))?;
 
             if used_pending_replay_base {
                 self.replay_base_pending_publish
@@ -920,7 +920,7 @@ impl TurboliteWalReplicator {
             .map_err(|_| anyhow!("replay-cursor base anchor for '{}' is not 32 bytes", name))?;
         self.walrust
             .inner()
-            .set_phase4_base(
+            .set_external_delta_base(
                 name,
                 m.cursor.epoch,
                 &self.writer_id,
@@ -928,7 +928,7 @@ impl TurboliteWalReplicator {
                 anchor,
             )
             .await
-            .map_err(|e| anyhow!("walrust reanchor set_phase4_base failed: {e}"))?;
+            .map_err(|e| anyhow!("walrust reanchor set_external_delta_base failed: {e}"))?;
         Ok(())
     }
 
