@@ -1,11 +1,11 @@
-//! Phase 004 writer→follower handshake (in-process, no MinIO).
+//! Replay cursor writer→follower handshake (in-process, no MinIO).
 //!
 //! Proves the load-bearing linkage between the writer's base publish
 //! and the follower's chain verification, end to end through the public
 //! API:
 //!
 //! 1. Writer publishes a base via
-//!    `TurboliteVfs::manifest_bytes_with_phase4_cursor`, which stamps
+//!    `TurboliteVfs::manifest_bytes_with_replay_cursor_anchor`, which stamps
 //!    `cursor.{last_applied_seq,epoch,base_object_checksum}` + writer_id
 //!    and returns `(payload, anchor)`.
 //! 2. Deltas are shipped as TLM_DELTA envelopes chaining from `anchor`
@@ -18,7 +18,7 @@
 //! anchor == first_delta.prev_checksum`. If the writer's anchor
 //! computation and the follower's anchor read ever diverge, the chain
 //! fails to verify and this test catches it. The full SQLite apply is
-//! covered separately (replay_sink prepare_phase4_replay tests +
+//! covered separately (replay_sink prepare_cursor_replay tests +
 //! turbolite VFS apply tests); this test isolates the protocol
 //! handshake the writer wiring depends on.
 
@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use common::InMemoryStorage;
-use haqlite_turbolite::phase4_chain::{filter_and_verify, ChainBreak, FollowerCursor};
+use haqlite_turbolite::cursor_chain::{filter_and_verify, ChainBreak, FollowerCursor};
 use turbolite::tiered::{
     CacheConfig, GroupingStrategy, Manifest as TlManifest, TurboliteConfig, TurboliteVfs,
 };
@@ -80,7 +80,7 @@ fn build_writer_vfs() -> TurboliteVfs {
     let rt_handle = tokio::runtime::Handle::current();
     let backend: Arc<dyn hadb_storage::StorageBackend> =
         Arc::new(hadb_storage_local::LocalStorage::new(&cache_dir));
-    let mut vfs = TurboliteVfs::with_backend(config, backend, rt_handle).expect("vfs");
+    let vfs = TurboliteVfs::with_backend(config, backend, rt_handle).expect("vfs");
     let mut seed = seed_manifest();
     seed.detect_and_normalize_strategy();
     vfs.set_manifest(seed);
@@ -139,8 +139,8 @@ async fn writer_base_anchor_links_to_follower_chain() {
 
     // Writer publishes a base at last_applied_seq=0, stamping the cursor.
     let (base_payload, anchor) = writer
-        .manifest_bytes_with_phase4_cursor(0, epoch, writer_id)
-        .expect("publish phase4 base");
+        .manifest_bytes_with_replay_cursor_anchor(0, epoch, writer_id)
+        .expect("publish replay cursor base");
     assert_eq!(anchor.len(), 32, "anchor is a 32-byte BLAKE3");
 
     // Ship two TLM_DELTA envelopes chaining from the base anchor.
@@ -187,7 +187,7 @@ async fn writer_base_anchor_links_to_follower_chain() {
 async fn follower_at_wrong_epoch_filters_everything() {
     let writer = build_writer_vfs();
     let (_payload, anchor) = writer
-        .manifest_bytes_with_phase4_cursor(0, 9, "writer-B")
+        .manifest_bytes_with_replay_cursor_anchor(0, 9, "writer-B")
         .expect("publish base");
 
     let storage = InMemoryStorage::new();

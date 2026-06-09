@@ -868,8 +868,8 @@ impl Builder {
 
         let replay_base_pending_publish = Arc::new(AtomicBool::new(false));
         let replay_base_seq = Arc::new(AtomicU64::new(0));
-        // Phase 004 leadership-term epoch, shared between the replicator
-        // (writer, latches it from the fence + publishes phase-4 bases)
+        // Replay cursor leadership-term epoch, shared between the replicator
+        // (writer, latches it from the fence + publishes cursor-chain bases)
         // and the follower behavior (resets it to 0 on promotion so the
         // replicator re-latches the new term's revision). Starts unset.
         let term_epoch = Arc::new(AtomicU64::new(0));
@@ -936,9 +936,9 @@ impl Builder {
                     )
                     .with_term_epoch(term_epoch.clone());
                     // Wire the lease fence when available (production
-                    // turbolite_http path) to activate phase-4 fenced
+                    // turbolite_http path) to activate cursor-chain fenced
                     // delta shipping. Without it the replicator stays on
-                    // the phase-3 path (term_epoch never latches).
+                    // the legacy path (term_epoch never latches).
                     if let Some((fence, _)) = &shared_fence {
                         wal_replicator = wal_replicator.with_fence(fence.clone());
                     }
@@ -1320,7 +1320,7 @@ mod tests {
 
     #[test]
     fn http_then_rollback_detection_compose() {
-        // L2 must stay composable with the phase-004 rollback detector.
+        // L2 must stay composable with the replay-cursor rollback detector.
         let b = Builder::new()
             .http("https://cinch.example.com", "tok")
             .with_rollback_detection("db-1", "tok");

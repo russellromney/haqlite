@@ -5,7 +5,7 @@ pub use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 pub mod builder;
 pub mod follower_behavior;
-pub mod phase4_chain;
+pub mod cursor_chain;
 mod replay_sink;
 pub mod replicator;
 pub mod rollback_detection;

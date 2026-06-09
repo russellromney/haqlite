@@ -1,24 +1,24 @@
-//! Phase 004 object-store reality proof (step 8, MinIO/real S3).
+//! Replay cursor object-store reality proof (MinIO/real S3).
 //!
-//! The plan emphasizes that the original live-stack bug was on the
-//! object-store path, so the phase-4 protocol must be proven against a
-//! real S3-compatible store's listing semantics — not just in-memory.
+//! The original live-stack bug was on the object-store path, so the
+//! cursor-chain protocol must be proven against a real S3-compatible
+//! store's listing semantics — not just in-memory.
 //! These tests gate on `TIERED_TEST_BUCKET` (set when MinIO/Tigris is
 //! available) and are skipped otherwise, matching the existing
 //! object-storage test convention.
 //!
 //! Run against MinIO:
-//!   TIERED_TEST_BUCKET=phase4-test AWS_ENDPOINT_URL=http://127.0.0.1:9000 \
+//!   TIERED_TEST_BUCKET=replay-cursor-test AWS_ENDPOINT_URL=http://127.0.0.1:9000 \
 //!   AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
 //!   AWS_REGION=us-east-1 \
-//!   cargo test -p haqlite-turbolite --test phase4_object_store
+//!   cargo test -p haqlite-turbolite --test cursor_object_store
 
 mod common;
 
 #[cfg(feature = "s3")]
 mod object_store {
     use crate::common;
-    use haqlite_turbolite::phase4_chain::{filter_and_verify, ChainBreak, FollowerCursor};
+    use haqlite_turbolite::cursor_chain::{filter_and_verify, ChainBreak, FollowerCursor};
     use walrust::external_delta::{self, DeltaPayloadV1};
     use walrust::hadb_changeset::physical::{PageEntry, PageId, PageIdSize, PhysicalChangeset};
 
@@ -75,7 +75,7 @@ mod object_store {
             return;
         }
         // Unique prefix per run so reruns don't collide.
-        let prefix = format!("phase4-obj/{}/", uuid::Uuid::new_v4());
+        let prefix = format!("replay-cursor-obj/{}/", uuid::Uuid::new_v4());
         let storage = common::s3_backend(&prefix).await;
         let db = "objdb";
         let epoch = 5u64;
@@ -122,17 +122,16 @@ mod object_store {
         assert_eq!(result.verified.last().unwrap().payload.end_page_count, 6);
     }
 
-    /// obj_no_state_json: the phase-4 delta prefix contains only `.tlmd`
+    /// obj_no_state_json: the cursor-chain delta prefix contains only `.tlmd`
     /// objects — no `state.json` sidecar (the cursor lives in the
-    /// turbolite manifest, per the plan's blast-radius rule) and no
-    /// rogue keys.
+    /// turbolite manifest) and no rogue keys.
     #[tokio::test]
     async fn obj_no_state_json_only_tlmd_objects() {
         if !common::s3_env_available() {
             eprintln!("skipping: TIERED_TEST_BUCKET not set");
             return;
         }
-        let prefix = format!("phase4-obj/{}/", uuid::Uuid::new_v4());
+        let prefix = format!("replay-cursor-obj/{}/", uuid::Uuid::new_v4());
         let storage = common::s3_backend(&prefix).await;
         let db = "objdb";
 
@@ -171,11 +170,11 @@ mod object_store {
         for key in &all {
             assert!(
                 !key.ends_with("state.json"),
-                "phase-4 prefix must not contain state.json: {key}"
+                "cursor-chain prefix must not contain state.json: {key}"
             );
             assert!(
                 key.ends_with(".tlmd"),
-                "phase-4 prefix must contain only .tlmd objects, found: {key}"
+                "cursor-chain prefix must contain only .tlmd objects, found: {key}"
             );
         }
     }
