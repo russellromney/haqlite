@@ -1,0 +1,21 @@
+[package]
+name = "haqlite-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Node.js bindings for embedded HA SQLite"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+haqlite = { path = ".." }
+hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", branch = "hoist-prereq-internal-lease-store" }
+napi = { version = "3.12.4", default-features = false, features = ["napi6", "tokio_rt"] }
+napi-derive = "3.6.5"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+
+[build-dependencies]
+napi-build = "2.3"

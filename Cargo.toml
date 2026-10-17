@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "haqlite-turbolite"]
+members = [".", "haqlite-turbolite", "haqlite-node"]
 resolver = "2"
 
 [patch."https://github.com/russellromney/hadb.git"]

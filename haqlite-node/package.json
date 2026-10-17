@@ -1,0 +1,52 @@
+{
+  "name": "haqlite",
+  "version": "0.4.0",
+  "description": "Embedded HA SQLite for Node.js",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/russellromney/haqlite.git",
+    "directory": "haqlite-node"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "require": "./index.js",
+      "import": "./index.mjs"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.mjs",
+    "index.d.ts",
+    "*.node",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "napi": {
+    "binaryName": "haqlite",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform",
+    "build:release": "napi build --platform --release",
+    "test": "node --test test/*.test.cjs",
+    "test:types": "tsc --noEmit -p test/tsconfig.json"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.10.8",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}

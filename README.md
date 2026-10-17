@@ -32,6 +32,25 @@ let count: i64 = db.query_row_local("SELECT COUNT(*) FROM users", &[], |r| r.get
 db.close().await?;
 ```
 
+## Node.js bindings
+
+The [`haqlite-node`](haqlite-node/README.md) package provides native Node.js bindings with TypeScript types for local and embedded HA databases.
+
+```javascript
+import { HaQLite } from 'haqlite'
+
+const db = await HaQLite.local('./app.db',
+  'CREATE TABLE IF NOT EXISTS users (name TEXT)')
+try {
+  await db.execute('INSERT INTO users VALUES (?)', ['Alice'])
+  console.log(await db.query('SELECT name FROM users')) // [['Alice']]
+} finally {
+  await db.close()
+}
+```
+
+Build the package from source before using it. See the [Node.js build and HA configuration guide](haqlite-node/README.md).
+
 ## How it works
 
 ```
